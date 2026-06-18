@@ -1,0 +1,2342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FieldRaven Desktop</title>
+<!-- Firebase App (compat) -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<!-- Three.js importmap for the 3D GLB viewer (loaded lazily on demand) -->
+<script type="importmap">
+{"imports":{
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+<style>
+/* ── FieldRaven Dark Theme ─────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --earth: #2C1A0E;
+  --bark: #3D2412;
+  --bark-light: #4E2E18;
+  --moss: #4B6A3B;
+  --moss-light: #6B9A55;
+  --clay: #C4622D;
+  --clay-light: #E07A45;
+  --cream: #F5EDD8;
+  --fog: #B8C4A8;
+  --sand: #E8D5B0;
+  --white: #FDFAF4;
+  --red: #E05A5A;
+  --green: #5AB87A;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--earth);
+  color: var(--cream);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+a { color: var(--clay-light); text-decoration: none; }
+a:hover { color: var(--sand); }
+
+/* ── Layout ────────────────────────────────────────────── */
+.app-container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+
+/* ── Header ────────────────────────────────────────────── */
+.header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-bottom: 24px; border-bottom: 1px solid rgba(196,98,45,0.15); margin-bottom: 24px;
+}
+.header-left { display: flex; align-items: center; gap: 12px; }
+.header-logo { font-size: 28px; }
+.header-title { font-size: 20px; font-weight: 800; letter-spacing: 0.15em; color: var(--cream); }
+.header-subtitle { font-size: 11px; color: var(--fog); letter-spacing: 0.1em; margin-top: 2px; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.status-dot {
+  width: 10px; height: 10px; border-radius: 50%; display: inline-block;
+}
+.status-dot.online { background: var(--green); box-shadow: 0 0 6px rgba(90,184,122,0.5); }
+.status-dot.offline { background: var(--red); }
+.status-dot.busy { background: var(--clay-light); animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* ── Cards ─────────────────────────────────────────────── */
+.card {
+  background: var(--bark);
+  border: 1px solid rgba(196,98,45,0.15);
+  border-radius: 16px;
+  padding: 20px;
+  margin-bottom: 16px;
+  transition: border-color 0.2s;
+}
+.card:hover { border-color: rgba(196,98,45,0.3); }
+.card-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.15em;
+  color: var(--clay-light); text-transform: uppercase; margin-bottom: 12px;
+}
+.card-empty {
+  text-align: center; padding: 32px 20px; color: var(--fog); font-size: 14px;
+}
+
+/* ── Buttons ───────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 20px; border-radius: 10px; font-size: 14px; font-weight: 600;
+  border: none; cursor: pointer; transition: all 0.2s; white-space: nowrap;
+}
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-primary { background: var(--moss); color: var(--white); }
+.btn-primary:hover:not(:disabled) { background: var(--moss-light); }
+.btn-secondary { background: rgba(196,98,45,0.15); color: var(--cream); border: 1px solid rgba(196,98,45,0.3); }
+.btn-secondary:hover:not(:disabled) { background: rgba(196,98,45,0.25); }
+.btn-danger { background: rgba(224,90,90,0.2); color: var(--red); border: 1px solid rgba(224,90,90,0.3); }
+.btn-danger:hover:not(:disabled) { background: rgba(224,90,90,0.3); }
+.btn-google {
+  background: #4285F4; color: white; font-weight: 700; padding: 12px 24px;
+}
+.btn-google:hover { background: #3b7ae3; }
+.btn-sm { padding: 6px 14px; font-size: 12px; }
+.btn-block { width: 100%; }
+
+/* ── Job Queue ─────────────────────────────────────────── */
+.job-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; margin-bottom: 8px;
+  background: rgba(44,26,14,0.5); border-radius: 12px;
+  border: 1px solid rgba(196,98,45,0.1);
+}
+.job-item:last-child { margin-bottom: 0; }
+.job-icon { font-size: 20px; margin-right: 12px; }
+.job-info { flex: 1; }
+.job-name { font-weight: 600; font-size: 14px; color: var(--cream); }
+.job-meta { font-size: 12px; color: var(--fog); margin-top: 2px; }
+.job-actions { display: flex; gap: 8px; }
+
+/* ── Progress ──────────────────────────────────────────── */
+.progress-bar {
+  width: 100%; height: 6px; background: rgba(255,255,255,0.08);
+  border-radius: 3px; overflow: hidden; margin: 8px 0;
+}
+.progress-fill {
+  height: 100%; background: linear-gradient(90deg, var(--moss), var(--moss-light));
+  border-radius: 3px; transition: width 0.5s ease;
+}
+.progress-label {
+  display: flex; justify-content: space-between; font-size: 12px; color: var(--fog);
+}
+.progress-step { font-size: 12px; color: var(--clay-light); margin-top: 4px; }
+
+/* ── Stage Stepper ─────────────────────────────────────── */
+.stage-stepper {
+  display: flex; align-items: flex-start; margin: 14px 0 6px;
+}
+.stage-step {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 52px;
+}
+.stage-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: rgba(255,255,255,0.08); border: 2px solid rgba(255,255,255,0.12);
+  transition: all 0.3s;
+}
+.stage-step.active .stage-dot {
+  background: var(--clay); border-color: var(--clay-light);
+  box-shadow: 0 0 8px rgba(196,98,45,0.5);
+}
+.stage-step.done .stage-dot { background: var(--moss); border-color: var(--moss-light); }
+.stage-label { font-size: 10px; color: var(--fog); letter-spacing: 0.05em; text-align: center; }
+.stage-step.active .stage-label { color: var(--clay-light); font-weight: 700; }
+.stage-step.done  .stage-label { color: var(--moss-light); }
+.stage-connector {
+  flex: 1; height: 1px; background: rgba(255,255,255,0.1);
+  margin: 4px 2px 0; align-self: flex-start; position: relative; top: 4px;
+}
+
+/* ── 3D Viewer Modal ────────────────────────────────────── */
+.viewer-modal {
+  display: none; position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.85); align-items: center; justify-content: center;
+}
+.viewer-modal.open { display: flex; }
+.viewer-box {
+  background: var(--earth); border: 1px solid rgba(196,98,45,0.3);
+  border-radius: 20px; width: 90vw; max-width: 960px;
+  height: 80vh; display: flex; flex-direction: column; overflow: hidden;
+}
+.viewer-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 20px; border-bottom: 1px solid rgba(196,98,45,0.15);
+  font-weight: 600; font-size: 14px; flex-shrink: 0;
+}
+.viewer-canvas-wrap { flex: 1; position: relative; background: #080808; }
+#viewerCanvas { width: 100%; height: 100%; display: block; }
+.viewer-hint {
+  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+  font-size: 11px; color: rgba(255,255,255,0.3); pointer-events: none; white-space: nowrap;
+}
+
+/* ── Log ───────────────────────────────────────────────── */
+.log-container {
+  max-height: 200px; overflow-y: auto; font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px; line-height: 1.6;
+  background: rgba(0,0,0,0.2); border-radius: 8px; padding: 12px; margin-top: 8px;
+}
+.log-entry { color: var(--fog); }
+.log-entry.info { color: var(--fog); }
+.log-entry.success { color: var(--green); }
+.log-entry.error { color: var(--red); }
+.log-entry.warning { color: var(--clay-light); }
+
+/* ── Completed Jobs ────────────────────────────────────── */
+.completed-job {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; margin-bottom: 6px;
+  background: rgba(44,26,14,0.3); border-radius: 8px;
+}
+
+/* ── Settings ──────────────────────────────────────────── */
+.settings-group { margin-bottom: 20px; }
+.settings-label {
+  font-size: 12px; color: var(--fog); margin-bottom: 6px; display: block;
+}
+.settings-input {
+  width: 100%; padding: 10px 14px; border-radius: 8px;
+  background: var(--earth); border: 1px solid rgba(196,98,45,0.25);
+  color: var(--cream); font-size: 14px; outline: none;
+}
+.settings-input:focus { border-color: var(--clay-light); }
+.settings-hint { font-size: 11px; color: var(--fog); margin-top: 4px; }
+
+/* ── Settings Sub-tabs ─────────────────────────────────── */
+.subtab-nav {
+  display: flex; gap: 2px; margin-bottom: 16px; overflow-x: auto;
+  border-bottom: 1px solid rgba(196,98,45,0.2); padding-bottom: 0;
+  -webkit-overflow-scrolling: touch;
+}
+.subtab-btn {
+  background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--fog); padding: 8px 14px; cursor: pointer;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.05em; white-space: nowrap;
+  margin-bottom: -1px; transition: all 0.2s; border-radius: 6px 6px 0 0;
+}
+.subtab-btn:hover { color: var(--cream); }
+.subtab-btn.active { color: var(--clay-light); border-bottom-color: var(--clay-light); }
+.settings-row {
+  display: flex; gap: 12px;
+}
+.settings-row .settings-group { flex: 1; }
+.settings-check {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--cream); margin-bottom: 8px; cursor: pointer;
+}
+.settings-check input[type="checkbox"] {
+  width: 16px; height: 16px; accent-color: var(--moss); cursor: pointer; flex-shrink: 0;
+}
+.settings-section-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.12em;
+  color: var(--clay); text-transform: uppercase; margin: 16px 0 8px;
+  padding-top: 12px; border-top: 1px solid rgba(196,98,45,0.12);
+}
+.settings-section-title:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+.radio-group {
+  display: flex; gap: 16px; flex-wrap: wrap; padding: 6px 0;
+}
+.radio-group label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--cream); cursor: pointer;
+}
+.radio-group input[type="radio"] { accent-color: var(--moss); cursor: pointer; }
+
+/* ── Stat Cards ───────────────────────────────────────── */
+.stat-cards {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px;
+}
+@media (max-width: 600px) { .stat-cards { grid-template-columns: repeat(2, 1fr); } }
+.stat-card {
+  background: var(--bark); border: 1px solid rgba(196,98,45,0.15);
+  border-radius: 12px; padding: 16px 12px; text-align: center;
+}
+.stat-value { font-size: 26px; font-weight: 800; color: var(--clay-light); line-height: 1.1; }
+.stat-label {
+  font-size: 10px; color: var(--fog); text-transform: uppercase;
+  letter-spacing: 0.1em; margin-top: 4px;
+}
+
+/* ── Field Job / Client Cards ─────────────────────────── */
+.field-job-card {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--bark); border: 1px solid rgba(196,98,45,0.15);
+  border-left: 3px solid var(--moss); border-radius: 12px;
+  padding: 12px 14px; margin-bottom: 6px;
+}
+.field-job-card:hover { border-color: rgba(196,98,45,0.35); }
+.field-job-row {
+  display: flex; align-items: center; padding: 8px 0;
+  border-bottom: 1px solid rgba(196,98,45,0.08);
+}
+.field-job-row:last-child { border-bottom: none; }
+.field-job-client { font-size: 14px; font-weight: 600; color: var(--cream); }
+.field-job-meta   { font-size: 12px; color: var(--fog); margin-top: 2px; }
+.field-job-notes  { font-size: 11px; color: var(--fog); margin-top: 4px; font-style: italic; }
+.client-card { padding: 12px 0; border-bottom: 1px solid rgba(196,98,45,0.08); }
+.client-card:last-child { border-bottom: none; }
+
+/* ── Search ───────────────────────────────────────────── */
+.search-input {
+  flex: 1; padding: 8px 12px; background: rgba(44,26,14,0.6);
+  border: 1px solid rgba(196,98,45,0.2); border-radius: 8px;
+  color: var(--cream); font-size: 13px; outline: none; width: 100%;
+}
+.search-input:focus { border-color: rgba(196,98,45,0.5); }
+.search-input::placeholder { color: var(--fog); }
+
+/* ── Clay button ──────────────────────────────────────── */
+.btn-clay { background: var(--clay); color: var(--white); }
+.btn-clay:hover:not(:disabled) { background: var(--clay-light); }
+
+/* ── Job Override Panel ───────────────────────────────── */
+.override-panel {
+  margin-top: 12px; padding: 12px; border-radius: 8px;
+  background: rgba(44,26,14,0.5); border: 1px solid rgba(196,98,45,0.15);
+}
+.override-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--clay-light); margin-bottom: 10px;
+}
+.override-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+}
+
+.settings-input-sm { padding: 5px 8px; font-size: 12px; }
+
+/* ── Spinner ──────────────────────────────────────────── */
+.spinner {
+  width: 32px; height: 32px; border: 2px solid rgba(196,98,45,0.3);
+  border-top-color: var(--clay-light); border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Stat card sub ────────────────────────────────────── */
+.stat-sub  { font-size: 11px; color: var(--moss-light); font-family: monospace; margin-top: 2px; }
+.stat-value-sm { font-size: 16px !important; }
+
+/* ── Dashboard quick links ────────────────────────────── */
+.quick-links {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px;
+}
+@media (max-width: 600px) { .quick-links { grid-template-columns: repeat(2, 1fr); } }
+.quick-link-card {
+  background: var(--bark); border: 1px solid rgba(196,98,45,0.2);
+  border-radius: 12px; padding: 14px 12px; cursor: pointer; transition: all 0.2s;
+}
+.quick-link-card:hover { border-color: rgba(196,98,45,0.45); background: var(--bark-light); }
+.quick-link-count { font-size: 11px; font-weight: 700; color: var(--clay-light); letter-spacing: 0.1em; margin-bottom: 4px; }
+.quick-link-label { font-size: 13px; font-weight: 500; color: var(--cream); }
+
+/* ── Recent job row ───────────────────────────────────── */
+.recent-job-row {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bark); border: 1px solid rgba(196,98,45,0.15);
+  border-radius: 12px; padding: 12px 16px; margin-bottom: 6px;
+  transition: all 0.2s; cursor: default;
+}
+.recent-job-row:hover { border-color: rgba(196,98,45,0.35); background: var(--bark-light); }
+
+/* ── Map tile toggle ──────────────────────────────────── */
+.active-map-btn { background: var(--earth) !important; color: var(--clay-light) !important; }
+
+
+/* ── Leaflet popup reset ──────────────────────────────── */
+.fr-popup .leaflet-popup-content-wrapper { background: transparent; border: none; box-shadow: none; padding: 0; }
+.fr-popup .leaflet-popup-tip-container { display: none; }
+.fr-popup .leaflet-popup-content { margin: 0; }
+
+/* ── Auth ──────────────────────────────────────────────── */
+.auth-screen {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: 24px;
+}
+.auth-box {
+  text-align: center; max-width: 360px;
+}
+.auth-logo { font-size: 64px; margin-bottom: 12px; }
+.auth-title { font-size: 28px; font-weight: 800; letter-spacing: 0.2em; margin-bottom: 4px; }
+.auth-subtitle { color: var(--fog); font-size: 14px; margin-bottom: 32px; }
+
+/* ── Camera status ─────────────────────────────────────── */
+.camera-status {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--fog);
+  padding: 8px 12px; border-radius: 8px; background: rgba(44,26,14,0.5);
+}
+
+/* ── Tabs ──────────────────────────────────────────────── */
+.tab-bar {
+  display: flex; gap: 2px; margin-bottom: 20px;
+  border-bottom: 1px solid rgba(196,98,45,0.12); padding-bottom: 0;
+  overflow-x: auto; scrollbar-width: none;
+}
+.tab-bar::-webkit-scrollbar { display: none; }
+.tab {
+  padding: 10px 14px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;
+  color: var(--fog); border-bottom: 2px solid transparent; transition: all 0.2s;
+  background: none; border-top: none; border-left: none; border-right: none; flex-shrink: 0;
+}
+.tab:hover { color: var(--cream); }
+.tab.active { color: var(--clay-light); border-bottom-color: var(--clay-light); }
+
+/* ── Utility ────────────────────────────────────────────── */
+.hidden { display: none !important; }
+.flex { display: flex; }
+.gap-8 { gap: 8px; }
+.gap-12 { gap: 12px; }
+.mt-8 { margin-top: 8px; }
+.mt-16 { margin-top: 16px; }
+.mb-8 { margin-bottom: 8px; }
+.text-center { text-align: center; }
+.text-sm { font-size: 13px; }
+.text-fog { color: var(--fog); }
+.text-clay { color: var(--clay-light); }
+.text-green { color: var(--green); }
+.text-red { color: var(--red); }
+</style>
+</head>
+<body>
+
+<!-- ═══ AUTH SCREEN ═══ -->
+<div id="authScreen" class="auth-screen">
+  <div class="auth-box">
+    <div class="auth-logo">🦅</div>
+    <h1 class="auth-title">FIELDRAVEN</h1>
+    <p class="auth-subtitle">Desktop Processing Dashboard</p>
+    <button id="googleSignInBtn" class="btn btn-google btn-block" onclick="signInWithGoogle()">
+      Sign in with Google
+    </button>
+    <p style="margin-top:20px; font-size:12px; color:var(--fog);">
+      Use the same Google account as your FieldRaven web app.
+    </p>
+  </div>
+</div>
+
+<!-- ═══ MAIN APP ═══ -->
+<div id="appScreen" class="app-container hidden">
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <span class="header-logo">🦅</span>
+      <div>
+        <div class="header-title">FIELDRAVEN</div>
+        <div class="header-subtitle">Desktop · <span id="machineName">local</span></div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="camera-status" id="cameraStatus">
+        <span>📷</span>
+        <span id="cameraText">Checking...</span>
+      </div>
+      <span id="statusDot" class="status-dot offline" title="Disconnected"></span>
+      <button class="btn btn-secondary btn-sm" onclick="signOut()">Sign Out</button>
+    </div>
+  </div>
+
+  <!-- Tab bar -->
+  <div class="tab-bar">
+    <button class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="tab" data-tab="jobs" onclick="switchTab('jobs')">Jobs</button>
+    <button class="tab" data-tab="clients" onclick="switchTab('clients')">Clients</button>
+    <button class="tab" data-tab="map" onclick="switchTab('map')">Map</button>
+    <button class="tab" data-tab="queue" onclick="switchTab('queue')">Queue</button>
+    <button class="tab" data-tab="active" onclick="switchTab('active')">Active Job</button>
+    <button class="tab" data-tab="history" onclick="switchTab('history')">History</button>
+    <button class="tab" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+  </div>
+
+  <!-- ═══ DASHBOARD TAB ═══ -->
+  <div id="tabDashboard" class="tab-content">
+    <div id="dashLoading" style="display:flex;justify-content:center;padding:48px 0;">
+      <div class="spinner"></div>
+    </div>
+    <div id="dashContent" class="hidden">
+      <div class="stat-cards">
+        <div class="stat-card">
+          <div class="stat-label">Total Jobs</div>
+          <div class="stat-value" id="statTotalJobs">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Hours</div>
+          <div class="stat-value" id="statTotalHours">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">This Month</div>
+          <div class="stat-value" id="statThisMonth">—</div>
+          <div class="stat-sub" id="statThisMonthHours"></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Top Client</div>
+          <div class="stat-value stat-value-sm" id="statTopClient">—</div>
+          <div class="stat-sub" id="statTopClientHours"></div>
+        </div>
+      </div>
+
+      <!-- Quick links -->
+      <div class="quick-links" id="dashQuickLinks"></div>
+
+      <!-- Recent jobs -->
+      <div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <div class="card-title" style="margin:0;">RECENT JOBS</div>
+          <button class="btn btn-secondary btn-sm" onclick="switchTab('jobs')">View all →</button>
+        </div>
+        <div id="dashRecentJobs"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ JOBS TAB ═══ -->
+  <div id="tabJobs" class="tab-content hidden">
+    <div class="card">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+        <input type="text" id="jobsSearch" class="search-input"
+               placeholder="Search client or notes…"
+               oninput="filterJobs()"
+               style="flex:1;min-width:160px;">
+        <select id="jobsClientFilter" class="search-input" style="flex:0 0 auto;width:auto;"
+                onchange="filterJobs()">
+          <option value="">All clients</option>
+        </select>
+      </div>
+      <div id="jobsCountLine" style="font-size:12px;color:var(--fog);margin-bottom:8px;"></div>
+      <div id="fieldJobsList">
+        <div class="card-empty">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ CLIENTS TAB ═══ -->
+  <div id="tabClients" class="tab-content hidden">
+    <div class="card">
+      <div style="margin-bottom:12px;">
+        <input type="text" id="clientsSearch" class="search-input"
+               placeholder="Search clients..."
+               oninput="filterClients(this.value)">
+      </div>
+      <div id="clientsList">
+        <div class="card-empty">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ MAP TAB ═══ -->
+  <div id="tabMap" class="tab-content hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+      <div>
+        <div style="font-size:18px;font-weight:700;color:var(--cream);">Field Map</div>
+        <div id="mapJobCount" style="font-size:12px;color:var(--fog);"></div>
+      </div>
+      <div style="display:flex;gap:4px;">
+        <button id="mapBtnSat" class="btn btn-secondary btn-sm active-map-btn" onclick="setMapTile('satellite')">Satellite</button>
+        <button id="mapBtnTopo" class="btn btn-secondary btn-sm" onclick="setMapTile('topo')">Topo</button>
+      </div>
+    </div>
+    <div style="border-radius:16px;overflow:hidden;border:1px solid rgba(196,98,45,0.2);height:calc(100vh - 220px);min-height:400px;background:#1a1a1a;">
+      <div id="mapContainer" style="height:100%;width:100%;"></div>
+    </div>
+  </div>
+
+  <!-- ═══ QUEUE TAB ═══ -->
+  <div id="tabQueue" class="tab-content hidden">
+    <div class="card">
+      <div class="card-title">📋 Processing Queue</div>
+      <div id="queueList">
+        <div class="card-empty">Sign in to see available jobs.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ ACTIVE JOB TAB ═══ -->
+  <div id="tabActive" class="tab-content hidden">
+    <div class="card">
+      <div id="noActiveJob" class="card-empty">No active job. Select one from the Queue tab.</div>
+      <div id="activeJobContent" class="hidden">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+          <div>
+            <span style="font-size:14px; font-weight:600;" id="activeJobName">Job Name</span>
+            <span style="font-size:12px; color:var(--fog); margin-left:8px;" id="activeJobType"></span>
+          </div>
+          <span id="activeJobStatus" style="font-size:12px; color:var(--moss-light);">Processing</span>
+        </div>
+
+        <!-- Stage stepper -->
+        <div class="stage-stepper" id="stageStepper">
+          <div class="stage-step" id="stageFrames">
+            <div class="stage-dot"></div>
+            <div class="stage-label">Frames</div>
+          </div>
+          <div class="stage-connector"></div>
+          <div class="stage-step" id="stageViews">
+            <div class="stage-dot"></div>
+            <div class="stage-label">Views</div>
+          </div>
+          <div class="stage-connector"></div>
+          <div class="stage-step" id="stageVggt">
+            <div class="stage-dot"></div>
+            <div class="stage-label">VGGT</div>
+          </div>
+          <div class="stage-connector"></div>
+          <div class="stage-step" id="stageColmap">
+            <div class="stage-dot"></div>
+            <div class="stage-label">COLMAP</div>
+          </div>
+        </div>
+
+        <div class="progress-bar">
+          <div id="progressFill" class="progress-fill" style="width:0%"></div>
+        </div>
+        <div class="progress-label">
+          <span id="progressPct">0%</span>
+          <span id="progressEta"></span>
+        </div>
+        <div class="progress-step" id="progressStep">Waiting to start…</div>
+
+        <div id="activeJobActions" style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button id="startPipelineBtn" class="btn btn-primary btn-sm" onclick="startProcessing()" disabled>
+            ▶ Start Processing
+          </button>
+          <button id="view3dBtn" class="btn btn-secondary btn-sm hidden" onclick="open3DViewer()">
+            🌐 View 3D Output
+          </button>
+          <button class="btn btn-danger btn-sm" onclick="cancelActiveJob()">Cancel Job</button>
+          <button class="btn btn-secondary btn-sm" onclick="openJobDir()">Open Input Folder</button>
+        </div>
+        <div class="log-container" id="jobLog"></div>
+      </div>
+    </div>
+
+    <!-- Camera Import -->
+    <div id="cameraImportSection" class="card hidden">
+      <div class="card-title">📷 Camera Import</div>
+      <div id="cameraDetectStatus" style="font-size:13px; color:var(--fog); margin-bottom:12px;">Detecting camera...</div>
+      <div id="cameraFileList" style="font-size:12px; color:var(--fog); margin-bottom:10px; line-height:1.8;"></div>
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <button id="importBtn" class="btn btn-primary btn-sm" onclick="importFromCamera()" disabled>
+          📥 Import from Camera
+        </button>
+        <span id="importProgress" style="font-size:12px; color:var(--fog);"></span>
+        <span id="inputFileCount" style="font-size:12px; color:var(--fog);"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ HISTORY TAB ═══ -->
+  <div id="tabHistory" class="tab-content hidden">
+    <div class="card">
+      <div class="card-title">📁 Completed Jobs</div>
+      <div id="jobHistory">
+        <div class="card-empty">No completed jobs yet.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ SETTINGS TAB ═══ -->
+  <div id="tabSettings" class="tab-content hidden">
+    <div class="card">
+      <div class="card-title">⚙️ Machine Settings</div>
+      <div class="settings-group">
+        <label class="settings-label">Machine Display Name</label>
+        <input type="text" id="settingsMachineName" class="settings-input"
+               placeholder="e.g. Desktop-RTX-4090" onchange="saveMachineName()">
+        <div class="settings-hint">This name appears in the web app when assigning jobs.</div>
+      </div>
+      <div class="settings-group">
+        <label class="settings-label">Machine ID</label>
+        <input type="text" id="settingsMachineId" class="settings-input" readonly
+               style="opacity:0.6; cursor:not-allowed;">
+        <div class="settings-hint">Auto-detected from hostname. Change in settings if needed.</div>
+      </div>
+      <div class="settings-group">
+        <label class="settings-label">Firebase Status</label>
+        <div id="firebaseStatus" style="font-size:13px; color:var(--fog);">Checking...</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔧 Pipeline Settings</div>
+      <!-- Sub-tab navigation -->
+      <div class="subtab-nav">
+        <button class="subtab-btn active" onclick="showSubtab(event,'extraction')">Extraction</button>
+        <button class="subtab-btn" onclick="showSubtab(event,'alignment')">Alignment</button>
+        <button class="subtab-btn" onclick="showSubtab(event,'postshot')">Postshot</button>
+        <button class="subtab-btn" onclick="showSubtab(event,'brush')">Brush</button>
+        <button class="subtab-btn" onclick="showSubtab(event,'paths')">Paths</button>
+      </div>
+
+      <!-- ═══ EXTRACTION ═══ -->
+      <div id="subtab-extraction" class="subtab-content">
+        <div class="settings-group">
+          <label class="settings-label">Extraction Method</label>
+          <div class="radio-group">
+            <label><input type="radio" name="extraction_method" value="interval" id="cfg_method_interval" onchange="onExtractionMethodChange()"> Interval</label>
+            <label><input type="radio" name="extraction_method" value="count"    id="cfg_method_count"    onchange="onExtractionMethodChange()"> Total Count</label>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div id="row_interval" class="settings-group">
+            <label class="settings-label">Interval Value</label>
+            <div style="display:flex;gap:8px;">
+              <input type="number" id="cfg_interval_value" class="settings-input" step="0.5" min="0.1" style="flex:1;">
+              <select id="cfg_interval_unit" class="settings-input" style="flex:0 0 auto;width:auto;">
+                <option value="seconds">seconds</option>
+                <option value="frames">frames</option>
+              </select>
+            </div>
+          </div>
+          <div id="row_frame_count" class="settings-group hidden">
+            <label class="settings-label">Total Frames</label>
+            <input type="number" id="cfg_frame_count" class="settings-input" min="1" max="1000">
+          </div>
+        </div>
+        <div class="settings-group">
+          <label class="settings-label">Frame Format</label>
+          <div class="radio-group">
+            <label><input type="radio" name="frame_format" value="jpg"> JPEG</label>
+            <label><input type="radio" name="frame_format" value="png"> PNG</label>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div class="settings-group">
+            <label class="settings-label">Pitch Angles (comma-separated °)</label>
+            <input type="text" id="cfg_pitch_angles_str" class="settings-input" placeholder="-30, -10, 10">
+            <div class="settings-hint">Camera tilt angles per panorama frame, e.g. <code>-30</code> or <code>-30,-10</code></div>
+          </div>
+          <div class="settings-group">
+            <label class="settings-label">Yaw Steps</label>
+            <input type="number" id="cfg_yaw_steps" class="settings-input" min="1" max="36" style="max-width:100px;">
+            <div class="settings-hint">Number of horizontal rotations per pitch angle</div>
+          </div>
+          <div class="settings-group">
+            <label class="settings-label">Field of View (°)</label>
+            <input type="number" id="cfg_fov" class="settings-input" min="30" max="160" step="0.1" style="max-width:100px;">
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══ ALIGNMENT ═══ -->
+      <div id="subtab-alignment" class="subtab-content hidden">
+        <div class="settings-section-title">Stages</div>
+        <label class="settings-check"><input type="checkbox" id="cfg_run_vggt"> Run VGGT Alignment</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_run_postshot"> Run Postshot Training after alignment</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_run_brush"> Run Brush Training after alignment</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_skip_realityscan"> Skip RealityScan step</label>
+
+        <div class="settings-section-title">VGGT Quality Filters</div>
+        <div class="settings-group">
+          <label class="settings-label">Confidence Threshold: <span id="conf_display">0</span></label>
+          <input type="range" id="cfg_vggt_conf_threshold" min="0" max="1" step="0.01"
+                 oninput="document.getElementById('conf_display').textContent=parseFloat(this.value).toFixed(2)"
+                 style="width:100%; accent-color:var(--moss);">
+        </div>
+        <label class="settings-check"><input type="checkbox" id="cfg_vggt_mask_sky"> Filter Sky</label>
+        <div id="row_sky_sensitivity" class="settings-group" style="padding-left:24px;">
+          <label class="settings-label">Sky Sensitivity: <span id="sky_display">32</span></label>
+          <input type="range" id="cfg_sky_sensitivity_threshold" min="0" max="100" step="1"
+                 oninput="document.getElementById('sky_display').textContent=this.value"
+                 style="width:100%; accent-color:var(--moss);">
+        </div>
+        <label class="settings-check"><input type="checkbox" id="cfg_vggt_mask_black_bg"> Filter Black Background</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_vggt_mask_white_bg"> Filter White Background</label>
+
+        <div class="settings-section-title">Point Cloud</div>
+        <label class="settings-check">
+          <input type="checkbox" id="cfg_vggt_enable_sparse" onchange="document.getElementById('row_sparse_target').classList.toggle('hidden',!this.checked)">
+          Enable Sparse Point Cloud
+        </label>
+        <div id="row_sparse_target" class="settings-group hidden" style="padding-left:24px;">
+          <label class="settings-label">Target Points</label>
+          <input type="number" id="cfg_vggt_sparse_target" class="settings-input" min="1000" step="10000">
+        </div>
+
+        <div class="settings-section-title">Camera Rig Mode</div>
+        <label class="settings-check">
+          <input type="checkbox" id="cfg_vggt_use_anchor_rig" onchange="document.getElementById('row_anchor_opts').classList.toggle('hidden',!this.checked)">
+          Enable Anchor Rig Mode
+        </label>
+        <div id="row_anchor_opts" class="settings-group hidden" style="padding-left:24px;">
+          <div class="settings-row">
+            <div class="settings-group">
+              <label class="settings-label">Anchor View Name</label>
+              <input type="text" id="cfg_vggt_anchor_view" class="settings-input" placeholder="y00">
+            </div>
+            <div class="settings-group">
+              <label class="settings-label">Min Optimization Points</label>
+              <input type="number" id="cfg_vggt_rig_optimization_min_points" class="settings-input" min="1000" step="10000">
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section-title">Inference Mode</div>
+        <div class="settings-group">
+          <label class="settings-label">Prediction Mode</label>
+          <div class="radio-group">
+            <label><input type="radio" name="vggt_prediction_mode" value="Depthmap and Camera Branch"> Depthmap</label>
+            <label><input type="radio" name="vggt_prediction_mode" value="Pointmap and Camera Branch"> Pointmap</label>
+          </div>
+        </div>
+        <label class="settings-check"><input type="checkbox" id="cfg_vggt_temporal_sequencing"> Temporal Sequencing (ordered photos)</label>
+      </div>
+
+      <!-- ═══ POSTSHOT ═══ -->
+      <div id="subtab-postshot" class="subtab-content hidden">
+        <div class="settings-group">
+          <label class="settings-label">Training Profile</label>
+          <select id="cfg_postshot_profile" class="settings-input">
+            <option value="Splat3">Splat3</option>
+            <option value="Splat2">Splat2</option>
+            <option value="Splat1">Splat1</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <div class="settings-group">
+            <label class="settings-label">Max Image Size (px)</label>
+            <input type="number" id="cfg_postshot_max_image_size" class="settings-input" min="512" step="256">
+          </div>
+          <div class="settings-group">
+            <label class="settings-label">Train Steps (k)</label>
+            <input type="number" id="cfg_postshot_train_steps" class="settings-input" min="1" max="100">
+          </div>
+          <div class="settings-group">
+            <label class="settings-label">Max Splats</label>
+            <input type="number" id="cfg_postshot_max_splats" class="settings-input" min="100" step="100">
+          </div>
+        </div>
+        <div class="settings-section-title">Options</div>
+        <label class="settings-check"><input type="checkbox" id="cfg_postshot_anti_aliasing"> Anti-Aliasing</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_postshot_show_train_error"> Show Train Error</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_postshot_store_context"> Store Context</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_postshot_export_ply"> Export PLY</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_postshot_alpha_mask"> Alpha Mask</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_postshot_sky_model"> Sky Model</label>
+      </div>
+
+      <!-- ═══ BRUSH ═══ -->
+      <div id="subtab-brush" class="subtab-content hidden">
+        <div class="settings-row">
+          <div class="settings-group">
+            <label class="settings-label">Total Steps</label>
+            <input type="number" id="cfg_brush_total_steps" class="settings-input" min="1000" step="1000">
+          </div>
+          <div class="settings-group">
+            <label class="settings-label">Max Splats</label>
+            <input type="number" id="cfg_brush_max_splats" class="settings-input" min="100" step="100">
+          </div>
+        </div>
+        <div class="settings-row">
+          <div class="settings-group">
+            <label class="settings-label">Max Resolution (px)</label>
+            <input type="number" id="cfg_brush_max_resolution" class="settings-input" min="256" step="64">
+          </div>
+          <div class="settings-group">
+            <label class="settings-label">Seed</label>
+            <input type="number" id="cfg_brush_seed" class="settings-input" min="0">
+          </div>
+        </div>
+        <div class="settings-section-title">Options</div>
+        <label class="settings-check"><input type="checkbox" id="cfg_brush_rerun_logging"> Enable Rerun Logging</label>
+        <label class="settings-check"><input type="checkbox" id="cfg_brush_spawn_viewer"> Spawn Viewer on Completion</label>
+      </div>
+
+      <!-- ═══ PATHS ═══ -->
+      <div id="subtab-paths" class="subtab-content hidden">
+        <div class="settings-group">
+          <label class="settings-label">FFmpeg Executable</label>
+          <input type="text" id="cfg_ffmpeg_path" class="settings-input" placeholder="C:\...\ffmpeg.exe">
+        </div>
+        <div class="settings-group">
+          <label class="settings-label">RealityScan Executable</label>
+          <input type="text" id="cfg_rs_path" class="settings-input" placeholder="C:\...\RealityScan.exe">
+        </div>
+        <div class="settings-group">
+          <label class="settings-label">Postshot CLI Executable</label>
+          <input type="text" id="cfg_postshot_path" class="settings-input" placeholder="C:\...\postshot-cli.exe">
+        </div>
+        <div class="settings-group">
+          <label class="settings-label">Brush Executable</label>
+          <input type="text" id="cfg_brush_path" class="settings-input" placeholder="C:\...\brush_app.exe">
+        </div>
+        <div class="settings-group">
+          <label class="settings-label">RealityScan Settings Folder</label>
+          <input type="text" id="cfg_rs_settings_path" class="settings-input" placeholder="C:\...\FFmpeg and RS Settings">
+        </div>
+        <div class="settings-group">
+          <label class="settings-label">VGGT Project Folder</label>
+          <input type="text" id="cfg_vggt_path" class="settings-input" placeholder="C:\...\vggt">
+        </div>
+        <div class="settings-group">
+          <label class="settings-label">fusion2sphere Executable</label>
+          <input type="text" id="cfg_fusion2sphere_path" class="settings-input"
+                 placeholder="C:\...\insp_fusion2sphere\fusion2sphere.exe">
+          <div class="settings-hint">
+            Required for Insta360 .insp files — stitches dual-fisheye frames into equirectangular panoramas.
+            Download from <a href="#" onclick="return false;" style="color:var(--clay-light);">github.com/dorthrithil/fusion2sphere</a>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:center; gap:12px; margin-top:16px; padding-top:12px; border-top:1px solid rgba(196,98,45,0.12);">
+        <button class="btn btn-primary btn-sm" onclick="savePipelineSettings()">💾 Save All Settings</button>
+        <span id="settingsSaveStatus" style="font-size:12px; color:var(--fog);"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">ℹ️ About</div>
+      <p style="font-size:13px; color:var(--fog);">
+        FieldRaven Desktop v1.0.0 · Slow Ocean · Denman Island, BC<br>
+        <span id="aboutUser">Not signed in</span>
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 3D VIEWER MODAL ═══ -->
+<div id="viewerModal" class="viewer-modal" onclick="handleViewerBackdrop(event)">
+  <div class="viewer-box">
+    <div class="viewer-header">
+      <span>🌐 3D Output — VGGT Scene</span>
+      <button class="btn btn-secondary btn-sm" onclick="close3DViewer()">✕ Close</button>
+    </div>
+    <div class="viewer-canvas-wrap">
+      <canvas id="viewerCanvas"></canvas>
+      <div class="viewer-hint" id="viewerHint">Loading 3D scene…</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────
+// auth and db are set after firebase-config is fetched from the backend
+let auth, db;
+
+// ── State ──────────────────────────────────────────────
+let currentUser = null;
+let idToken = null;
+let currentJobId = null;
+let _machineId = null;
+let pollInterval = null;
+let activeJobPollInterval = null;
+let cameraPollInterval = null;
+let _allJobs    = [];
+let _allClients = [];
+let _mapInitialized = false;
+let _leafletLoaded  = false;
+let _leafletMap     = null;
+
+// ── Auth ───────────────────────────────────────────────
+function signInWithGoogle() {
+  const provider = new firebase.auth.GoogleAuthProvider();
+  auth.signInWithPopup(provider)
+    .then(async (result) => {
+      currentUser = result.user;
+      idToken = await currentUser.getIdToken();
+      try {
+        await sendTokenToBackend(idToken);
+        showApp();
+      } catch (backendErr) {
+        // onAuthStateChanged will retry — don't alert the user here
+        console.warn('Initial backend login deferred to auth listener:', backendErr.message);
+      }
+    })
+    .catch((err) => {
+      if (err.code !== 'auth/popup-closed-by-user') {
+        alert('Google sign-in failed: ' + err.message);
+      }
+    });
+}
+
+async function sendTokenToBackend(token) {
+  const res = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idToken: token }),
+  });
+  if (!res.ok) throw new Error('Backend login failed');
+  return res.json();
+}
+
+async function signOut() {
+  await auth.signOut();
+  await fetch('/api/auth/logout', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + idToken },
+  });
+  currentUser = null;
+  idToken = null;
+  currentJobId = null;
+  clearIntervals();
+  showAuth();
+}
+
+// ── Bootstrap — fetch config from backend, then init Firebase ─
+(async () => {
+  try {
+    const res = await fetch('/api/firebase-config');
+    if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
+    const cfg = await res.json();
+    firebase.initializeApp(cfg);
+    auth = firebase.auth();
+    db   = firebase.firestore();
+  } catch (e) {
+    console.error('🦅 Firebase init failed:', e);
+    return;
+  }
+
+// ── Auth State Listener ────────────────────────────────
+auth.onAuthStateChanged(async (user) => {
+  if (user) {
+    currentUser = user;
+    idToken = await user.getIdToken();
+    try {
+      await sendTokenToBackend(idToken);
+      showApp();
+    } catch (e) {
+      console.warn('Backend not ready yet, retrying...', e);
+      // Backend might not be up yet — retry in a moment
+      setTimeout(async () => {
+        try {
+          await sendTokenToBackend(idToken);
+          showApp();
+        } catch (e2) {
+          console.error('Backend login failed:', e2);
+          showAuth();
+        }
+      }, 2000);
+    }
+  } else {
+    showAuth();
+  }
+});
+
+// ── Screen Management ─────────────────────────────────
+function showAuth() {
+  document.getElementById('authScreen').classList.remove('hidden');
+  document.getElementById('appScreen').classList.add('hidden');
+  clearIntervals();
+}
+
+function showApp() {
+  document.getElementById('authScreen').classList.add('hidden');
+  document.getElementById('appScreen').classList.remove('hidden');
+  refreshMachineStatus();
+  startPolling();
+  checkCamera();
+  cameraPollInterval = setInterval(checkCamera, 5000);
+  switchTab('dashboard');
+}
+
+function clearIntervals() {
+  if (pollInterval) clearInterval(pollInterval);
+  if (activeJobPollInterval) clearInterval(activeJobPollInterval);
+  if (cameraPollInterval) clearInterval(cameraPollInterval);
+  pollInterval = null;
+  activeJobPollInterval = null;
+  cameraPollInterval = null;
+}
+
+// ── Tab Switching ─────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.add('hidden'));
+  const tabBtn = document.querySelector(`.tab[data-tab="${name}"]`);
+  if (tabBtn) tabBtn.classList.add('active');
+  const tabEl = document.getElementById('tab' + name.charAt(0).toUpperCase() + name.slice(1));
+  if (tabEl) tabEl.classList.remove('hidden');
+  if (name === 'dashboard') loadDashboard();
+  if (name === 'jobs')      loadJobs();
+  if (name === 'clients')   loadClients();
+  if (name === 'map')       loadMap();
+  if (name === 'queue')     loadQueue();
+  if (name === 'active' && currentJobId) loadActiveJob();
+  if (name === 'history')   loadHistory();
+  if (name === 'settings')  loadSettings();
+}
+
+// ── Machine Status (header + settings card) ───────────
+async function refreshMachineStatus() {
+  try {
+    const res = await fetch('/api/health', {
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    const data = await res.json();
+    _machineId = data.machine_id || null;
+    document.getElementById('machineName').textContent = data.machine_name || data.machine_id;
+    const machineIdEl = document.getElementById('settingsMachineId');
+    if (machineIdEl) machineIdEl.value = data.machine_id || 'unknown';
+    const dot = document.getElementById('statusDot');
+    if (data.firebase?.connected) {
+      dot.className = data.busy ? 'status-dot busy' : 'status-dot online';
+      const fbEl = document.getElementById('firebaseStatus');
+      if (fbEl) fbEl.textContent = '✅ Connected to fieldraven-ffad8';
+    } else {
+      dot.className = 'status-dot offline';
+      const fbEl = document.getElementById('firebaseStatus');
+      if (fbEl) fbEl.textContent = '❌ Not connected — check service account';
+    }
+  } catch (e) {
+    console.warn('Machine status check failed:', e);
+    const fbEl = document.getElementById('firebaseStatus');
+    if (fbEl) fbEl.textContent = '⚠️ Cannot reach backend';
+  }
+}
+
+// ── Firestore Helpers ────────────────────────────────
+async function fsGetJobs(uid, limitN = 200) {
+  const snap = await db.collection('users').doc(uid).collection('jobs')
+    .orderBy('startTime', 'desc').limit(limitN).get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+async function fsGetClients(uid) {
+  const snap = await db.collection('users').doc(uid).collection('clients').get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+// startTime is a plain number (ms since epoch) in Firestore
+function fmtHM(ms) {
+  if (!ms) return '0h 0m';
+  const h = Math.floor(ms / 3600000);
+  const m = Math.round((ms % 3600000) / 60000);
+  return `${h}h ${m}m`;
+}
+function fmtTime(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit' });
+}
+function fmtDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleDateString('en-CA',
+    { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+}
+function fmtDateShort(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleDateString('en-CA',
+    { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+// ── Dashboard Tab ─────────────────────────────────────
+async function loadDashboard() {
+  if (!currentUser) return;
+  document.getElementById('dashLoading').style.display = 'flex';
+  document.getElementById('dashContent').classList.add('hidden');
+  try {
+    const jobs = await fsGetJobs(currentUser.uid, 200);
+    const now = Date.now();
+    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
+
+    const totalMs   = jobs.reduce((s, j) => s + (j.durationMs || 0), 0);
+    const monthJobs = jobs.filter(j => j.startTime >= monthStart);
+    const monthMs   = monthJobs.reduce((s, j) => s + (j.durationMs || 0), 0);
+
+    const clientHours = {};
+    jobs.forEach(j => {
+      clientHours[j.clientName] = (clientHours[j.clientName] || 0) + (j.durationMs || 0);
+    });
+    const topEntry = Object.entries(clientHours).sort((a, b) => b[1] - a[1])[0];
+
+    document.getElementById('statTotalJobs').textContent        = jobs.length;
+    document.getElementById('statTotalHours').textContent       = fmtHM(totalMs);
+    document.getElementById('statThisMonth').textContent        = monthJobs.length + ' jobs';
+    document.getElementById('statThisMonthHours').textContent   = fmtHM(monthMs);
+    document.getElementById('statTopClient').textContent        = topEntry?.[0] ?? '—';
+    document.getElementById('statTopClientHours').textContent   = topEntry ? fmtHM(topEntry[1]) : '';
+
+    // Quick links
+    const clients = await fsGetClients(currentUser.uid);
+    document.getElementById('dashQuickLinks').innerHTML = [
+      { tab: 'jobs',     label: 'View All Jobs',   count: jobs.length },
+      { tab: 'clients',  label: 'Clients',          count: clients.length },
+      { tab: 'map',      label: 'Field Map',        count: null },
+      { tab: 'queue',    label: 'Processing Queue', count: null },
+    ].map(({ tab, label, count }) => `
+      <div class="quick-link-card" onclick="switchTab('${tab}')">
+        <div class="quick-link-count">${count !== null ? count : '→'}</div>
+        <div class="quick-link-label">${label}</div>
+      </div>
+    `).join('');
+
+    // Recent jobs
+    const recent = jobs.slice(0, 8);
+    const recentEl = document.getElementById('dashRecentJobs');
+    if (!recent.length) {
+      recentEl.innerHTML = '<div class="card-empty" style="background:var(--bark);border:1px solid rgba(196,98,45,0.15);border-radius:12px;padding:32px;text-align:center;">No jobs yet. Start tracking on the mobile app.</div>';
+    } else {
+      recentEl.innerHTML = recent.map(j => `
+        <div class="recent-job-row">
+          <div>
+            <div style="font-weight:600;font-size:14px;color:var(--cream);">${j.clientName || 'Unknown'}</div>
+            <div style="font-size:12px;color:var(--fog);margin-top:2px;">${fmtDate(j.startTime)} · ${fmtTime(j.startTime)}</div>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-weight:700;font-size:14px;color:var(--moss-light);font-family:monospace;">${fmtHM(j.durationMs)}</div>
+            ${j.manual ? '<div style="font-size:10px;color:var(--clay);">manual</div>' : ''}
+          </div>
+        </div>
+      `).join('');
+    }
+
+    document.getElementById('dashLoading').style.display = 'none';
+    document.getElementById('dashContent').classList.remove('hidden');
+  } catch (e) {
+    console.warn('Dashboard load failed:', e);
+    document.getElementById('dashLoading').style.display = 'none';
+    document.getElementById('dashContent').classList.remove('hidden');
+    document.getElementById('dashRecentJobs').innerHTML =
+      '<div class="card-empty">Could not load — check Firestore permissions.</div>';
+  }
+}
+
+// ── Jobs Tab ──────────────────────────────────────────
+async function loadJobs() {
+  if (!currentUser) return;
+  const listEl = document.getElementById('fieldJobsList');
+  listEl.innerHTML = '<div class="card-empty" style="color:var(--fog);">Loading...</div>';
+  try {
+    const [jobs, clients] = await Promise.all([
+      fsGetJobs(currentUser.uid, 200),
+      fsGetClients(currentUser.uid),
+    ]);
+    _allJobs    = jobs;
+    _allClients = clients;
+
+    // Populate client dropdown
+    const sel = document.getElementById('jobsClientFilter');
+    sel.innerHTML = '<option value="">All clients</option>' +
+      clients.map(c => {
+        const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || c.business || 'Unnamed';
+        return `<option value="${c.id}">${name}</option>`;
+      }).join('');
+
+    filterJobs();
+  } catch (e) {
+    listEl.innerHTML = '<div class="card-empty">Could not load jobs.</div>';
+    console.warn('Jobs load failed:', e);
+  }
+}
+
+function filterJobs() {
+  const q   = (document.getElementById('jobsSearch')?.value || '').toLowerCase();
+  const cid = document.getElementById('jobsClientFilter')?.value || '';
+  const filtered = _allJobs.filter(j => {
+    if (cid && j.clientId !== cid) return false;
+    if (q && !(j.clientName || '').toLowerCase().includes(q) &&
+             !(j.notes || '').toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const totalMs = filtered.reduce((s, j) => s + (j.durationMs || 0), 0);
+  const countEl = document.getElementById('jobsCountLine');
+  if (countEl) countEl.textContent = `${filtered.length} job${filtered.length !== 1 ? 's' : ''} · ${fmtHM(totalMs)}`;
+  renderJobsList(filtered);
+}
+
+function renderJobsList(jobs) {
+  const listEl = document.getElementById('fieldJobsList');
+  if (!jobs.length) {
+    listEl.innerHTML = '<div class="card-empty">No jobs found.</div>';
+    return;
+  }
+  listEl.innerHTML = jobs.map(j => {
+    const safeId = j.id.replace(/'/g, "\\'");
+    return `
+    <div class="field-job-card">
+      <div style="flex:1;min-width:0;">
+        <div class="field-job-client">${j.clientName || 'Unknown Client'}</div>
+        <div class="field-job-meta">${fmtDate(j.startTime)} · ${fmtTime(j.startTime)}${j.endTime ? ' – ' + fmtTime(j.endTime) : ''}</div>
+        ${j.notes ? `<div class="field-job-notes">${String(j.notes).substring(0, 80)}${j.notes.length > 80 ? '…' : ''}</div>` : ''}
+        ${j.manual ? '<span style="font-size:10px;color:var(--clay);font-weight:600;">manual</span>' : ''}
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+        <span style="font-size:14px;font-weight:700;color:var(--moss-light);font-family:monospace;">${fmtHM(j.durationMs)}</span>
+        <button class="btn btn-clay btn-sm" onclick="queueForProcessing('${safeId}', this)">Queue</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function queueForProcessing(userJobId, btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const res = await fetch('/api/jobs/queue-for-processing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + idToken },
+      body: JSON.stringify({ userJobId }),
+    });
+    if (res.ok) {
+      btn.textContent = '✅';
+      setTimeout(() => switchTab('queue'), 600);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      btn.disabled = false;
+      btn.textContent = orig;
+      alert('Failed to queue job: ' + (err.detail || 'Unknown error'));
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = orig;
+    alert('Failed to queue job: ' + e.message);
+  }
+}
+
+// ── Clients Tab ───────────────────────────────────────
+async function loadClients() {
+  if (!currentUser) return;
+  const listEl = document.getElementById('clientsList');
+  listEl.innerHTML = '<div class="card-empty" style="color:var(--fog);">Loading...</div>';
+  try {
+    _allClients = await fsGetClients(currentUser.uid);
+    renderClientsList(_allClients);
+  } catch (e) {
+    listEl.innerHTML = '<div class="card-empty">Could not load clients.</div>';
+    console.warn('Clients load failed:', e);
+  }
+}
+
+function renderClientsList(clients) {
+  const listEl = document.getElementById('clientsList');
+  if (!clients.length) {
+    listEl.innerHTML = '<div class="card-empty">No clients yet. Add them in the mobile app.</div>';
+    return;
+  }
+  listEl.innerHTML = clients.map(c => {
+    const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || c.business || 'Unnamed';
+    return `
+    <div class="client-card">
+      <div style="font-weight:600;font-size:14px;">${name}</div>
+      ${c.business ? `<div style="font-size:12px;color:var(--clay-light);">🏢 ${c.business}</div>` : ''}
+      <div style="font-size:12px;color:var(--fog);margin-top:4px;">
+        ${[c.email, c.phone].filter(Boolean).join(' · ') || '—'}
+      </div>
+      ${c.notes ? `<div style="font-size:11px;color:var(--fog);font-style:italic;margin-top:3px;">${c.notes}</div>` : ''}
+      ${c.dailyHourCap ? `<div style="font-size:11px;color:var(--moss);">Cap: ${c.dailyHourCap}h/day</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function filterClients(query) {
+  const q = query.toLowerCase();
+  renderClientsList(q ? _allClients.filter(c =>
+    ((c.firstName || '') + ' ' + (c.lastName || '') + ' ' + (c.business || '')).toLowerCase().includes(q)
+  ) : _allClients);
+}
+
+// ── Map Tab ───────────────────────────────────────────
+const CLIENT_COLORS = ['#6B9A55','#E07A45','#5B8EC4','#C4622D','#8E6BC4','#C4A62D','#2DC4A6','#C42D6B'];
+let _mapTileMode  = 'satellite';
+let _mapMarkers   = [];
+let _mapTileLayer = null;
+let _mapLabelLayer = null;
+
+function loadMap() {
+  if (!currentUser) return;
+  if (!_leafletLoaded) {
+    _leafletLoaded = true;
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    document.head.appendChild(link);
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    script.onload = _renderMap;
+    document.head.appendChild(script);
+  } else {
+    _renderMap();
+  }
+}
+
+function setMapTile(mode) {
+  _mapTileMode = mode;
+  document.getElementById('mapBtnSat').classList.toggle('active-map-btn', mode === 'satellite');
+  document.getElementById('mapBtnTopo').classList.toggle('active-map-btn', mode === 'topo');
+  if (!_leafletMap) return;
+  if (_mapTileLayer) _leafletMap.removeLayer(_mapTileLayer);
+  if (_mapLabelLayer) { _leafletMap.removeLayer(_mapLabelLayer); _mapLabelLayer = null; }
+  if (mode === 'satellite') {
+    _mapTileLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri', maxZoom: 18 }).addTo(_leafletMap);
+    _mapLabelLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', { attribution: '', maxZoom: 18, opacity: 0.8 }).addTo(_leafletMap);
+  } else {
+    _mapTileLayer = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap contributors | OpenTopoMap', maxNativeZoom: 17, maxZoom: 18 }).addTo(_leafletMap);
+  }
+}
+
+function _makePin(color) {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="36" viewBox="0 0 28 36">
+    <path d="M14 0C6.268 0 0 6.268 0 14c0 9.333 14 22 14 22S28 23.333 28 14 21.732 0 14 0z"
+      fill="${color}" stroke="rgba(255,255,255,0.8)" stroke-width="2"/>
+    <circle cx="14" cy="14" r="5" fill="white"/>
+    <circle cx="14" cy="14" r="3" fill="${color}"/>
+  </svg>`;
+  return L.divIcon({ html: svg, iconSize: [28, 36], iconAnchor: [14, 36], popupAnchor: [0, -38], className: '' });
+}
+
+async function _renderMap() {
+  const container = document.getElementById('mapContainer');
+  if (!container || typeof L === 'undefined') return;
+
+  if (!_mapInitialized) {
+    _leafletMap = L.map('mapContainer', { center: [20, 0], zoom: 2, zoomControl: true });
+    setMapTile('satellite');
+    _mapInitialized = true;
+  }
+
+  // Clear old markers
+  _mapMarkers.forEach(m => _leafletMap.removeLayer(m));
+  _mapMarkers = [];
+
+  try {
+    const jobs = await fsGetJobs(currentUser.uid, 200);
+    const jobsWithGPS = jobs.filter(j => j.gpsStart?.lat && (j.gpsStart?.lon || j.gpsStart?.lng));
+
+    const countEl = document.getElementById('mapJobCount');
+    if (countEl) countEl.textContent = jobsWithGPS.length + ' job location' + (jobsWithGPS.length !== 1 ? 's' : '');
+
+    // Build client → color map
+    const clientNames = [...new Set(jobs.map(j => j.clientName))];
+    const colorMap = {};
+    clientNames.forEach((c, i) => { colorMap[c] = CLIENT_COLORS[i % CLIENT_COLORS.length]; });
+
+    const bounds = [];
+    jobsWithGPS.forEach(j => {
+      const lat  = j.gpsStart.lat;
+      const lon  = j.gpsStart.lon || j.gpsStart.lng;
+      const color = colorMap[j.clientName] || CLIENT_COLORS[0];
+      const popup = `<div style="background:#3D2412;border-radius:8px;overflow:hidden;min-width:170px;border:1px solid rgba(196,98,45,0.3);font-family:sans-serif;">
+        <div style="background:#2C1A0E;padding:8px 10px;border-left:4px solid ${color};">
+          <div style="font-size:14px;font-weight:700;color:#F5EDD8;">${j.clientName || 'Job'}</div>
+          <div style="font-size:11px;color:#B8C4A8;">${fmtDate(j.startTime)}</div>
+        </div>
+        <div style="padding:8px 10px;">
+          <span style="font-size:18px;font-weight:700;color:#6B9A55;font-family:monospace;display:block;margin-bottom:4px;">${fmtHM(j.durationMs)}</span>
+          <div style="font-size:11px;color:#B8C4A8;">🕐 ${fmtTime(j.startTime)}</div>
+          ${j.notes ? `<div style="font-size:11px;color:#E8D5B0;font-style:italic;margin-top:6px;padding-top:6px;border-top:1px solid rgba(196,98,45,0.15);">📝 ${j.notes}</div>` : ''}
+        </div>
+      </div>`;
+      const marker = L.marker([lat, lon], { icon: _makePin(color) })
+        .bindPopup(popup, { maxWidth: 280, className: 'fr-popup' })
+        .addTo(_leafletMap);
+      _mapMarkers.push(marker);
+      bounds.push([lat, lon]);
+    });
+
+    if (bounds.length === 1) {
+      _leafletMap.setView(bounds[0], 14);
+    } else if (bounds.length > 1) {
+      _leafletMap.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
+    }
+  } catch (e) {
+    console.warn('Map job load failed:', e);
+  }
+  setTimeout(() => _leafletMap && _leafletMap.invalidateSize(), 200);
+}
+
+// ── Queue ─────────────────────────────────────────────
+async function loadQueue() {
+  try {
+    const res = await fetch('/api/jobs/queue', {
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    const data = await res.json();
+    const list = document.getElementById('queueList');
+
+    if (data.busy) {
+      list.innerHTML = `
+        <div class="card-empty" style="color:var(--clay-light);">
+          ⚙️ Currently processing a job. Check the Active Job tab.
+        </div>
+      `;
+      currentJobId = data.current?.docId || null;
+      if (currentJobId) loadActiveJob();
+      return;
+    }
+
+    if (!data.queued || data.queued.length === 0) {
+      list.innerHTML = `<div class="card-empty">No jobs in queue. Assign jobs from the web app.</div>`;
+      return;
+    }
+
+    list.innerHTML = data.queued.map(job => `
+      <div class="job-item" id="qi-${job.docId}">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div style="display:flex; align-items:center;">
+            <span class="job-icon">${getJobIcon(job.jobType)}</span>
+            <div class="job-info">
+              <div class="job-name">${job.clientName || 'Unknown Client'}</div>
+              <div class="job-meta">
+                ${job.jobType || 'job'} · ${job.fileCount || 0} files ·
+                ${job.processingProfile || 'splat3'} profile
+              </div>
+            </div>
+          </div>
+          <div class="job-actions">
+            <button class="btn btn-secondary btn-sm" onclick="toggleOverride('${job.docId}')">⚙️</button>
+            <button class="btn btn-primary btn-sm" onclick="acceptJob('${job.docId}')">Accept</button>
+          </div>
+        </div>
+        <div id="override-${job.docId}" class="override-panel hidden">
+          <div class="override-title">Settings Override</div>
+          <div class="override-grid">
+            <div class="settings-group">
+              <label class="settings-label">Extraction Method</label>
+              <select class="settings-input settings-input-sm" id="ov_method_${job.docId}">
+                <option value="">— default —</option>
+                <option value="interval">Interval</option>
+                <option value="count">Frame Count</option>
+              </select>
+            </div>
+            <div class="settings-group">
+              <label class="settings-label">Interval (sec)</label>
+              <input type="number" class="settings-input settings-input-sm" id="ov_interval_${job.docId}" placeholder="1.0" step="0.1" min="0.1">
+            </div>
+            <div class="settings-group">
+              <label class="settings-label">Pitch Angles</label>
+              <input type="text" class="settings-input settings-input-sm" id="ov_pitch_${job.docId}" placeholder="-30, 0, 30">
+            </div>
+            <div class="settings-group">
+              <label class="settings-label">Yaw Steps</label>
+              <input type="number" class="settings-input settings-input-sm" id="ov_yaw_${job.docId}" placeholder="6" min="1">
+            </div>
+          </div>
+          <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
+            <label class="settings-check"><input type="checkbox" id="ov_vggt_${job.docId}" checked> VGGT</label>
+            <label class="settings-check"><input type="checkbox" id="ov_postshot_${job.docId}"> Postshot</label>
+            <label class="settings-check"><input type="checkbox" id="ov_brush_${job.docId}"> Brush</label>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px; margin-top:10px;">
+            <button class="btn btn-secondary btn-sm" onclick="saveJobOverride('${job.docId}')">💾 Save Override</button>
+            <span id="ov_status_${job.docId}" style="font-size:12px;"></span>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    console.warn('Queue load failed:', e);
+  }
+}
+
+async function acceptJob(jobId) {
+  try {
+    const res = await fetch('/api/jobs/accept', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + idToken,
+      },
+      body: JSON.stringify({ jobId }),
+    });
+    if (res.ok) {
+      currentJobId = jobId;
+      switchTab('active');
+      loadActiveJob();
+      document.getElementById('cameraImportSection').classList.remove('hidden');
+      checkCamera();
+      checkInputFiles();
+    } else {
+      alert('Failed to accept job');
+    }
+  } catch (e) {
+    console.error('Accept job failed:', e);
+  }
+}
+
+// ── Active Job ────────────────────────────────────────
+let _lastLogStep = '';
+
+async function loadActiveJob() {
+  if (!currentJobId) return;
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}/status`, {
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    if (!res.ok) {
+      document.getElementById('noActiveJob').classList.remove('hidden');
+      document.getElementById('activeJobContent').classList.add('hidden');
+      return;
+    }
+    const job = await res.json();
+    document.getElementById('noActiveJob').classList.add('hidden');
+    document.getElementById('activeJobContent').classList.remove('hidden');
+
+    document.getElementById('activeJobName').textContent = job.clientName || 'Processing Job';
+    document.getElementById('activeJobType').textContent =
+      [job.jobType, job.processingProfile].filter(Boolean).join(' · ');
+
+    const pct = job.progress || 0;
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressPct').textContent = pct + '%';
+    document.getElementById('progressStep').textContent = job.currentStep || 'Waiting to start…';
+
+    // Status badge
+    const statusEl = document.getElementById('activeJobStatus');
+    const isTerminal = ['complete', 'error', 'cancelled'].includes(job.status);
+    const pipelineRunning = job.currentStage && job.currentStage !== 'idle';
+    if (job.status === 'complete') {
+      statusEl.textContent = '✅ Complete'; statusEl.style.color = 'var(--green)';
+    } else if (job.status === 'error') {
+      statusEl.textContent = '❌ Error'; statusEl.style.color = 'var(--red)';
+    } else if (pipelineRunning) {
+      statusEl.textContent = '⚙️ Processing'; statusEl.style.color = 'var(--clay-light)';
+    } else {
+      statusEl.textContent = '⏳ Ready'; statusEl.style.color = 'var(--fog)';
+    }
+
+    // Stage stepper
+    updateStageStepper(job.currentStage || '', job.status);
+
+    // Start Processing button — hide once pipeline is live or job is terminal
+    const startBtn = document.getElementById('startPipelineBtn');
+    if (pipelineRunning || isTerminal) {
+      startBtn.classList.add('hidden');
+    } else {
+      startBtn.classList.remove('hidden');
+    }
+
+    // 3D viewer button — reveal when complete and GLB URL is available
+    const view3dBtn = document.getElementById('view3dBtn');
+    if (job.status === 'complete' && job.previewUrl) {
+      view3dBtn.classList.remove('hidden');
+      view3dBtn.dataset.glbUrl = job.previewUrl;
+    } else {
+      view3dBtn.classList.add('hidden');
+    }
+
+    // Log — only append when the step changes to avoid spam
+    if (job.currentStep && job.currentStep !== _lastLogStep) {
+      _lastLogStep = job.currentStep;
+      addLogEntry(job.currentStep, job.status === 'error' ? 'error' : 'info');
+    }
+
+    // Poll management
+    if (!activeJobPollInterval) {
+      activeJobPollInterval = setInterval(loadActiveJob, 3000);
+    }
+    if (isTerminal) {
+      clearInterval(activeJobPollInterval);
+      activeJobPollInterval = null;
+      if (job.status === 'complete') addLogEntry('✅ Job complete!', 'success');
+    }
+  } catch (e) {
+    console.warn('Active job load failed:', e);
+  }
+}
+
+function addLogEntry(text, type = 'info') {
+  const log = document.getElementById('jobLog');
+  const entry = document.createElement('div');
+  entry.className = 'log-entry ' + type;
+  const time = new Date().toLocaleTimeString();
+  entry.textContent = `[${time}] ${text}`;
+  log.appendChild(entry);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function cancelActiveJob() {
+  if (!currentJobId || !confirm('Cancel this job?')) return;
+  try {
+    await fetch(`/api/jobs/${currentJobId}/cancel`, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    currentJobId = null;
+    if (activeJobPollInterval) {
+      clearInterval(activeJobPollInterval);
+      activeJobPollInterval = null;
+    }
+    switchTab('queue');
+    loadQueue();
+  } catch (e) {
+    console.error('Cancel failed:', e);
+  }
+}
+
+function openJobDir() {
+  if (currentJobId) {
+    window.open(`/api/jobs/${currentJobId}/files`, '_blank');
+  }
+}
+
+// ── Camera ─────────────────────────────────────────────
+let _lastCameraDrive = null;
+
+function _fmtBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+async function checkCamera() {
+  const cameraText = document.getElementById('cameraText');
+  try {
+    if (!currentUser) return;
+    idToken = await currentUser.getIdToken();
+    const res = await fetch('/api/camera/status', {
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    if (!res.ok) {
+      cameraText.textContent = '📷 —';
+      cameraText.style.color = 'var(--fog)';
+      return;
+    }
+    const data = await res.json();
+    const statusEl   = document.getElementById('cameraDetectStatus');
+    const fileListEl = document.getElementById('cameraFileList');
+    const importBtn  = document.getElementById('importBtn');
+
+    if (data.camera_connected) {
+      _lastCameraDrive = data.camera_drive;
+      cameraText.textContent = '📷 Camera on ' + data.camera_drive;
+      cameraText.style.color = 'var(--green)';
+      if (importBtn) importBtn.disabled = false;
+
+      const parts = [];
+      if (data.video_count) parts.push(`${data.video_count} video${data.video_count > 1 ? 's' : ''}`);
+      if (data.photo_count) parts.push(`${data.photo_count} photo${data.photo_count > 1 ? 's' : ''}`);
+      const summary = parts.join(', ') || `${data.file_count} files`;
+      if (statusEl) { statusEl.textContent = `Insta360 on ${data.camera_drive} — ${summary} (${_fmtBytes(data.total_bytes)})`; statusEl.style.color = 'var(--green)'; }
+
+      if (fileListEl && data.files?.length) {
+        const shown = data.files.slice(0, 8);
+        fileListEl.innerHTML = shown.map(f =>
+          `<div>${f.name} <span style="color:var(--clay-light);">${_fmtBytes(f.size)}</span></div>`
+        ).join('') + (data.files.length > 8 ? `<div style="color:var(--clay);">...and ${data.files.length - 8} more</div>` : '');
+      } else if (fileListEl) {
+        fileListEl.textContent = '';
+      }
+    } else {
+      _lastCameraDrive = null;
+      cameraText.textContent = '🔌 No camera';
+      cameraText.style.color = 'var(--fog)';
+      if (importBtn) importBtn.disabled = true;
+      if (statusEl) { statusEl.textContent = 'Plug in your Insta360 camera or SD card.'; statusEl.style.color = 'var(--fog)'; }
+      if (fileListEl) fileListEl.textContent = '';
+    }
+  } catch (e) {
+    if (cameraText) { cameraText.textContent = '📷 —'; cameraText.style.color = 'var(--fog)'; }
+    console.warn('Camera check failed:', e);
+  }
+}
+
+async function importFromCamera() {
+  if (!currentJobId) return;
+
+  if (!_lastCameraDrive) {
+    const status = await fetch('/api/camera/status', {
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    }).then(r => r.json()).catch(() => null);
+    if (!status?.camera_connected) {
+      alert('Camera not detected. Make sure it is connected and powered on.');
+      return;
+    }
+    _lastCameraDrive = status.camera_drive;
+  }
+
+  const importBtn  = document.getElementById('importBtn');
+  const progressEl = document.getElementById('importProgress');
+  importBtn.disabled = true;
+  importBtn.textContent = 'Importing...';
+  progressEl.textContent = 'Copying files — this may take a while for large videos...';
+  progressEl.style.color = 'var(--clay-light)';
+
+  try {
+    const res = await fetch('/api/camera/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + idToken },
+      body: JSON.stringify({ jobId: currentJobId, sourceDrive: _lastCameraDrive }),
+    });
+    const data = await res.json();
+
+    if (res.ok) {
+      const msg = `${data.imported} file${data.imported !== 1 ? 's' : ''} copied` +
+                  (data.skipped ? `, ${data.skipped} already present` : '') +
+                  (data.errors  ? `, ${data.errors} errors` : '');
+      addLogEntry('Import complete: ' + msg, 'success');
+      progressEl.textContent = msg;
+      progressEl.style.color = 'var(--green)';
+      document.getElementById('cameraDetectStatus').textContent = 'Import complete';
+      checkInputFiles();
+    } else {
+      const err = (data && data.detail) || 'Import failed';
+      progressEl.textContent = err;
+      progressEl.style.color = 'var(--red)';
+      addLogEntry('Import error: ' + err, 'error');
+    }
+  } catch (e) {
+    progressEl.textContent = e.message;
+    progressEl.style.color = 'var(--red)';
+    addLogEntry('Import failed: ' + e.message, 'error');
+  } finally {
+    importBtn.disabled = false;
+    importBtn.textContent = 'Import from Camera';
+  }
+}
+
+// ── History ────────────────────────────────────────────
+async function loadHistory() {
+  const el = document.getElementById('jobHistory');
+  el.innerHTML = '<div class="card-empty" style="color:var(--fog);">Loading...</div>';
+  try {
+    if (currentUser) {
+      try { idToken = await currentUser.getIdToken(); } catch(e) {}
+    }
+
+    const res = await fetch('/api/jobs/history', {
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    const data = await res.json();
+    const jobs = data.jobs || [];
+
+    if (jobs.length === 0) {
+      el.innerHTML = '<div class="card-empty">No processing jobs yet. Queue a field job to get started.</div>';
+      return;
+    }
+
+    const statusBadge = s => {
+      const map = {
+        complete:  ['✅', 'var(--green)',      'Complete'],
+        error:     ['❌', 'var(--red)',        'Failed'],
+        cancelled: ['🚫', 'var(--fog)',        'Cancelled'],
+        processing:['⚙️', 'var(--clay-light)', 'Processing'],
+        queued:    ['⏳', 'var(--sand)',       'Queued'],
+        waiting_for_camera: ['📷', 'var(--fog)', 'Waiting'],
+      };
+      const [icon, color, label] = map[s] || ['❓', 'var(--fog)', s || '?'];
+      return `<span style="font-size:11px;color:${color};white-space:nowrap;">${icon} ${label}</span>`;
+    };
+
+    el.innerHTML = jobs.map(job => {
+      const createdStr = job.createdAt ? fmtDateShort(new Date(job.createdAt).getTime()) : '—';
+      const completedStr = job.completedAt
+        ? new Date(job.completedAt).toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit' }) + ' · ' + fmtDateShort(new Date(job.completedAt).getTime())
+        : null;
+      const hasGlb = !!job.previewUrl;
+      const status = job.status || 'queued';
+      return `
+        <div class="completed-job" style="flex-wrap:wrap; gap:8px;">
+          <div style="flex:1; min-width:0;">
+            <div style="font-weight:600; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${job.name || job.clientName || 'Processing Job'}</div>
+            <div style="font-size:11px; color:var(--fog); margin-top:2px;">
+              Queued ${createdStr}${completedStr ? ' · Done ' + completedStr : ''}
+              ${job.errorMessage ? '<br><span style="color:var(--red);">' + job.errorMessage.slice(0,80) + '</span>' : ''}
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; flex-shrink:0;">
+            ${statusBadge(status)}
+            ${hasGlb ? `<button class="btn btn-secondary btn-sm" onclick="openHistoryViewer('${job.previewUrl}')">🌐 View 3D</button>` : ''}
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<div class="card-empty">Could not load history.</div>';
+    console.warn('History load failed:', e);
+  }
+}
+
+// ── Settings ───────────────────────────────────────────
+function showSubtab(event, name) {
+  document.querySelectorAll('.subtab-content').forEach(el => el.classList.add('hidden'));
+  document.querySelectorAll('.subtab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('subtab-' + name).classList.remove('hidden');
+  event.currentTarget.classList.add('active');
+}
+
+function onExtractionMethodChange() {
+  const isInterval = document.querySelector('[name="extraction_method"]:checked')?.value === 'interval';
+  document.getElementById('row_interval').classList.toggle('hidden', !isInterval);
+  document.getElementById('row_frame_count').classList.toggle('hidden', isInterval);
+}
+
+function _setCheck(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.checked = String(val).toLowerCase() === 'true';
+}
+function _setRadio(name, val) {
+  const el = document.querySelector(`[name="${name}"][value="${val}"]`);
+  if (el) el.checked = true;
+}
+function _getCheck(id) {
+  const el = document.getElementById(id);
+  return el ? el.checked : false;
+}
+function _getRadio(name) {
+  const el = document.querySelector(`[name="${name}"]:checked`);
+  return el ? el.value : '';
+}
+function _setVal(id, val) {
+  const el = document.getElementById(id);
+  if (el && val !== undefined && val !== null) el.value = val;
+}
+function _getVal(id) {
+  const el = document.getElementById(id);
+  return el ? el.value.trim() : '';
+}
+
+async function loadSettings() {
+  try {
+    const [machineRes, configRes] = await Promise.all([
+      fetch('/api/machine/status', { headers: { 'Authorization': 'Bearer ' + idToken } }),
+      fetch('/api/config',         { headers: { 'Authorization': 'Bearer ' + idToken } }),
+    ]);
+    const machine = await machineRes.json();
+    const cfg     = await configRes.json();
+
+    // Machine card
+    document.getElementById('settingsMachineName').value = machine.display_name || '';
+    document.getElementById('settingsMachineId').value   = machine.machine_id   || '';
+
+    // Extraction sub-tab
+    _setRadio('extraction_method', cfg.extraction_method || 'interval');
+    _setVal('cfg_interval_value',  cfg.interval_value);
+    _setVal('cfg_interval_unit',   cfg.interval_unit || 'seconds');
+    _setVal('cfg_frame_count',     cfg.frame_count);
+    _setRadio('frame_format',      cfg.frame_format || 'jpg');
+    _setVal('cfg_pitch_angles_str', cfg.pitch_angles_str);
+    _setVal('cfg_yaw_steps',       cfg.yaw_steps);
+    _setVal('cfg_fov',             cfg.fov);
+    onExtractionMethodChange();
+
+    // Alignment sub-tab
+    _setCheck('cfg_run_vggt',               cfg.run_vggt);
+    _setCheck('cfg_run_postshot',            cfg.run_postshot);
+    _setCheck('cfg_run_brush',              cfg.run_brush);
+    _setCheck('cfg_skip_realityscan',       cfg.skip_realityscan);
+    const confVal = cfg.vggt_conf_threshold || '0';
+    _setVal('cfg_vggt_conf_threshold', confVal);
+    document.getElementById('conf_display').textContent = parseFloat(confVal).toFixed(2);
+    _setCheck('cfg_vggt_mask_sky',          cfg.vggt_mask_sky);
+    const skyVal = cfg.sky_sensitivity_threshold || '32';
+    _setVal('cfg_sky_sensitivity_threshold', skyVal);
+    document.getElementById('sky_display').textContent = skyVal;
+    _setCheck('cfg_vggt_mask_black_bg',     cfg.vggt_mask_black_bg);
+    _setCheck('cfg_vggt_mask_white_bg',     cfg.vggt_mask_white_bg);
+    const sparse = String(cfg.vggt_enable_sparse).toLowerCase() === 'true';
+    _setCheck('cfg_vggt_enable_sparse',     cfg.vggt_enable_sparse);
+    document.getElementById('row_sparse_target').classList.toggle('hidden', !sparse);
+    _setVal('cfg_vggt_sparse_target',       cfg.vggt_sparse_target);
+    const rig = String(cfg.vggt_use_anchor_rig).toLowerCase() === 'true';
+    _setCheck('cfg_vggt_use_anchor_rig',    cfg.vggt_use_anchor_rig);
+    document.getElementById('row_anchor_opts').classList.toggle('hidden', !rig);
+    _setVal('cfg_vggt_anchor_view',         cfg.vggt_anchor_view);
+    _setVal('cfg_vggt_rig_optimization_min_points', cfg.vggt_rig_optimization_min_points);
+    _setRadio('vggt_prediction_mode',       cfg.vggt_prediction_mode || 'Depthmap and Camera Branch');
+    _setCheck('cfg_vggt_temporal_sequencing', cfg.vggt_temporal_sequencing);
+
+    // Postshot sub-tab
+    _setVal('cfg_postshot_profile',         cfg.postshot_profile);
+    _setVal('cfg_postshot_max_image_size',  cfg.postshot_max_image_size);
+    _setVal('cfg_postshot_train_steps',     cfg.postshot_train_steps);
+    _setVal('cfg_postshot_max_splats',      cfg.postshot_max_splats);
+    _setCheck('cfg_postshot_anti_aliasing', cfg.postshot_anti_aliasing);
+    _setCheck('cfg_postshot_show_train_error', cfg.postshot_show_train_error);
+    _setCheck('cfg_postshot_store_context', cfg.postshot_store_context);
+    _setCheck('cfg_postshot_export_ply',    cfg.postshot_export_ply);
+    _setCheck('cfg_postshot_alpha_mask',    cfg.postshot_alpha_mask);
+    _setCheck('cfg_postshot_sky_model',     cfg.postshot_sky_model);
+
+    // Brush sub-tab
+    _setVal('cfg_brush_total_steps',        cfg.brush_total_steps);
+    _setVal('cfg_brush_max_splats',         cfg.brush_max_splats);
+    _setVal('cfg_brush_max_resolution',     cfg.brush_max_resolution);
+    _setVal('cfg_brush_seed',               cfg.brush_seed);
+    _setCheck('cfg_brush_rerun_logging',    cfg.brush_rerun_logging);
+    _setCheck('cfg_brush_spawn_viewer',     cfg.brush_spawn_viewer);
+
+    // Paths sub-tab
+    _setVal('cfg_ffmpeg_path',              cfg.ffmpeg_path);
+    _setVal('cfg_rs_path',                  cfg.rs_path);
+    _setVal('cfg_postshot_path',            cfg.postshot_path);
+    _setVal('cfg_brush_path',               cfg.brush_path);
+    _setVal('cfg_rs_settings_path',         cfg.rs_settings_path);
+    _setVal('cfg_vggt_path',               cfg.vggt_path);
+    _setVal('cfg_fusion2sphere_path',       cfg.fusion2sphere_path);
+
+  } catch (e) {
+    console.warn('Settings load failed:', e);
+  }
+}
+
+async function savePipelineSettings() {
+  const statusEl = document.getElementById('settingsSaveStatus');
+  statusEl.textContent = 'Saving…';
+  statusEl.style.color = 'var(--fog)';
+
+  const payload = {
+    // Extraction
+    extraction_method: _getRadio('extraction_method'),
+    interval_value:    _getVal('cfg_interval_value'),
+    interval_unit:     _getVal('cfg_interval_unit'),
+    frame_count:       _getVal('cfg_frame_count'),
+    frame_format:      _getRadio('frame_format'),
+    pitch_angles_str:  _getVal('cfg_pitch_angles_str'),
+    yaw_steps:         _getVal('cfg_yaw_steps'),
+    fov:               _getVal('cfg_fov'),
+    // Alignment
+    run_vggt:                         _getCheck('cfg_run_vggt'),
+    run_postshot:                     _getCheck('cfg_run_postshot'),
+    run_brush:                        _getCheck('cfg_run_brush'),
+    skip_realityscan:                 _getCheck('cfg_skip_realityscan'),
+    vggt_conf_threshold:              _getVal('cfg_vggt_conf_threshold'),
+    vggt_mask_sky:                    _getCheck('cfg_vggt_mask_sky'),
+    sky_sensitivity_threshold:        _getVal('cfg_sky_sensitivity_threshold'),
+    vggt_mask_black_bg:               _getCheck('cfg_vggt_mask_black_bg'),
+    vggt_mask_white_bg:               _getCheck('cfg_vggt_mask_white_bg'),
+    vggt_enable_sparse:               _getCheck('cfg_vggt_enable_sparse'),
+    vggt_sparse_target:               _getVal('cfg_vggt_sparse_target'),
+    vggt_use_anchor_rig:              _getCheck('cfg_vggt_use_anchor_rig'),
+    vggt_anchor_view:                 _getVal('cfg_vggt_anchor_view'),
+    vggt_rig_optimization_min_points: _getVal('cfg_vggt_rig_optimization_min_points'),
+    vggt_prediction_mode:             _getRadio('vggt_prediction_mode'),
+    vggt_temporal_sequencing:         _getCheck('cfg_vggt_temporal_sequencing'),
+    // Postshot
+    postshot_profile:          _getVal('cfg_postshot_profile'),
+    postshot_max_image_size:   _getVal('cfg_postshot_max_image_size'),
+    postshot_train_steps:      _getVal('cfg_postshot_train_steps'),
+    postshot_max_splats:       _getVal('cfg_postshot_max_splats'),
+    postshot_anti_aliasing:    _getCheck('cfg_postshot_anti_aliasing'),
+    postshot_show_train_error: _getCheck('cfg_postshot_show_train_error'),
+    postshot_store_context:    _getCheck('cfg_postshot_store_context'),
+    postshot_export_ply:       _getCheck('cfg_postshot_export_ply'),
+    postshot_alpha_mask:       _getCheck('cfg_postshot_alpha_mask'),
+    postshot_sky_model:        _getCheck('cfg_postshot_sky_model'),
+    // Brush
+    brush_total_steps:    _getVal('cfg_brush_total_steps'),
+    brush_max_splats:     _getVal('cfg_brush_max_splats'),
+    brush_max_resolution: _getVal('cfg_brush_max_resolution'),
+    brush_seed:           _getVal('cfg_brush_seed'),
+    brush_rerun_logging:  _getCheck('cfg_brush_rerun_logging'),
+    brush_spawn_viewer:   _getCheck('cfg_brush_spawn_viewer'),
+    // Paths
+    ffmpeg_path:        _getVal('cfg_ffmpeg_path'),
+    rs_path:            _getVal('cfg_rs_path'),
+    postshot_path:      _getVal('cfg_postshot_path'),
+    brush_path:         _getVal('cfg_brush_path'),
+    rs_settings_path:   _getVal('cfg_rs_settings_path'),
+    vggt_path:          _getVal('cfg_vggt_path'),
+    fusion2sphere_path: _getVal('cfg_fusion2sphere_path'),
+  };
+
+  try {
+    const res = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + idToken },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      statusEl.textContent = '✅ Saved to SplatPipe config';
+      statusEl.style.color = 'var(--green)';
+    } else {
+      const err = await res.json().catch(() => ({}));
+      statusEl.textContent = '❌ ' + (err.detail || 'Save failed');
+      statusEl.style.color = 'var(--red)';
+    }
+  } catch (e) {
+    statusEl.textContent = '❌ ' + e.message;
+    statusEl.style.color = 'var(--red)';
+  }
+  setTimeout(() => { statusEl.textContent = ''; }, 4000);
+}
+
+async function saveMachineName() {
+  const name = document.getElementById('settingsMachineName').value.trim();
+  if (!name) return;
+  try {
+    await fetch('/api/machine/settings', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + idToken,
+      },
+      body: JSON.stringify({ displayName: name }),
+    });
+    document.getElementById('machineName').textContent = name;
+  } catch (e) {
+    console.error('Save machine name failed:', e);
+  }
+}
+
+// ── Utility ────────────────────────────────────────────
+function getJobIcon(type) {
+  const icons = {
+    '360survey': '🌐',
+    'video': '🎥',
+    'timelapse': '⏱',
+    'simple': '📍',
+    'other': '✚',
+  };
+  return icons[type] || '📋';
+}
+
+// ── Queue Override ─────────────────────────────────────
+function toggleOverride(jobId) {
+  const panel = document.getElementById('override-' + jobId);
+  if (panel) panel.classList.toggle('hidden');
+}
+
+async function saveJobOverride(jobId) {
+  const statusEl = document.getElementById('ov_status_' + jobId);
+  const method   = document.getElementById('ov_method_'   + jobId)?.value;
+  const interval = document.getElementById('ov_interval_' + jobId)?.value;
+  const pitchRaw = document.getElementById('ov_pitch_'    + jobId)?.value;
+  const yaw      = document.getElementById('ov_yaw_'      + jobId)?.value;
+  const runVggt     = document.getElementById('ov_vggt_'     + jobId)?.checked;
+  const runPostshot = document.getElementById('ov_postshot_' + jobId)?.checked;
+  const runBrush    = document.getElementById('ov_brush_'    + jobId)?.checked;
+
+  const settings = { runVggt, runPostshot, runBrush };
+  if (method)   settings.extractionMethod = method;
+  if (interval) settings.intervalValue    = parseFloat(interval);
+  if (pitchRaw) settings.pitchAngles      = pitchRaw.split(',')
+    .map(p => parseFloat(p.trim())).filter(n => !isNaN(n));
+  if (yaw)      settings.yawSteps         = parseInt(yaw);
+
+  try {
+    statusEl.textContent = 'Saving…';
+    statusEl.style.color = 'var(--fog)';
+    await db.collection('processing_queue').doc(jobId).update({ settings });
+    statusEl.textContent = '✅ Saved';
+    statusEl.style.color = 'var(--green)';
+  } catch (e) {
+    statusEl.textContent = '❌ ' + e.message;
+    statusEl.style.color = 'var(--red)';
+  }
+  setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+}
+
+// ── Polling ────────────────────────────────────────────
+function startPolling() {
+  if (pollInterval) clearInterval(pollInterval);
+  pollInterval = setInterval(async () => {
+    if (currentUser) {
+      try { idToken = await currentUser.getIdToken(); } catch(e) {}
+    }
+    refreshMachineStatus();
+  }, 15000);
+}
+
+// ── Confirm before close ──────────────────────────────
+window.addEventListener('beforeunload', (e) => {
+  if (currentJobId) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// ── Stage Stepper ──────────────────────────────────────
+const _STAGE_ORDER = ['frame_extraction', 'view_extraction', 'vggt_alignment', 'colmap_export'];
+const _STAGE_EL    = {
+  'frame_extraction': 'stageFrames',
+  'view_extraction':  'stageViews',
+  'vggt_alignment':   'stageVggt',
+  'colmap_export':    'stageColmap',
+};
+
+function updateStageStepper(currentStage, jobStatus) {
+  const currentIdx = _STAGE_ORDER.indexOf(currentStage);
+  for (const [stage, elId] of Object.entries(_STAGE_EL)) {
+    const el = document.getElementById(elId);
+    if (!el) continue;
+    const idx = _STAGE_ORDER.indexOf(stage);
+    if (jobStatus === 'complete') {
+      el.className = 'stage-step done';
+    } else if (idx < currentIdx) {
+      el.className = 'stage-step done';
+    } else if (stage === currentStage) {
+      el.className = 'stage-step active';
+    } else {
+      el.className = 'stage-step';
+    }
+  }
+}
+
+// ── Pipeline Start ──────────────────────────────────────
+async function startProcessing() {
+  if (!currentJobId) return;
+  const btn = document.getElementById('startPipelineBtn');
+  btn.disabled = true;
+  btn.textContent = '⚙️ Starting…';
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}/start`, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    if (res.ok) {
+      addLogEntry('🚀 Pipeline started!', 'success');
+      btn.classList.add('hidden');
+      _lastLogStep = '';
+      if (!activeJobPollInterval) {
+        activeJobPollInterval = setInterval(loadActiveJob, 3000);
+      }
+    } else {
+      const err = await res.json().catch(() => ({}));
+      addLogEntry('❌ Start failed: ' + (err.detail || 'Unknown error'), 'error');
+      btn.disabled = false;
+      btn.textContent = '▶ Start Processing';
+    }
+  } catch (e) {
+    addLogEntry('❌ Start failed: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = '▶ Start Processing';
+  }
+}
+
+async function checkInputFiles() {
+  if (!currentJobId) return;
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}/files`, {
+      headers: { 'Authorization': 'Bearer ' + idToken },
+    });
+    const data = await res.json();
+    const count = data.total || 0;
+    const info = document.getElementById('inputFileCount');
+    if (info) {
+      info.textContent = count > 0
+        ? `${count} file${count === 1 ? '' : 's'} ready`
+        : 'No files yet — import from camera or add to input folder';
+      info.style.color = count > 0 ? 'var(--green)' : 'var(--fog)';
+    }
+    const startBtn = document.getElementById('startPipelineBtn');
+    if (startBtn && !startBtn.classList.contains('hidden')) {
+      startBtn.disabled = count === 0;
+    }
+  } catch (e) {
+    console.warn('File check failed:', e);
+  }
+}
+
+// ── 3D Viewer ───────────────────────────────────────────
+let _viewerActive = false;
+let _viewerAnimFrame = null;
+
+function open3DViewer() {
+  const btn = document.getElementById('view3dBtn');
+  const url = btn?.dataset?.glbUrl || `/api/jobs/${currentJobId}/output/glb`;
+  openHistoryViewer(url);
+}
+
+function openHistoryViewer(glbUrl) {
+  document.getElementById('viewerModal').classList.add('open');
+  document.getElementById('viewerHint').textContent = 'Loading 3D scene…';
+  if (!_viewerActive) {
+    _viewerActive = true;
+    _initViewer(glbUrl);
+  }
+}
+
+function close3DViewer() {
+  document.getElementById('viewerModal').classList.remove('open');
+  if (_viewerAnimFrame) {
+    cancelAnimationFrame(_viewerAnimFrame);
+    _viewerAnimFrame = null;
+  }
+  _viewerActive = false;
+  // Clear canvas
+  const canvas = document.getElementById('viewerCanvas');
+  const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+  if (gl) gl.getExtension('WEBGL_lose_context')?.loseContext();
+}
+
+function handleViewerBackdrop(event) {
+  if (event.target === document.getElementById('viewerModal')) {
+    close3DViewer();
+  }
+}
+
+async function _initViewer(glbUrl) {
+  try {
+    const THREE = await import('three');
+    const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
+    const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+
+    const canvas = document.getElementById('viewerCanvas');
+    const wrap   = canvas.parentElement;
+    const W = wrap.clientWidth;
+    const H = wrap.clientHeight;
+
+    // Scene + lights
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x080808);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+    sun.position.set(5, 10, 5);
+    scene.add(sun);
+
+    // Camera
+    const cam = new THREE.PerspectiveCamera(50, W / H, 0.01, 2000);
+    cam.position.set(0, 1, 4);
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+    // Controls
+    const controls = new OrbitControls(cam, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+
+    // Load GLB
+    const loader = new GLTFLoader();
+    loader.load(
+      glbUrl,
+      (gltf) => {
+        const model = gltf.scene;
+        const box = new THREE.Box3().setFromObject(model);
+        const center = box.getCenter(new THREE.Vector3());
+        const size   = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+        model.position.sub(center);
+        model.scale.setScalar(3 / maxDim);
+        scene.add(model);
+        document.getElementById('viewerHint').textContent = 'Drag to orbit · Scroll to zoom · Right-drag to pan';
+      },
+      (xhr) => {
+        if (xhr.total) {
+          const pct = Math.round(xhr.loaded / xhr.total * 100);
+          document.getElementById('viewerHint').textContent = `Loading… ${pct}%`;
+        }
+      },
+      (err) => {
+        document.getElementById('viewerHint').textContent = '⚠️ Could not load 3D scene';
+        console.error('GLB load error:', err);
+      }
+    );
+
+    // Render loop
+    function animate() {
+      if (!_viewerActive) return;
+      _viewerAnimFrame = requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, cam);
+    }
+    animate();
+
+    // Resize handling
+    window.addEventListener('resize', () => {
+      const nw = wrap.clientWidth, nh = wrap.clientHeight;
+      cam.aspect = nw / nh;
+      cam.updateProjectionMatrix();
+      renderer.setSize(nw, nh);
+    }, { once: false });
+
+  } catch (err) {
+    console.error('Viewer init failed:', err);
+    document.getElementById('viewerHint').textContent = '⚠️ 3D viewer failed to load';
+  }
+}
+
+console.log('🦅 FieldRaven Desktop Dashboard loaded');
+})();
+</script>
+</body>
+</html>
