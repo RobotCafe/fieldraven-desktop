@@ -3,13 +3,16 @@ FastAPI application for FieldRaven Desktop.
 Serves the local web dashboard and provides API endpoints
 for auth, queue management, camera detection, and pipeline control.
 """
+import asyncio
 import os
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, status, Body
+from fastapi import FastAPI, HTTPException, Depends, status, Body, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -61,6 +64,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.fieldraven.ca", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ── API Routes ───────────────────────────────────────────────
 
 # ── Firebase web config ──────────────────────────────────────
@@ -92,6 +103,30 @@ async def health():
         "current_job": queue_manager.get_current_job(),
     }
 
+# ── Auto-accept callback (used by polling loop for web-queued jobs) ──────────
+
+def _auto_accept_job(job: dict) -> None:
+    """
+    Called by the queue polling loop when a new queued job is found.
+    Accepts the job and starts the pipeline without any user interaction.
+    Only runs for jobs that originated from the web app (have storageInputPath).
+    Local desktop-queued jobs are handled by the frontend via /api/jobs/{id}/start.
+    """
+    job_id = job.get('docId')
+    if not job_id:
+        return
+    if pipeline_runner.is_running(job_id):
+        return
+    # Only auto-start web-originated jobs (they have a storageInputPath set)
+    if not job.get('storageInputPath'):
+        return
+    print(f"🌐 Web job detected — auto-accepting: {job_id}")
+    if not queue_manager.accept_job(job_id):
+        return
+    # job dict already contains full Firestore data from poll_for_jobs
+    pipeline_runner.start(job_id, job)
+
+
 # ── Auth ─────────────────────────────────────────────────────
 
 class AuthLoginRequest(BaseModel):
@@ -109,7 +144,7 @@ async def auth_login(request: AuthLoginRequest):
 
     # Register machine and start heartbeat
     machine_module.start_heartbeat(uid)
-    queue_manager.start_polling(on_new_job=None)  # Auto-accept handled by frontend
+    queue_manager.start_polling(on_new_job=_auto_accept_job)
 
     return {
         "uid": uid,
@@ -244,7 +279,7 @@ async def queue_for_processing(
     })
 
     doc_id = new_ref.id
-    job_dir = JOBS_DIR / doc_id / "input"
+    job_dir = JOBS_DIR / doc_id / "import from camera"
     job_dir.mkdir(parents=True, exist_ok=True)
 
     return {"processingJobId": doc_id, "status": "queued", "name": display_name}
@@ -272,6 +307,7 @@ async def get_job_history(user: CurrentUser = Depends(require_auth)):
 @app.post("/api/jobs/{job_id}/start")
 async def start_job(
     job_id: str,
+    raw_request: Request,
     user: CurrentUser = Depends(require_auth),
 ):
     """Start the SplatPipe pipeline for an accepted job."""
@@ -280,6 +316,14 @@ async def start_job(
     job_data = queue_manager.get_job_status(job_id)
     if not job_data:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Read UI settings from request body (snake_case keys, string values)
+    try:
+        ui_settings = await raw_request.json()
+    except Exception:
+        ui_settings = {}
+    if ui_settings:
+        job_data = {**job_data, "_ui_settings": ui_settings}
+        print(f"📋 UI settings: run_vggt={ui_settings.get('run_vggt')} run_brush={ui_settings.get('run_brush')} yaw_steps={ui_settings.get('yaw_steps')}")
     started = pipeline_runner.start(job_id, job_data)
     if not started:
         raise HTTPException(status_code=409, detail="Could not start pipeline")
@@ -324,20 +368,58 @@ async def get_job_glb(
         raise HTTPException(status_code=404, detail="GLB output not found for this job")
     return FileResponse(str(glb), media_type="model/gltf-binary", filename="vggt_scene.glb")
 
+# ── User field jobs ──────────────────────────────────────────
+
+@app.get("/api/user-jobs")
+async def get_user_jobs(
+    limit: int = 100,
+    user: CurrentUser = Depends(require_auth),
+):
+    """List field jobs from users/{uid}/jobs, most recent first."""
+    try:
+        from google.cloud.firestore import Query
+        docs = (
+            firebase_client.get_user_collection(user.uid, 'jobs')
+            .order_by('startTime', direction=Query.DESCENDING)
+            .limit(limit)
+            .get()
+        )
+        jobs = []
+        for doc in docs:
+            data = doc.to_dict() or {}
+            data['id'] = doc.id
+            photos = data.pop('photos', None) or []
+            data['photoCount'] = len(photos)
+            for k, v in list(data.items()):
+                if hasattr(v, 'isoformat'):
+                    data[k] = v.isoformat()
+                elif hasattr(v, '_seconds'):
+                    data[k] = v._seconds * 1000
+            jobs.append(data)
+        return {"jobs": jobs}
+    except Exception as e:
+        print(f"⚠️ get_user_jobs failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── Camera ───────────────────────────────────────────────────
 
-# File types to detect and import from camera
+# File types to import from a confirmed Insta360 camera drive
 _CAMERA_EXTS = {'.insp', '.insv', '.jpg', '.jpeg', '.png', '.dng'}
+# Insta360-specific extensions — presence of either confirms this is an Insta360 drive
+_INSTA_EXTS  = {'.insp', '.insv'}
 # Low-res proxy files — skip, not needed for processing
 _SKIP_EXTS   = {'.lrv', '.thm'}
 
 
 def _scan_dcim(drive_root: str) -> list[dict]:
-    """Walk camera files on a drive. Checks DCIM first, falls back to drive root."""
+    """Scan only the DCIM folder of an Insta360 camera drive.
+    Returns empty list if no DCIM folder exists or no Insta360 files (.insp/.insv) are found
+    — this prevents misidentifying any USB drive with photos as a camera."""
     dcim = os.path.join(drive_root, "DCIM")
-    search_root = dcim if os.path.isdir(dcim) else drive_root
+    if not os.path.isdir(dcim):
+        return []
     files = []
-    for root, _dirs, names in os.walk(search_root):
+    for root, _dirs, names in os.walk(dcim):
         for name in sorted(names):
             ext = os.path.splitext(name)[1].lower()
             if ext in _SKIP_EXTS:
@@ -349,6 +431,9 @@ def _scan_dcim(drive_root: str) -> list[dict]:
                     files.append({"name": name, "path": full, "size": size, "ext": ext})
                 except OSError:
                     pass
+    # Only treat this as a camera drive if it contains Insta360-specific files
+    if not any(f["ext"] in _INSTA_EXTS for f in files):
+        return []
     return files
 
 
@@ -389,7 +474,7 @@ async def camera_status(user: CurrentUser = Depends(require_auth)):
         "camera_connected": camera_drive is not None,
         "camera_drive":     camera_drive,
         "camera_type":      "Insta360" if camera_drive else None,
-        "file_count":       len(camera_files),
+        "file_count":       photo_count,   # photos only — what the user cares about
         "video_count":      video_count,
         "photo_count":      photo_count,
         "total_bytes":      total_bytes,
@@ -397,9 +482,99 @@ async def camera_status(user: CurrentUser = Depends(require_auth)):
     }
 
 
+def _tk_browse_folder(initial: str) -> Optional[str]:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes('-topmost', True)
+    path = filedialog.askdirectory(
+        initialdir=initial,
+        title="Select or create a project folder (click Make New Folder to create one)",
+    )
+    root.destroy()
+    return path.replace('/', '\\') if path else None
+
+
+def _tk_browse_files(initial: str) -> list[str]:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes('-topmost', True)
+    paths = filedialog.askopenfilenames(
+        initialdir=initial,
+        title="Select Insta360 camera files to import",
+        filetypes=[
+            ("Camera files", "*.insp *.insv *.jpg *.jpeg *.png *.dng"),
+            ("All files", "*.*"),
+        ],
+    )
+    root.destroy()
+    return [p.replace('/', '\\') for p in paths]
+
+
+def _tk_browse_file(initial: str, filetypes: list) -> Optional[str]:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes('-topmost', True)
+    path = filedialog.askopenfilename(
+        initialdir=initial,
+        title="Open project file",
+        filetypes=filetypes,
+    )
+    root.destroy()
+    return path.replace('/', '\\') if path else None
+
+
+@app.get("/api/browse/file")
+async def browse_file(initial: str = "C:\\Users", type: str = "json"):
+    """Open a single-file picker dialog; returns selected path or null."""
+    if type == "json":
+        ft = [("FieldRaven project", "fieldraven.json"), ("JSON files", "*.json"), ("All files", "*.*")]
+    else:
+        ft = [("All files", "*.*")]
+    path = await asyncio.get_event_loop().run_in_executor(None, _tk_browse_file, initial, ft)
+    return {"path": path}
+
+
+@app.get("/api/browse/folder")
+async def browse_folder(initial: str = "C:\\Users"):
+    """Open a folder-picker dialog; returns selected path or null."""
+    path = await asyncio.get_event_loop().run_in_executor(None, _tk_browse_folder, initial)
+    return {"path": path}
+
+
+@app.get("/api/browse/files")
+async def browse_files(initial: str = "D:\\"):
+    """Open a multi-file picker starting in DCIM; returns selected paths."""
+    # Auto-navigate into DCIM subfolder if it exists
+    dcim = os.path.join(initial.rstrip("\\"), "DCIM")
+    start_dir = dcim if os.path.isdir(dcim) else initial
+    paths = await asyncio.get_event_loop().run_in_executor(None, _tk_browse_files, start_dir)
+    return {"paths": paths}
+
+
+@app.post("/api/browse/open-folder")
+async def open_folder_in_explorer(
+    request: Request,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Open a directory in Windows Explorer (fire-and-forget)."""
+    body = await request.json()
+    path = body.get("path", "")
+    if path and os.path.isdir(path):
+        import subprocess as _sp
+        _sp.Popen(["explorer", os.path.normpath(path)])
+    return {"ok": True}
+
+
 class CameraImportRequest(BaseModel):
     jobId: str
     sourceDrive: str  # e.g. "J:\\"
+    projectDir: Optional[str] = None  # user-selected project root
 
 @app.post("/api/camera/import")
 async def import_from_camera(
@@ -408,10 +583,23 @@ async def import_from_camera(
 ):
     """Import only the camera files associated with this job from the drive."""
     import shutil as _shutil
-    source   = request.sourceDrive
-    job_id   = request.jobId
-    dest_dir = JOBS_DIR / job_id / "input"
+    source     = request.sourceDrive
+    job_id     = request.jobId
+    project_dir = Path(request.projectDir) if request.projectDir else None
+
+    if not project_dir:
+        raise HTTPException(status_code=400, detail="projectDir is required")
+
+    dest_dir = project_dir / "import from camera"
     dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persist projectDir to the processing queue doc
+    try:
+        firebase_client.get_processing_queue().document(job_id).update(
+            {"projectDir": str(project_dir)}
+        )
+    except Exception as e:
+        print(f"⚠️ Could not save projectDir to Firestore: {e}")
 
     # Resolve which filenames belong to this job via the field job in Firestore
     target_filenames: set[str] | None = None
@@ -432,16 +620,20 @@ async def import_from_camera(
     except Exception as e:
         print(f"⚠️ Could not fetch job filenames from Firestore: {e}")
 
-    # Scan the camera drive
-    all_files = _scan_dcim(source)
+    if not target_filenames:
+        # No cameraFileName on photos — ask the user to pick files manually
+        print("⚠️ No filename list found — requesting manual file selection")
+        return {
+            "imported": 0, "skipped": 0, "errors": 0,
+            "needsManualSelect": True,
+            "cameraDrive": source,
+            "jobId": job_id,
+        }
 
-    if target_filenames:
-        files_to_copy = [f for f in all_files if f['name'] in target_filenames]
-        print(f"📷 Matched {len(files_to_copy)}/{len(all_files)} files on camera drive")
-    else:
-        # No filename list available — fall back to full import with a warning
-        print(f"⚠️ No filename list found — importing all {len(all_files)} camera files")
-        files_to_copy = all_files
+    # Scan the camera drive and match
+    all_files = _scan_dcim(source)
+    files_to_copy = [f for f in all_files if f['name'] in target_filenames]
+    print(f"📷 Matched {len(files_to_copy)}/{len(all_files)} files on camera drive")
 
     if not files_to_copy:
         return {"imported": 0, "errors": 0, "skipped": 0,
@@ -485,13 +677,381 @@ async def import_from_camera(
     }
 
 
+class ManualImportRequest(BaseModel):
+    jobId: str
+    filePaths: list[str]
+    projectDir: str
+
+@app.post("/api/camera/import-manual")
+async def import_manual(
+    request: ManualImportRequest,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Copy a user-selected list of files into the project's input directory."""
+    import shutil as _shutil
+    job_id      = request.jobId
+    project_dir = Path(request.projectDir)
+    dest_dir    = project_dir / "import from camera"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        firebase_client.get_processing_queue().document(job_id).update(
+            {"projectDir": str(project_dir)}
+        )
+    except Exception as e:
+        print(f"⚠️ Could not save projectDir: {e}")
+
+    imported = skipped = errors = 0
+    error_details: list[str] = []
+    total = len(request.filePaths)
+    queue_manager.update_job_progress(job_id, 1, f"Starting manual import of {total} files…")
+
+    for i, src_path in enumerate(request.filePaths):
+        dst = dest_dir / Path(src_path).name
+        if dst.exists():
+            skipped += 1
+            continue
+        try:
+            _shutil.copy2(src_path, str(dst))
+            imported += 1
+            pct = int((i + 1) / total * 30)
+            queue_manager.update_job_progress(
+                job_id, pct, f"Copied {imported}/{total}: {Path(src_path).name}"
+            )
+        except Exception as exc:
+            errors += 1
+            msg = f"{Path(src_path).name}: {exc}"
+            error_details.append(msg)
+            print(f"⚠️ Manual import error {msg}")
+
+    if imported == 0 and errors > 0:
+        detail = f"All {errors} file copies failed. First error: {error_details[0]}"
+        raise HTTPException(status_code=500, detail=detail)
+
+    queue_manager.update_job_progress(
+        job_id, 30, f"Import complete — {imported} copied, {skipped} skipped"
+    )
+    return {
+        "imported": imported, "skipped": skipped, "errors": errors,
+        "errorDetails": error_details[:5],
+        "destination": str(dest_dir), "jobId": job_id,
+    }
+
+
+# ── Project config ───────────────────────────────────────────
+
+class ProjectConfigWriteRequest(BaseModel):
+    dir: str
+    jobId: str
+
+@app.get("/api/project/config")
+async def read_project_config(
+    dir: str,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Return the fieldraven.json config + current file list for a project directory."""
+    project_dir = Path(dir)
+    config_path = project_dir / "fieldraven.json"
+
+    config: dict = {}
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    input_dir = project_dir / "import from camera"
+    files: list[dict] = []
+    if input_dir.exists():
+        for f in sorted(input_dir.iterdir()):
+            if f.is_file() and not f.name.startswith(".") and f.suffix.lower() not in {".lrv", ".thm"}:
+                files.append({"name": f.name, "size": f.stat().st_size, "ext": f.suffix.lower()})
+
+    def _count_files(d: Path, exts: set) -> int:
+        if not d.exists(): return 0
+        return sum(1 for f in d.rglob("*") if f.is_file() and f.suffix.lower() in exts)
+
+    img_exts = {".jpg", ".jpeg", ".png"}
+    stages = {
+        "frames":   {"count": _count_files(project_dir / "01_frames",   img_exts)},
+        "views":    {"count": _count_files(project_dir / "02_views",    img_exts)},
+        "training": {
+            "postshot": (project_dir / "04_training" / "postshot_input").exists(),
+            "brush":    (project_dir / "04_training" / "brush_input").exists(),
+            "vggt":     (project_dir / "04_training" / "vggt_output").exists(),
+        },
+    }
+
+    return {"config": config, "files": files, "total": len(files),
+            "path": str(input_dir), "stages": stages}
+
+
+@app.post("/api/project/config")
+async def write_project_config(
+    request: ProjectConfigWriteRequest,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Write or update fieldraven.json in the project directory."""
+    project_dir = Path(request.dir)
+    config_path = project_dir / "fieldraven.json"
+
+    # Preserve any existing fields (e.g. createdAt) and update
+    existing: dict = {}
+    if config_path.exists():
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    config = {
+        **existing,
+        "version": 1,
+        "jobId": request.jobId,
+        "savedAt": datetime.now().isoformat(timespec="seconds"),
+    }
+    if "createdAt" not in config:
+        config["createdAt"] = config["savedAt"]
+
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Persist projectDir to the processing_queue Firestore doc so the
+    # pipeline worker can find the files when it runs.
+    if request.jobId:
+        try:
+            firebase_client.get_processing_queue().document(request.jobId).update(
+                {"projectDir": str(project_dir)}
+            )
+        except Exception as e:
+            print(f"⚠️ Could not save projectDir to Firestore: {e}")
+
+    return {"ok": True}
+
+
+# ── Project state / prepare / resume ──────────────────────────
+
+@app.get("/api/project/state")
+async def get_project_state(
+    dir: str,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Scan a project directory and return actual pipeline stage completion status."""
+    project_dir = Path(dir)
+    if not project_dir.exists():
+        return {"found": False}
+
+    json_path = project_dir / "fieldraven.json"
+    saved: dict = {}
+    if json_path.exists():
+        try:
+            saved = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    _img_exts = {".jpg", ".jpeg", ".png"}
+
+    def _has_images(d: Path) -> bool:
+        return d.exists() and any(f.is_file() and f.suffix.lower() in _img_exts for f in d.rglob("*"))
+
+    def _count_images(d: Path) -> int:
+        if not d.exists():
+            return 0
+        return sum(1 for f in d.rglob("*") if f.is_file() and f.suffix.lower() in _img_exts)
+
+    # Import stage: stitched JPGs in "import from camera"
+    import_dir    = project_dir / "import from camera"
+    stitched_count = sum(
+        1 for f in import_dir.iterdir()
+        if f.is_file() and f.suffix.lower() == ".jpg"
+    ) if import_dir.exists() else 0
+
+    # View extraction: 02_views
+    views_dir   = project_dir / "02_views"
+    views_done  = _has_images(views_dir)
+    views_count = _count_images(views_dir)
+
+    # RealityScan: 03_alignment/COLMAP_for_Brush must have COLMAP text files
+    colmap_dir   = project_dir / "03_alignment" / "COLMAP_for_Brush"
+    colmap_items = list(colmap_dir.iterdir()) if colmap_dir.exists() else []
+    rs_done      = any(f.name.lower() in ("cameras.txt", "images.txt") for f in colmap_items)
+    rs_images    = sum(1 for f in colmap_items if f.suffix.lower() == ".png")
+
+    # Brush training: 04_training/*.ply
+    training_dir = project_dir / "04_training"
+    ply_files    = list(training_dir.glob("*.ply")) if training_dir.exists() else []
+    brush_done   = len(ply_files) > 0
+
+    saved_stages = saved.get("stages", {})
+    stages = {
+        "import": {
+            "done":        stitched_count > 0,
+            "stitched":    stitched_count,
+            "completedAt": saved_stages.get("import", {}).get("completedAt"),
+        },
+        "view_extraction": {
+            "done":        views_done,
+            "views":       views_count,
+            "completedAt": saved_stages.get("view_extraction", {}).get("completedAt"),
+        },
+        "realityscan": {
+            "done":        rs_done,
+            "images":      rs_images,
+            "completedAt": saved_stages.get("realityscan", {}).get("completedAt"),
+        },
+        "brush_training": {
+            "done":        brush_done,
+            "plyFiles":    len(ply_files),
+            "completedAt": saved_stages.get("brush_training", {}).get("completedAt"),
+        },
+    }
+
+    saved_settings = saved.get("settings", {})
+    pipeline_mode = "vggt" if saved_settings.get("run_vggt") else "rs_brush"
+
+    stage_order     = ["import", "view_extraction", "realityscan", "brush_training"]
+    completed_stages: list[str] = []
+    next_stage: Optional[str]   = None
+    for s in stage_order:
+        if stages[s]["done"]:
+            completed_stages.append(s)
+        elif next_stage is None:
+            next_stage = s
+
+    return {
+        "found":           True,
+        "projectDir":      str(project_dir),
+        "jobId":           saved.get("jobId"),
+        "settings":        saved_settings,
+        "stages":          stages,
+        "nextStage":       next_stage,
+        "completedStages": completed_stages,
+        "pipelineMode":    pipeline_mode,
+        "hasHistory":      len(completed_stages) > 0,
+    }
+
+
+class ProjectPrepareRequest(BaseModel):
+    dir: str
+    startFrom: str  # "view_extraction" | "realityscan" | "brush_training"
+
+
+_STAGE_DIRS_TO_DELETE: dict[str, list[str]] = {
+    "view_extraction": ["02_views", "03_alignment", "04_training"],
+    "realityscan":     ["03_alignment", "04_training"],
+    "brush_training":  ["04_training"],
+}
+
+
+@app.post("/api/project/prepare")
+async def prepare_project_rerun(
+    request: ProjectPrepareRequest,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Delete stage output directories from startFrom onwards (cascade)."""
+    project_dir  = Path(request.dir)
+    dirs_to_wipe = _STAGE_DIRS_TO_DELETE.get(request.startFrom, [])
+    deleted = []
+    for name in dirs_to_wipe:
+        p = project_dir / name
+        if p.exists():
+            import shutil as _shutil
+            _shutil.rmtree(str(p))
+            deleted.append(name)
+    return {"deleted": deleted, "startFrom": request.startFrom}
+
+
+class ProjectResumeRequest(BaseModel):
+    dir:       str
+    startFrom: str
+    jobId:     Optional[str] = None
+
+
+@app.post("/api/project/resume")
+async def resume_project(
+    request: ProjectResumeRequest,
+    user:    CurrentUser = Depends(require_auth),
+):
+    """Resume an existing project from a specific stage without re-queuing."""
+    project_dir = Path(request.dir)
+    if not project_dir.exists():
+        raise HTTPException(status_code=400, detail="Project directory not found")
+
+    # Read fieldraven.json for jobId and settings
+    saved: dict = {}
+    json_path = project_dir / "fieldraven.json"
+    if json_path.exists():
+        try:
+            saved = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    job_id = request.jobId or saved.get("jobId")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="No jobId — project was never queued")
+
+    saved_settings = saved.get("settings", {})
+
+    # Reset the Firestore doc to processing state so the frontend can track it
+    # accept_job also sets queue_manager._current_job_id
+    queue_manager.accept_job(job_id)
+
+    # Also persist projectDir on the doc so pipeline_runner can find files
+    try:
+        firebase_client.get_processing_queue().document(job_id).update(
+            {"projectDir": str(project_dir)}
+        )
+    except Exception as e:
+        print(f"⚠️  Could not set projectDir on Firestore doc: {e}")
+
+    # Build job_data — _ui_settings carries highest-priority overrides including start_from
+    job_data = {
+        "projectDir": str(project_dir),
+        "settings":   {},
+        "_ui_settings": {
+            "run_vggt":          saved_settings.get("run_vggt", False),
+            "run_brush":         saved_settings.get("run_brush", True),
+            "yaw_steps":         saved_settings.get("yaw_steps", 6),
+            "pitch_angles_str":  saved_settings.get("pitch_angles_str", "-7"),
+            "fov":               saved_settings.get("fov", 94.6),
+            "extraction_method": saved_settings.get("extraction_method", "interval"),
+            "interval_value":    saved_settings.get("interval_value", 1.0),
+            "interval_unit":     saved_settings.get("interval_unit", "seconds"),
+            "start_from":        request.startFrom,
+        },
+    }
+
+    started = pipeline_runner.start(job_id, job_data)
+    if not started:
+        raise HTTPException(status_code=409, detail="Pipeline already running for this job")
+
+    return {"ok": True, "jobId": job_id, "startFrom": request.startFrom}
+
+
 @app.get("/api/jobs/{job_id}/files")
 async def list_job_files(
     job_id: str,
+    projectDir: Optional[str] = None,
     user: CurrentUser = Depends(require_auth),
 ):
     """List files in a job's input directory."""
-    input_dir = JOBS_DIR / job_id / "input"
+    if projectDir:
+        input_dir = Path(projectDir) / "import from camera"
+    else:
+        # Fall back to Firestore lookup then hardcoded path
+        input_dir = None
+        try:
+            doc = firebase_client.get_processing_queue().document(job_id).get()
+            if doc.exists:
+                pd = doc.to_dict().get('projectDir')
+                if pd:
+                    input_dir = Path(pd) / "import from camera"
+        except Exception:
+            pass
+        if input_dir is None:
+            input_dir = JOBS_DIR / job_id / "import from camera"
     if not input_dir.exists():
         return {"files": [], "total": 0}
 
@@ -510,28 +1070,112 @@ async def list_job_files(
         "path": str(input_dir),
     }
 
-# ── Serve frontend ───────────────────────────────────────────
+@app.post("/api/jobs/{job_id}/stitch")
+async def stitch_job(
+    job_id: str,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Convert any .insp files in the job's input dir to equirectangular JPEGs (background thread)."""
+    import threading
+    from . import pipeline_runner
 
-# Serve the frontend directory
-FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
-FRONTEND_DIR.mkdir(exist_ok=True)
+    try:
+        doc = firebase_client.get_processing_queue().document(job_id).get()
+        job_data = doc.to_dict() if doc.exists else {}
+    except Exception:
+        job_data = {}
+
+    input_dir = pipeline_runner._job_root(job_id, job_data) / "import from camera"
+    insp_files = list(input_dir.glob("*.insp")) if input_dir.exists() else []
+    if not insp_files:
+        return {"total": 0, "message": "No .insp files to convert"}
+
+    total = len(insp_files)
+    cancel = threading.Event()
+
+    def _run():
+        try:
+            count = pipeline_runner._stitch_insp_files(job_id, cancel, job_data)
+            queue_manager.update_job_progress(
+                job_id, 50, f"Converted {count}/{total} .insp files to equirectangular"
+            )
+        except Exception as e:
+            queue_manager.update_job_progress(job_id, 0, f"Conversion failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    queue_manager.update_job_progress(job_id, 31, f"Converting {total} .insp files…")
+    return {"total": total, "message": f"Converting {total} .insp files in background"}
+
+
+@app.get("/api/jobs/{job_id}/input/{filename}")
+async def serve_input_file(
+    job_id: str,
+    filename: str,
+    projectDir: Optional[str] = None,
+    thumb: bool = False,
+):
+    """Serve a file from the job input directory for in-app preview. No auth — localhost only."""
+    try:
+        doc = firebase_client.get_processing_queue().document(job_id).get()
+        job_data = doc.to_dict() if doc.exists else {}
+    except Exception:
+        job_data = {}
+
+    if projectDir:
+        job_data = {**job_data, "projectDir": projectDir}
+
+    input_dir = pipeline_runner._job_root(job_id, job_data) / "import from camera"
+    file_path = (input_dir / filename).resolve()
+
+    if not str(file_path).startswith(str(input_dir.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Serve a small disk-cached thumbnail so the gallery doesn't load full 6-12K images
+    if thumb and file_path.suffix.lower() in ('.jpg', '.jpeg', '.png'):
+        thumb_dir = input_dir / ".thumbs"
+        thumb_path = (thumb_dir / filename).resolve()
+        if not thumb_path.exists():
+            try:
+                from PIL import Image as _PILImage
+                thumb_dir.mkdir(exist_ok=True)
+                with _PILImage.open(str(file_path)) as img:
+                    img.thumbnail((400, 200), _PILImage.LANCZOS)
+                    img.save(str(thumb_path), "JPEG", quality=80, optimize=True)
+            except Exception as e:
+                print(f"⚠️ Thumb failed for {filename}: {e}")
+        if thumb_path.exists():
+            return FileResponse(str(thumb_path), media_type="image/jpeg")
+
+    return FileResponse(str(file_path))
+
+
+# ── Serve React frontend ─────────────────────────────────────
+
+REACT_DIST = Path(__file__).resolve().parent.parent / "frontend-react" / "dist"
 
 
 @app.get("/")
 async def serve_index():
-    """Serve the main dashboard HTML."""
-    index_path = FRONTEND_DIR / "index.html"
-    if not index_path.exists():
-        return JSONResponse(
-            status_code=200,
-            content={"status": "dashboard_not_built", "message": "Frontend not yet built. Navigate to /api/ endpoints."}
+    """Serve the React app entry point — never cache so bundle updates load immediately."""
+    index_path = REACT_DIST / "index.html"
+    if index_path.exists():
+        return FileResponse(
+            str(index_path),
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
         )
-    return FileResponse(str(index_path))
+    return JSONResponse(
+        status_code=503,
+        content={"status": "frontend_not_built",
+                 "message": "Run: cd frontend-react && npm run build"}
+    )
 
 
-# Mount static files (JS, CSS, images)
-if FRONTEND_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="frontend")
+# Vite build assets (hashed JS/CSS bundles)
+if (REACT_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(REACT_DIST / "assets")), name="react_assets")
 
-print(f"📁 Frontend served from: {FRONTEND_DIR}")
+print(f"📁 Frontend served from: {REACT_DIST}")
 print(f"📁 Jobs directory: {JOBS_DIR}")

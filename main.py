@@ -12,6 +12,16 @@ Usage:
 """
 import sys
 import os
+
+# Auto-relaunch under Python 3.13 if running on a different version.
+# This ensures cv2, torch, and other ML deps are available regardless of
+# which python.exe the user invoked.
+if sys.version_info[:2] != (3, 13):
+    import subprocess
+    print(f"[FieldRaven] Python {sys.version_info.major}.{sys.version_info.minor} detected — relaunching under Python 3.13...")
+    result = subprocess.run(["py", "-3.13"] + sys.argv, close_fds=True)
+    sys.exit(result.returncode)
+
 import webbrowser
 import argparse
 import time
@@ -36,7 +46,7 @@ def open_browser(port: int, delay: float = 2.0):
 def main():
     parser = argparse.ArgumentParser(description="FieldRaven Desktop Dashboard")
     parser.add_argument("--port", type=int, default=8081, help="Port to serve on (default: 8081)")
-    parser.add_argument("--host", type=str, default="localhost", help="Host to bind to (default: localhost)")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
     parser.add_argument("--no-browser", action="store_true", help="Don't open browser automatically")
     args = parser.parse_args()
 
@@ -46,6 +56,9 @@ def main():
     print("║     Local 3D Processing Dashboard               ║")
     print("╚══════════════════════════════════════════════════╝")
     print()
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    print(f"   Python:    {py_ver}  ✓")
+    print(f"   Exec:      {sys.executable}")
     print(f"   Server:    http://{args.host}:{args.port}")
     print(f"   API docs:  http://{args.host}:{args.port}/docs")
     print(f"   Jobs dir:  C:\\FieldRaven\\Jobs")
