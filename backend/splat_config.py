@@ -60,6 +60,7 @@ _SECTION_MAP: dict[str, dict[str, str]] = {
         "brush_max_splats":     "max_splats",
         "brush_max_resolution": "max_resolution",
         "brush_seed":           "seed",
+        "brush_export_every":   "export_every",
         "brush_rerun_logging":  "rerun_logging",
         "brush_spawn_viewer":   "spawn_viewer",
     },
@@ -70,7 +71,14 @@ _SECTION_MAP: dict[str, dict[str, str]] = {
         "brush_path":         "brush_path",
         "rs_settings_path":   "rs_settings_path",
         "vggt_path":          "vggt_path",
-        "fusion2sphere_path": "fusion2sphere_path",
+    },
+    "InspStitch": {
+        "insp_stitch_type":   "stitch_type",
+        "insp_lens_guard":    "lens_guard",
+        "insp_flowstate":     "flowstate",
+        "insp_cuda":          "cuda",
+        "insp_output_width":  "output_width",
+        "insp_workers":       "workers",
     },
 }
 
@@ -119,16 +127,23 @@ _DEFAULTS: dict[str, str] = {
     "brush_max_splats":     "3000",
     "brush_max_resolution": "1920",
     "brush_seed":           "42",
+    "brush_export_every":   "5000",
     "brush_rerun_logging":  "False",
-    "brush_spawn_viewer":   "True",
+    "brush_spawn_viewer":   "False",
+    # InspStitch
+    "insp_stitch_type":  "ai",
+    "insp_lens_guard":   "none",
+    "insp_flowstate":    "True",
+    "insp_cuda":         "True",
+    "insp_output_width": "5984",  # half of native 11968 — 4x faster, still 6K
+    "insp_workers":      "2",
     # Paths
     "ffmpeg_path":        "",
     "rs_path":            "",
     "postshot_path":      "",
     "brush_path":         "",
     "rs_settings_path":   "",
-    "vggt_path":          r"C:\Users\DenmanNic\Projects\3DGS Pipe V13 with VGGT",
-    "fusion2sphere_path": r"C:\Users\DenmanNic\Projects\3DGS Pipe V13 with VGGT\insp_fusion2sphere\fusion2sphere.exe",
+    "vggt_path": r"C:\Users\DenmanNic\Projects\3DGS Pipe V13 with VGGT",
 }
 
 # Simple in-process cache — cleared on every save

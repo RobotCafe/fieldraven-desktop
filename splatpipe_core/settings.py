@@ -42,6 +42,8 @@ class PipelineSettings:
     run_brush: bool = False
     postshot_path: Optional[str] = None
     brush_path: Optional[str] = None
+    rs_path: Optional[str] = None
+    rs_settings_path: Optional[str] = None
 
     # Postshot training options
     postshot_profile: str = "Splat3"
@@ -60,20 +62,16 @@ class PipelineSettings:
     brush_max_splats: int = 3000
     brush_max_resolution: int = 1920
     brush_seed: int = 42
+    brush_export_every: int = 5000
     brush_rerun_logging: bool = False
-    brush_spawn_viewer: bool = True
-
-    # ── INSP conversion (Insta360 raw photo format) ──────────────
-    fusion2sphere_path: str = r"C:\Users\DenmanNic\Projects\3DGS Pipe V13 with VGGT\insp_fusion2sphere\fusion2sphere.exe"
-    # Per-lens pixel size in the .insp file (3040 for ONE X / ONE X2 / ONE R 360)
-    insp_lens_size: int = 3040
-    # Output equirectangular width (height = width / 2)
-    insp_output_width: int = 5760
-    # Seam blend radius passed to fusion2sphere
-    insp_blend_radius: int = 10
+    brush_spawn_viewer: bool = False
 
     # ── Paths ────────────────────────────────────────────────────
     jobs_base_dir: str = r"C:\FieldRaven\Jobs"
     # Path to the SplatPipe App directory containing video_extraction.py,
     # panorama_processing.py, vggt_training.py, etc.
     vggt_app_path: str = r"C:\Users\DenmanNic\Projects\3DGS Pipe V13 with VGGT\App"
+    # Override: use this as the job root instead of jobs_base_dir / job_id.
+    # Set by FieldRaven to the user-selected project directory so that
+    # 01_frames/, 02_views/, 04_training/ land alongside import from camera/.
+    project_dir: Optional[str] = None

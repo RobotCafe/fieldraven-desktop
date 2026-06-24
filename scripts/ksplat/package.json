@@ -1,0 +1,8 @@
+{
+  "name": "fieldraven-ksplat-converter",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@mkkellogg/gaussian-splats-3d": "^0.4.7"
+  }
+}

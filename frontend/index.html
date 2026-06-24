@@ -570,7 +570,7 @@ a:hover { color: var(--sand); }
           <span id="activeJobStatus" style="font-size:12px; color:var(--moss-light);">Processing</span>
         </div>
 
-        <!-- Stage stepper -->
+        <!-- Stage stepper: VGGT path shown by default; switches to RS+Brush when detected -->
         <div class="stage-stepper" id="stageStepper">
           <div class="stage-step" id="stageFrames">
             <div class="stage-dot"></div>
@@ -581,12 +581,24 @@ a:hover { color: var(--sand); }
             <div class="stage-dot"></div>
             <div class="stage-label">Views</div>
           </div>
-          <div class="stage-connector"></div>
+          <!-- RS+Brush path (hidden until detected) -->
+          <div class="stage-connector hidden" id="connectorRS"></div>
+          <div class="stage-step hidden" id="stageRS">
+            <div class="stage-dot"></div>
+            <div class="stage-label">Align</div>
+          </div>
+          <div class="stage-connector hidden" id="connectorBrush"></div>
+          <div class="stage-step hidden" id="stageBrush">
+            <div class="stage-dot"></div>
+            <div class="stage-label">Brush</div>
+          </div>
+          <!-- VGGT path (visible by default) -->
+          <div class="stage-connector" id="connectorVggt"></div>
           <div class="stage-step" id="stageVggt">
             <div class="stage-dot"></div>
             <div class="stage-label">VGGT</div>
           </div>
-          <div class="stage-connector"></div>
+          <div class="stage-connector" id="connectorColmap"></div>
           <div class="stage-step" id="stageColmap">
             <div class="stage-dot"></div>
             <div class="stage-label">COLMAP</div>
@@ -874,15 +886,6 @@ a:hover { color: var(--sand); }
           <label class="settings-label">VGGT Project Folder</label>
           <input type="text" id="cfg_vggt_path" class="settings-input" placeholder="C:\...\vggt">
         </div>
-        <div class="settings-group">
-          <label class="settings-label">fusion2sphere Executable</label>
-          <input type="text" id="cfg_fusion2sphere_path" class="settings-input"
-                 placeholder="C:\...\insp_fusion2sphere\fusion2sphere.exe">
-          <div class="settings-hint">
-            Required for Insta360 .insp files — stitches dual-fisheye frames into equirectangular panoramas.
-            Download from <a href="#" onclick="return false;" style="color:var(--clay-light);">github.com/dorthrithil/fusion2sphere</a>
-          </div>
-        </div>
       </div>
 
       <div style="display:flex; align-items:center; gap:12px; margin-top:16px; padding-top:12px; border-top:1px solid rgba(196,98,45,0.12);">
@@ -924,6 +927,7 @@ let auth, db;
 let currentUser = null;
 let idToken = null;
 let currentJobId = null;
+let _pipelineMode = 'vggt'; // 'vggt' | 'rs_brush'; auto-detected from stage reports
 let _machineId = null;
 let pollInterval = null;
 let activeJobPollInterval = null;
@@ -1032,6 +1036,7 @@ function showApp() {
   refreshMachineStatus();
   startPolling();
   checkCamera();
+  loadSettings();
   cameraPollInterval = setInterval(checkCamera, 5000);
   switchTab('dashboard');
 }
@@ -1456,7 +1461,7 @@ async function loadQueue() {
         </div>
       `;
       currentJobId = data.current?.docId || null;
-      if (currentJobId) loadActiveJob();
+      if (currentJobId) { _pipelineMode = 'vggt'; loadActiveJob(); }
       return;
     }
 
@@ -1536,6 +1541,7 @@ async function acceptJob(jobId) {
     });
     if (res.ok) {
       currentJobId = jobId;
+      _pipelineMode = 'vggt';
       switchTab('active');
       loadActiveJob();
       document.getElementById('cameraImportSection').classList.remove('hidden');
@@ -1590,7 +1596,9 @@ async function loadActiveJob() {
       statusEl.textContent = '⏳ Ready'; statusEl.style.color = 'var(--fog)';
     }
 
-    // Stage stepper
+    // Stage stepper — honour backend-reported mode from first poll onward
+    if (job.pipelineMode === 'rs_brush') _pipelineMode = 'rs_brush';
+    else if (job.pipelineMode === 'vggt') _pipelineMode = 'vggt';
     updateStageStepper(job.currentStage || '', job.status);
 
     // Start Processing button — hide once pipeline is live or job is terminal
@@ -1959,19 +1967,14 @@ async function loadSettings() {
     _setVal('cfg_brush_path',               cfg.brush_path);
     _setVal('cfg_rs_settings_path',         cfg.rs_settings_path);
     _setVal('cfg_vggt_path',               cfg.vggt_path);
-    _setVal('cfg_fusion2sphere_path',       cfg.fusion2sphere_path);
 
   } catch (e) {
     console.warn('Settings load failed:', e);
   }
 }
 
-async function savePipelineSettings() {
-  const statusEl = document.getElementById('settingsSaveStatus');
-  statusEl.textContent = 'Saving…';
-  statusEl.style.color = 'var(--fog)';
-
-  const payload = {
+function _buildSettingsPayload() {
+  return {
     // Extraction
     extraction_method: _getRadio('extraction_method'),
     interval_value:    _getVal('cfg_interval_value'),
@@ -2017,14 +2020,21 @@ async function savePipelineSettings() {
     brush_rerun_logging:  _getCheck('cfg_brush_rerun_logging'),
     brush_spawn_viewer:   _getCheck('cfg_brush_spawn_viewer'),
     // Paths
-    ffmpeg_path:        _getVal('cfg_ffmpeg_path'),
-    rs_path:            _getVal('cfg_rs_path'),
-    postshot_path:      _getVal('cfg_postshot_path'),
-    brush_path:         _getVal('cfg_brush_path'),
-    rs_settings_path:   _getVal('cfg_rs_settings_path'),
-    vggt_path:          _getVal('cfg_vggt_path'),
-    fusion2sphere_path: _getVal('cfg_fusion2sphere_path'),
+    ffmpeg_path:      _getVal('cfg_ffmpeg_path'),
+    rs_path:          _getVal('cfg_rs_path'),
+    postshot_path:    _getVal('cfg_postshot_path'),
+    brush_path:       _getVal('cfg_brush_path'),
+    rs_settings_path: _getVal('cfg_rs_settings_path'),
+    vggt_path:        _getVal('cfg_vggt_path'),
   };
+}
+
+async function savePipelineSettings() {
+  const statusEl = document.getElementById('settingsSaveStatus');
+  statusEl.textContent = 'Saving…';
+  statusEl.style.color = 'var(--fog)';
+
+  const payload = _buildSettingsPayload();
 
   try {
     const res = await fetch('/api/config', {
@@ -2133,20 +2143,43 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 // ── Stage Stepper ──────────────────────────────────────
-const _STAGE_ORDER = ['frame_extraction', 'view_extraction', 'vggt_alignment', 'colmap_export'];
-const _STAGE_EL    = {
+const _STAGE_EL_VGGT = {
   'frame_extraction': 'stageFrames',
   'view_extraction':  'stageViews',
   'vggt_alignment':   'stageVggt',
   'colmap_export':    'stageColmap',
 };
+const _STAGE_ORDER_VGGT = ['frame_extraction', 'view_extraction', 'vggt_alignment', 'colmap_export'];
+
+const _STAGE_EL_RS_BRUSH = {
+  'frame_extraction': 'stageFrames',
+  'view_extraction':  'stageViews',
+  'realityscan':      'stageRS',
+  'brush_training':   'stageBrush',
+};
+const _STAGE_ORDER_RS_BRUSH = ['frame_extraction', 'view_extraction', 'realityscan', 'brush_training'];
+
+function _setStepperMode(mode) {
+  const isRS = mode === 'rs_brush';
+  const tog = (id, show) => { const el = document.getElementById(id); if (el) el.classList.toggle('hidden', !show); };
+  tog('connectorRS',    isRS);  tog('stageRS',        isRS);
+  tog('connectorBrush', isRS);  tog('stageBrush',     isRS);
+  tog('connectorVggt',  !isRS); tog('stageVggt',      !isRS);
+  tog('connectorColmap',!isRS); tog('stageColmap',    !isRS);
+}
 
 function updateStageStepper(currentStage, jobStatus) {
-  const currentIdx = _STAGE_ORDER.indexOf(currentStage);
-  for (const [stage, elId] of Object.entries(_STAGE_EL)) {
+  if (['realityscan', 'brush_training'].includes(currentStage)) _pipelineMode = 'rs_brush';
+  _setStepperMode(_pipelineMode);
+
+  const order = _pipelineMode === 'rs_brush' ? _STAGE_ORDER_RS_BRUSH : _STAGE_ORDER_VGGT;
+  const elMap = _pipelineMode === 'rs_brush' ? _STAGE_EL_RS_BRUSH   : _STAGE_EL_VGGT;
+  const currentIdx = order.indexOf(currentStage);
+
+  for (const [stage, elId] of Object.entries(elMap)) {
     const el = document.getElementById(elId);
     if (!el) continue;
-    const idx = _STAGE_ORDER.indexOf(stage);
+    const idx = order.indexOf(stage);
     if (jobStatus === 'complete') {
       el.className = 'stage-step done';
     } else if (idx < currentIdx) {
@@ -2166,9 +2199,12 @@ async function startProcessing() {
   btn.disabled = true;
   btn.textContent = '⚙️ Starting…';
   try {
+    const settings = _buildSettingsPayload();
+    addLogEntry(`⚙️ Settings: vggt=${settings.run_vggt} brush=${settings.run_brush} yaw=${settings.yaw_steps} pitch=${settings.pitch_angles_str}`);
     const res = await fetch(`/api/jobs/${currentJobId}/start`, {
       method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + idToken },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + idToken },
+      body: JSON.stringify(settings),
     });
     if (res.ok) {
       addLogEntry('🚀 Pipeline started!', 'success');

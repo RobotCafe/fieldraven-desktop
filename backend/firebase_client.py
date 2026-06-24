@@ -131,6 +131,30 @@ def get_bucket():
     return _bucket
 
 
+def download_storage_folder(storage_prefix: str, local_dir: str) -> list[str]:
+    """
+    Download all blobs under storage_prefix into local_dir.
+    Skips files that already exist locally (resume-safe).
+    Returns list of paths that were actually downloaded.
+    """
+    bucket = get_bucket()
+    blobs = list(bucket.list_blobs(prefix=storage_prefix))
+    downloaded: list[str] = []
+    for blob in blobs:
+        if blob.name.endswith('/'):
+            continue
+        filename = Path(blob.name).name
+        dest = Path(local_dir) / filename
+        if dest.exists():
+            print(f"  [storage] Already exists, skipping: {filename}")
+            continue
+        size_kb = (blob.size or 0) // 1024
+        print(f"  [storage] Downloading: {filename} ({size_kb:,} KB)")
+        blob.download_to_filename(str(dest))
+        downloaded.append(str(dest))
+    return downloaded
+
+
 def upload_preview(job_id: str, local_path: str, uid: str) -> Optional[str]:
     """
     Upload a preview/thumbnail to Firebase Storage.

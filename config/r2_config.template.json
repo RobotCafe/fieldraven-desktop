@@ -1,0 +1,7 @@
+{
+  "endpoint": "https://<ACCOUNT_ID>.r2.cloudflarestorage.com",
+  "access_key_id": "<R2_ACCESS_KEY_ID>",
+  "secret_access_key": "<R2_SECRET_ACCESS_KEY>",
+  "bucket": "fieldraven-splats",
+  "public_base_url": "https://splats.fieldraven.ca"
+}
