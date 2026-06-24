@@ -93,10 +93,9 @@ async def get_firebase_config():
 @app.get("/api/health")
 async def health():
     """Basic health check."""
-    fb_status = firebase_client.check_connection()
     return {
         "status": "running",
-        "firebase": fb_status,
+        "firebase": {"connected": _is_initialized, "project": "fieldraven-ffad8"},
         "machine_id": machine_module.get_machine_id(),
         "machine_name": machine_module.get_display_name(),
         "busy": queue_manager.is_busy(),

@@ -46,7 +46,7 @@ def open_browser(port: int, delay: float = 2.0):
 def main():
     parser = argparse.ArgumentParser(description="FieldRaven Desktop Dashboard")
     parser.add_argument("--port", type=int, default=8081, help="Port to serve on (default: 8081)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    parser.add_argument("--host", type=str, default="localhost", help="Host to bind to (default: localhost)")
     parser.add_argument("--no-browser", action="store_true", help="Don't open browser automatically")
     args = parser.parse_args()
 

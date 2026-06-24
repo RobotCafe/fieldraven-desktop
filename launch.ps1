@@ -6,7 +6,7 @@ $Python = "C:\Users\DenmanNic\AppData\Local\Programs\Python\Python313\python.exe
 # If server is already up, just open Chrome
 $already = $false
 try {
-    Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop | Out-Null
+    Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
     $already = $true
 } catch {}
 
@@ -20,7 +20,7 @@ if (-not $already) {
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 500
         try {
-            Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop | Out-Null
+            Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
             $ready = $true
             break
         } catch {}
@@ -36,7 +36,7 @@ $ChromePaths = @(
 $Chrome = $ChromePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if ($Chrome) {
-    Start-Process $Chrome "--app=$Url --window-size=1440,900"
+    Start-Process $Chrome "--app=$Url --new-window --window-size=1440,900"
 } else {
     Start-Process $Url
 }
