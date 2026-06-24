@@ -73,9 +73,9 @@ def upload_splat(local_path: str | Path, job_id: str) -> str:
     return public_url
 
 
-def upload_ksplat(local_path: str | Path, job_id: str) -> str:
+def upload_rad(local_path: str | Path, job_id: str) -> str:
     """
-    Upload a .ksplat file to R2 under {job_id}/scene.ksplat.
+    Upload a .rad LoD splat file to R2 under {job_id}/scene-lod.rad.
     Returns the public HTTPS URL.
     """
     import boto3
@@ -93,7 +93,7 @@ def upload_ksplat(local_path: str | Path, job_id: str) -> str:
         config=Config(signature_version="s3v4"),
     )
 
-    key = f"{job_id}/scene.ksplat"
+    key = f"{job_id}/scene-lod.rad"
     file_size_mb = local_path.stat().st_size / (1024 * 1024)
     print(f"  [r2] Uploading {local_path.name} ({file_size_mb:.0f} MB) → {cfg['bucket']}/{key}")
 
@@ -108,7 +108,7 @@ def upload_ksplat(local_path: str | Path, job_id: str) -> str:
     )
 
     public_url = f"{cfg['public_base_url'].rstrip('/')}/{key}"
-    print(f"  [r2] Uploaded -> {public_url}")
+    print(f"  [r2] Uploaded → {public_url}")
     return public_url
 
 

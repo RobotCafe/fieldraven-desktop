@@ -486,13 +486,16 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                 ply_file = find_latest_ply(str(training_dir))
 
                 if ply_file and r2_client.is_configured():
-                    ksplat_file = training_dir / "scene.ksplat"
-                    queue_manager.update_job_progress(job_id, 93, "Converting to .ksplat (preserving full SH)...")
-                    _convert_ply_to_ksplat(Path(ply_file), ksplat_file)
                     gaussian_count = _count_gaussians_ply(Path(ply_file))
 
-                    queue_manager.update_job_progress(job_id, 98, "Uploading to gallery...")
-                    r2_url = r2_client.upload_ksplat(ksplat_file, job_id)
+                    queue_manager.update_job_progress(job_id, 90, "Compressing to .spz…")
+                    spz_file = _convert_ply_to_spz(Path(ply_file))
+
+                    queue_manager.update_job_progress(job_id, 95, "Building LoD tree (.rad)…")
+                    rad_file = _convert_spz_to_rad(spz_file)
+
+                    queue_manager.update_job_progress(job_id, 98, "Uploading to gallery…")
+                    r2_url = r2_client.upload_rad(rad_file, job_id)
 
                     # Pick middle stitched JPEG as thumbnail
                     thumbnail_url = _upload_thumbnail(job_id, proj_root)
@@ -523,18 +526,38 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         _threads.pop(job_id, None)
 
 
-_KSPLAT_SCRIPT = Path(__file__).parent.parent / "scripts" / "ksplat" / "convert.mjs"
+_SPZ_SCRIPT = Path(__file__).parent.parent / "scripts" / "spz" / "convert.mjs"
+_BUILD_LOD_EXE = (
+    Path(__file__).parent.parent
+    / "scripts" / "spark-repo" / "rust"
+    / "target" / "release" / "build-lod.exe"
+)
 
 
-def _convert_ply_to_ksplat(ply_path: Path, out_path: Path) -> None:
-    """Convert a PLY file to .ksplat format using the Node.js GaussianSplats3D converter."""
+def _convert_ply_to_spz(ply_path: Path) -> Path:
+    """Compress PLY → .spz (Spark WASM compressor). Output lands next to input."""
     result = subprocess.run(
-        ["node", str(_KSPLAT_SCRIPT), str(ply_path), str(out_path), "1"],
+        ["node", str(_SPZ_SCRIPT), str(ply_path), "--max-sh", "2"],
         capture_output=True, text=True, timeout=1800,
+        cwd=str(ply_path.parent),
     )
     if result.returncode != 0:
-        raise RuntimeError(f"ksplat conversion failed:\n{result.stderr[-2000:]}")
-    print(f"  [ksplat] {result.stdout.strip()}")
+        raise RuntimeError(f"spz compression failed:\n{result.stderr[-2000:]}")
+    print(f"  [spz] {result.stdout.strip()}")
+    return ply_path.with_suffix(".spz")
+
+
+def _convert_spz_to_rad(spz_path: Path) -> Path:
+    """Build LoD splat tree (.rad) from .spz using Spark's build-lod binary."""
+    result = subprocess.run(
+        [str(_BUILD_LOD_EXE), "--quality", str(spz_path)],
+        capture_output=True, text=True, timeout=3600,
+        cwd=str(spz_path.parent),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"build-lod failed:\n{result.stderr[-2000:]}")
+    print(f"  [build-lod] {result.stdout.strip()}")
+    return spz_path.parent / (spz_path.stem + "-lod.rad")
 
 
 def _count_gaussians_ply(path: Path) -> int:

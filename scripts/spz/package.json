@@ -1,0 +1,8 @@
+{
+  "name": "fieldraven-spz-tools",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@sparkjsdev/spark": "^2.1.0"
+  }
+}

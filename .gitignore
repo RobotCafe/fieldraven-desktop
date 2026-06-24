@@ -33,5 +33,15 @@ frontend-react/dist/
 # ksplat converter dependencies
 scripts/ksplat/node_modules/
 
+# spz converter dependencies
+scripts/spz/node_modules/
+
+# Spark repo (cloned upstream — nested git repo)
+scripts/spark-repo/
+
 # Compiled object files at root
 *.obj
+
+# Spec / debug docs
+*_Spec.md
+*_DEBUG.md
