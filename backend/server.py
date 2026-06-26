@@ -742,6 +742,7 @@ async def import_manual(
 class ProjectConfigWriteRequest(BaseModel):
     dir: str
     jobId: str
+    settings: Optional[Dict[str, Any]] = None
 
 @app.get("/api/project/config")
 async def read_project_config(
@@ -810,6 +811,8 @@ async def write_project_config(
     }
     if "createdAt" not in config:
         config["createdAt"] = config["savedAt"]
+    if request.settings is not None:
+        config["settings"] = {**existing.get("settings", {}), **request.settings}
 
     try:
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -907,10 +910,50 @@ async def get_project_state(
         },
     }
 
-    saved_settings = saved.get("settings", {})
-    pipeline_mode = "vggt" if saved_settings.get("run_vggt") else "rs_brush"
+    def _b(v, default=False):
+        if isinstance(v, bool): return v
+        return str(v).lower() in ("true", "1", "yes") if v is not None else default
 
-    stage_order     = ["import", "view_extraction", "realityscan", "brush_training"]
+    saved_settings = saved.get("settings", {})
+    run_colmap = _b(saved_settings.get("run_colmap"), False)
+    run_vggt   = _b(saved_settings.get("run_vggt"),   False)
+    skip_rs    = _b(saved_settings.get("skip_realityscan"), False)
+
+    if skip_rs and run_colmap:
+        pipeline_mode = "colmap"
+    elif skip_rs and run_vggt:
+        pipeline_mode = "vggt"
+    else:
+        pipeline_mode = "rs_brush"
+
+    # COLMAP alignment: sparse reconstruction in 03_alignment/colmap/sparse_txt
+    colmap_sparse = project_dir / "03_alignment" / "colmap" / "sparse_txt"
+    colmap_done   = colmap_sparse.exists() and any(
+        (colmap_sparse / f).exists() for f in ("cameras.txt", "images.txt")
+    )
+    colmap_cameras = sum(1 for _ in colmap_sparse.glob("*.txt")) if colmap_sparse.exists() else 0
+
+    # VGGT alignment: output in 04_training/vggt_output
+    vggt_dir  = project_dir / "04_training" / "vggt_output"
+    vggt_done = vggt_dir.exists() and _has_images(vggt_dir)
+
+    stages["colmap_alignment"] = {
+        "done":        colmap_done,
+        "cameras":     colmap_cameras,
+        "completedAt": saved_stages.get("colmap_alignment", {}).get("completedAt"),
+    }
+    stages["vggt_alignment"] = {
+        "done":        vggt_done,
+        "completedAt": saved_stages.get("vggt_alignment", {}).get("completedAt"),
+    }
+
+    if pipeline_mode == "colmap":
+        stage_order = ["import", "view_extraction", "colmap_alignment", "brush_training"]
+    elif pipeline_mode == "vggt":
+        stage_order = ["import", "view_extraction", "vggt_alignment", "brush_training"]
+    else:
+        stage_order = ["import", "view_extraction", "realityscan", "brush_training"]
+
     completed_stages: list[str] = []
     next_stage: Optional[str]   = None
     for s in stage_order:
@@ -938,9 +981,11 @@ class ProjectPrepareRequest(BaseModel):
 
 
 _STAGE_DIRS_TO_DELETE: dict[str, list[str]] = {
-    "view_extraction": ["02_views", "03_alignment", "04_training"],
-    "realityscan":     ["03_alignment", "04_training"],
-    "brush_training":  ["04_training"],
+    "view_extraction":   ["02_views", "03_alignment", "04_training"],
+    "realityscan":       ["03_alignment", "04_training"],
+    "colmap_alignment":  ["03_alignment", "04_training"],
+    "vggt_alignment":    ["03_alignment", "04_training"],
+    "brush_training":    ["04_training"],
 }
 
 
@@ -966,6 +1011,7 @@ class ProjectResumeRequest(BaseModel):
     dir:       str
     startFrom: str
     jobId:     Optional[str] = None
+    settings:  Optional[Dict[str, Any]] = None
 
 
 @app.post("/api/project/resume")
@@ -991,7 +1037,8 @@ async def resume_project(
     if not job_id:
         raise HTTPException(status_code=400, detail="No jobId — project was never queued")
 
-    saved_settings = saved.get("settings", {})
+    # Prefer settings sent by the UI (always current) over saved settings (may be stale)
+    saved_settings = request.settings if request.settings is not None else saved.get("settings", {})
 
     # Reset the Firestore doc to processing state so the frontend can track it
     # accept_job also sets queue_manager._current_job_id
@@ -1012,9 +1059,16 @@ async def resume_project(
         "_ui_settings": {
             "run_vggt":          saved_settings.get("run_vggt", False),
             "run_brush":         saved_settings.get("run_brush", True),
+            "run_postshot":      saved_settings.get("run_postshot", False),
+            "skip_realityscan":  saved_settings.get("skip_realityscan", True),
+            "run_colmap":        saved_settings.get("run_colmap", False),
+            "colmap_mode":       saved_settings.get("colmap_mode", "rig"),
+            "colmap_matcher":    saved_settings.get("colmap_matcher", "sequential"),
+            "colmap_visualize":  saved_settings.get("colmap_visualize", False),
             "yaw_steps":         saved_settings.get("yaw_steps", 6),
             "pitch_angles_str":  saved_settings.get("pitch_angles_str", "-7"),
             "fov":               saved_settings.get("fov", 94.6),
+            "horizon_ref":       saved_settings.get("horizon_ref", True),
             "extraction_method": saved_settings.get("extraction_method", "interval"),
             "interval_value":    saved_settings.get("interval_value", 1.0),
             "interval_unit":     saved_settings.get("interval_unit", "seconds"),

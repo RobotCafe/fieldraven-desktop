@@ -212,7 +212,9 @@ const API_TO_UI = {
   run_brush:'runBrush', vggt_conf_threshold:'vggtConf',
   sky_sensitivity_threshold:'vggtSky', vggt_mask_sky:'vggtMaskSky',
   vggt_show_camera:'vggtShowCam', vggt_temporal_sequencing:'vggtTemporal',
-  vggt_prediction_mode:'vggtMode',
+  vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
+  export_xmp:'exportXmp',
+  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_gravity_align:'colmapGravityAlign',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -222,7 +224,7 @@ const API_TO_UI = {
   brush_max_resolution:'brushRes', brush_seed:'brushSeed',
   brush_rerun_logging:'brushRerun', brush_spawn_viewer:'brushViewer',
   ffmpeg_path:'ffmpeg', rs_path:'rs', postshot_path:'postshot',
-  brush_path:'brush', rs_settings_path:'rsSettings', vggt_path:'vggt',
+  brush_path:'brush', rs_settings_path:'rsSettings', vggt_path:'vggt', colmap_bin:'colmapBin',
   insp_stitch_type:'inspStitchType', insp_lens_guard:'inspLensGuard',
   insp_flowstate:'inspFlowState', insp_cuda:'inspCuda',
   insp_workers:'inspWorkers',
@@ -238,8 +240,8 @@ function parseApiVal(v) {
 // Keys whose values must always remain strings (never coerced to number)
 const STRING_SETTINGS = new Set(['pitchAngles', 'vggtMode', 'postshotProfile',
   'extractionMethod', 'intervalUnit', 'frameFormat', 'ffmpeg', 'rs', 'postshot',
-  'brush', 'rsSettings', 'vggt', 'inspStitchType', 'inspLensGuard',
-  'inspOutputWidth', 'inspWorkers']);
+  'brush', 'rsSettings', 'vggt', 'colmapBin', 'inspStitchType', 'inspLensGuard',
+  'inspOutputWidth', 'inspWorkers', 'colmapMode', 'colmapMatcher']);
 
 function apiConfigToSettings(cfg) {
   const out = {};
@@ -1145,6 +1147,8 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
             <Input type="number" value={settings.fov}
               onChange={v=>setSettings(s=>({...s,fov:v}))} />
           </FieldRow>
+          <Toggle checked={!!settings.horizonRef} label="Horizon Reference View (adds pitch=0° sensor for vertical anchoring)"
+            onChange={v=>setSettings(s=>({...s,horizonRef:v}))} />
         </Accordion>
 
         <Accordion title="Overlay" defaultOpen={false}>
@@ -1254,11 +1258,17 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 // ─── Alignment Tab ────────────────────────────────────────────────────────────
 function AlignmentTab({ settings, setSettings }) {
   const { skipRS, runVggt, runPostshot, runBrush } = settings;
+  const runColmap = !!settings.runColmap;
+  const training = [runPostshot&&"Postshot", runBrush&&"Brush"].filter(Boolean).join(", ") || "None";
   const plan = skipRS
     ? runVggt
-      ? `VGGT → COLMAP → Training: ${[runPostshot&&"Postshot",runBrush&&"Brush"].filter(Boolean).join(", ")||"None"}`
-      : runPostshot ? "Direct Postshot (handles alignment internally)" : "⚠️ No method selected"
-    : [runPostshot&&"Postshot export",runBrush&&"Brush export"].filter(Boolean).join(" + ") || "RealityScan align only";
+      ? `VGGT → Training: ${training}`
+      : runColmap
+        ? `COLMAP → Training: ${training}`
+        : runPostshot
+          ? "Direct Postshot (handles alignment internally)"
+          : "⚠️ No alignment method selected"
+    : [runPostshot&&"Postshot export", runBrush&&"Brush export"].filter(Boolean).join(" + ") || "RealityScan align only";
 
   return (
     <div style={{ overflowY:"auto", height:"100%" }}>
@@ -1270,6 +1280,12 @@ function AlignmentTab({ settings, setSettings }) {
             runVggt: v ? s.runVggt : false,       // turning RS on forces VGGT off
             runBrush: v && !s.runVggt ? false : s.runBrush,
           }))} />
+        {!skipRS && (
+          <div style={{ marginTop:8 }}>
+            <Toggle checked={settings.exportXmp} label="Rig-Aware XMP (inject rig geometry into RS)"
+              onChange={v=>setSettings(s=>({...s,exportXmp:v}))} />
+          </div>
+        )}
         {skipRS && (
           <div style={{ marginTop:10, paddingLeft:10, borderLeft:`2px solid ${T.border}` }}>
             <Toggle checked={runVggt} label="Use VGGT for camera pose estimation"
@@ -1295,7 +1311,7 @@ function AlignmentTab({ settings, setSettings }) {
                   </FieldRow>
                   <div style={{ display:"flex", flexWrap:"wrap", gap:10, marginTop:6 }}>
                     {[["vggtMaskSky","Filter Sky"],["vggtShowCam","Show Camera Frustums"],
-                      ["vggtTemporal","Temporal Sequencing"]].map(([k,l])=>(
+                      ["vggtTemporal","Temporal Sequencing"],["vggtAnchorRig","Anchor+Rig Mode"]].map(([k,l])=>(
                       <Toggle key={k} checked={settings[k]} label={l}
                         onChange={v=>setSettings(s=>({...s,[k]:v}))} />
                     ))}
@@ -1315,12 +1331,41 @@ function AlignmentTab({ settings, setSettings }) {
         )}
       </Accordion>
 
+      <Accordion title="COLMAP (experimental)" accent={T.amber}>
+        <Toggle checked={settings.runColmap} label="Use COLMAP alignment"
+          onChange={v=>setSettings(s=>({...s,runColmap:v}))} />
+        {settings.runColmap && (
+          <div style={{ marginTop:10, display:"flex", flexDirection:"column", gap:10 }}>
+            <FieldRow label="Mode">
+              <div style={{ display:"flex", gap:12 }}>
+                <Radio value="rig" checked={settings.colmapMode==="rig"}
+                  onChange={v=>setSettings(s=>({...s,colmapMode:v}))} label="Perspective-Rig" />
+                <Radio value="spherical" checked={settings.colmapMode==="spherical"}
+                  onChange={v=>setSettings(s=>({...s,colmapMode:v}))} label="Spherical" />
+              </div>
+            </FieldRow>
+            <FieldRow label="Matcher">
+              <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                {["sequential","exhaustive","vocabtree"].map(m=>(
+                  <Radio key={m} value={m} checked={settings.colmapMatcher===m}
+                    onChange={v=>setSettings(s=>({...s,colmapMatcher:v}))} label={m} />
+                ))}
+              </div>
+            </FieldRow>
+            <Toggle checked={!!settings.colmapVisualize} label="Generate camera visualizer (cameras.html)"
+              onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
+            <Toggle checked={settings.colmapGravityAlign !== false} label="Apply gravity alignment (R_X correction)"
+              onChange={v=>setSettings(s=>({...s,colmapGravityAlign:v}))} />
+          </div>
+        )}
+      </Accordion>
+
       <Accordion title="Training" accent={T.amber}>
         <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
           <Toggle checked={runPostshot} label="Run Postshot Training"
             onChange={v=>setSettings(s=>({...s,runPostshot:v}))} />
           <Toggle checked={runBrush} label="Run Brush Training"
-            disabled={skipRS&&!runVggt}
+            disabled={skipRS&&!runVggt&&!settings.runColmap}
             onChange={v=>setSettings(s=>({...s,runBrush:v}))} />
         </div>
       </Accordion>
@@ -1399,6 +1444,7 @@ function ConfigTab({ settings, setSettings, machineInfo, onSaveConfig }) {
     ["ffmpeg","FFmpeg Executable"],["rs","RealityScan Executable"],
     ["postshot","Postshot CLI"],["brush","Brush CLI"],
     ["rsSettings","RS Settings Folder"],["vggt","VGGT Project"],
+    ["colmapBin","COLMAP Binary (.exe)"],
   ];
   return (
     <div style={{ overflowY:"auto", height:"100%" }}>
@@ -1671,29 +1717,37 @@ function MenuBar({ menus }) {
 
 // ─── Project State Modal ──────────────────────────────────────────────────────
 const _STAGE_LABELS = {
-  import:          { label: "Import",        icon: "📷" },
-  view_extraction: { label: "View Extraction", icon: "🖼" },
-  realityscan:     { label: "RealityScan",   icon: "📐" },
-  brush_training:  { label: "Brush Training", icon: "🎨" },
-  vggt_alignment:  { label: "VGGT Align",    icon: "🔬" },
-  colmap_export:   { label: "COLMAP Export", icon: "📦" },
+  import:           { label: "Import",             icon: "📷" },
+  view_extraction:  { label: "View Extraction",    icon: "🖼" },
+  realityscan:      { label: "RealityScan",        icon: "📐" },
+  colmap_alignment: { label: "COLMAP Alignment",   icon: "📐" },
+  vggt_alignment:   { label: "VGGT Alignment",     icon: "🔬" },
+  brush_training:   { label: "Brush Training",     icon: "🎨" },
+  colmap_export:    { label: "COLMAP Export",      icon: "📦" },
 };
 
 function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCancel }) {
   const [rerunStage, setRerunStage] = useState('');
   if (!state) return null;
 
-  const { stages, nextStage, completedStages, projectDir } = state;
-  const allStages = ['import', 'view_extraction', 'realityscan', 'brush_training'];
+  const { stages, nextStage, completedStages, projectDir, pipelineMode } = state;
+  const _mode = pipelineMode || 'rs_brush';
+  const allStages = _mode === 'colmap'
+    ? ['import', 'view_extraction', 'colmap_alignment', 'brush_training']
+    : _mode === 'vggt'
+    ? ['import', 'view_extraction', 'vggt_alignment', 'brush_training']
+    : ['import', 'view_extraction', 'realityscan', 'brush_training'];
   const shortDir = projectDir.length > 55 ? '…' + projectDir.slice(-52) : projectDir;
 
   const stageDetail = (key) => {
     const s = stages[key] || {};
     if (!s.done) return 'Not started';
-    if (key === 'import')          return `${s.stitched || 0} files`;
-    if (key === 'view_extraction') return `${s.views || 0} views`;
-    if (key === 'realityscan')     return `${s.images || 0} images`;
-    if (key === 'brush_training')  return `${s.plyFiles || 0} PLY file(s)`;
+    if (key === 'import')            return `${s.stitched || 0} files`;
+    if (key === 'view_extraction')   return `${s.views || 0} views`;
+    if (key === 'realityscan')       return `${s.images || 0} images`;
+    if (key === 'colmap_alignment')  return s.cameras ? `${s.cameras} txt file(s)` : 'Done';
+    if (key === 'vggt_alignment')    return 'Done';
+    if (key === 'brush_training')    return `${s.plyFiles || 0} PLY file(s)`;
     return 'Done';
   };
 
@@ -1780,13 +1834,14 @@ const defaultSettings = {
   pitchAngles:"-50, -7", yawSteps:"6", fov:"94.6", overlayOpacity:0.6,
   skipRS:false, runVggt:false, runPostshot:true, runBrush:false,
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
-  vggtMode:"depthmap",
+  vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false,
+  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapGravityAlign:true,
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,
   brushSteps:30000, brushSplats:5000000, brushRes:1920, brushSeed:42,
   brushRerun:false, brushViewer:false,
-  ffmpeg:"", rs:"", postshot:"", brush:"", rsSettings:"", vggt:"",
+  ffmpeg:"", rs:"", postshot:"", brush:"", rsSettings:"", vggt:"", colmapBin:"",
   inspStitchType:"ai", inspLensGuard:"none", inspFlowState:true, inspCuda:true,
   inspOutputWidth:"5984", inspWorkers:"2",
   projectDir:"",
@@ -1962,6 +2017,11 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         (state.completedStages || []).some(s => s !== 'import');
       if (hasMeaningfulHistory) {
         setProjectState(state);
+        // Apply saved project settings to the UI so the 1500ms auto-save
+        // writes the correct values (not the UI defaults) back to disk.
+        if (state.settings) {
+          setSettings(s => ({ ...s, ...apiConfigToSettings(state.settings) }));
+        }
         return; // modal handles what happens next
       }
     } catch (e) {
@@ -1972,17 +2032,25 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   }, [api, selected, loadProjectDir, setSettings]);
 
   // ── Resume a project from a specific stage ────────────────────
-  const runPipelineResume = useCallback(async (projectDir, jobId, startFrom) => {
+  const runPipelineResume = useCallback(async (projectDir, jobId, startFrom, savedApiSettings = null) => {
     setProjectState(null);
     try {
       addLog(`Resuming from ${startFrom || 'beginning'}…`);
+      // Use the project's own saved settings when available (prevents the current
+      // UI mode from overriding the pipeline that was originally configured).
+      const apiCfg = savedApiSettings || settingsToApiConfig(settings);
       const r = await api('/api/project/resume', 'POST', {
         dir: projectDir, jobId, startFrom: startFrom || '',
+        settings: apiCfg,
       });
       setCurrentJobId(r.jobId);
       setProgress(0);
       setCurrentStage('');
-      setPipelineMode('rs_brush'); // default; backend will correct via pipelineMode field
+      const _rc = savedApiSettings?.run_colmap ?? settings.runColmap;
+      const _rv = savedApiSettings?.run_vggt   ?? settings.runVggt;
+      const _rb = savedApiSettings?.run_brush   ?? settings.runBrush;
+      const _mode = _rc ? 'colmap' : (!_rv && _rb ? 'rs_brush' : 'vggt');
+      setPipelineMode(_mode);
       setStatusMsg(`Resuming from ${startFrom || 'beginning'}`);
       addLog(`Pipeline resumed — jobId: ${r.jobId}`);
       setActiveMainTab(2);
@@ -1990,7 +2058,18 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     } catch (e) {
       addLog(`Resume failed: ${e.message}`);
     }
-  }, [api, loadQueue]);
+  }, [api, loadQueue, settings]);
+
+  // ── Auto-save settings to fieldraven.json when they change ──
+  useEffect(() => {
+    if (!selected?.id || !projectDirs[selected.id]) return;
+    const dir = projectDirs[selected.id];
+    const jobId = selected.id;
+    const timer = setTimeout(() => {
+      api('/api/project/config', 'POST', { dir, jobId, settings: settingsToApiConfig(settings) }).catch(() => {});
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [settings, selected, projectDirs, api]);
 
   // ── Import progress polling ───────────────────────────────
   useEffect(() => {
@@ -2140,12 +2219,18 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       try {
         addLog(`Accepting job...`);
         await api('/api/jobs/accept', 'POST', { jobId: selected.id });
+        // Save current settings to fieldraven.json before starting
+        const projectDir = projectDirs[selected.id];
+        if (projectDir) {
+          api('/api/project/config', 'POST', { dir: projectDir, jobId: selected.id, settings: settingsToApiConfig(settings) }).catch(() => {});
+        }
         addLog('Starting pipeline...');
         await api(`/api/jobs/${selected.id}/start`, 'POST', settingsToApiConfig(settings));
         setCurrentJobId(selected.id);
         setProgress(0);
         setCurrentStage('');
-        setPipelineMode(!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+        const _mode = settings.runColmap ? 'colmap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+        setPipelineMode(_mode);
         setStatusMsg('Pipeline started');
         addLog('Pipeline running');
         setSelected(null);
@@ -2155,7 +2240,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         addLog(`Pipeline error: ${e.message}`);
       }
     }
-  }, [selected, api, pqItems, loadQueue]);
+  }, [selected, api, pqItems, loadQueue, settings, projectDirs]);
 
   const cancelPipeline = useCallback(async () => {
     if (!currentJobId) return;
@@ -2206,13 +2291,13 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         <ProjectStateModal
           state={projectState}
           onContinue={async (nextStage) => {
-            await runPipelineResume(projectState.projectDir, projectState.jobId, nextStage);
+            await runPipelineResume(projectState.projectDir, projectState.jobId, nextStage, projectState.settings);
           }}
           onRerunFrom={async (stage) => {
             try {
               addLog(`Preparing rerun from ${stage}…`);
               await api('/api/project/prepare', 'POST', { dir: projectState.projectDir, startFrom: stage });
-              await runPipelineResume(projectState.projectDir, projectState.jobId, stage);
+              await runPipelineResume(projectState.projectDir, projectState.jobId, stage, projectState.settings);
             } catch (e) {
               addLog(`Rerun failed: ${e.message}`);
               setProjectState(null);
@@ -2222,7 +2307,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
             try {
               addLog('Starting over — clearing all output…');
               await api('/api/project/prepare', 'POST', { dir: projectState.projectDir, startFrom: 'view_extraction' });
-              await runPipelineResume(projectState.projectDir, projectState.jobId, 'view_extraction');
+              await runPipelineResume(projectState.projectDir, projectState.jobId, 'view_extraction', projectState.settings);
             } catch (e) {
               addLog(`Start over failed: ${e.message}`);
               setProjectState(null);

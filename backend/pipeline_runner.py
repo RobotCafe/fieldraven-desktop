@@ -47,6 +47,18 @@ _STAGE_RANGE_RS_BRUSH_POST_STITCH = {
     "realityscan":      (70, 85),
     "brush_training":   (85, 97),
 }
+_STAGE_RANGE_COLMAP = {
+    "frame_extraction":  (5,  20),
+    "view_extraction":   (20, 45),
+    "colmap_alignment":  (45, 80),
+    "brush_training":    (80, 97),
+}
+_STAGE_RANGE_COLMAP_POST_STITCH = {
+    "frame_extraction":  (47, 57),
+    "view_extraction":   (57, 72),
+    "colmap_alignment":  (72, 88),
+    "brush_training":    (88, 97),
+}
 
 _cancel_events: dict[str, threading.Event] = {}
 _threads:       dict[str, threading.Thread] = {}
@@ -166,6 +178,7 @@ def _build_settings(job_data: dict):
         s.pitch_angles = [float(x.strip()) for x in raw_pitch.split(",") if x.strip()]
     s.yaw_steps         = int(cfg.get("yaw_steps", s.yaw_steps))
     s.fov               = float(cfg.get("fov", s.fov))
+    s.horizon_ref       = _to_bool(cfg.get("horizon_ref", s.horizon_ref))
 
     # ── Alignment / VGGT ─────────────────────────────────────────
     s.run_vggt                    = _to_bool(cfg.get("run_vggt", s.run_vggt))
@@ -182,6 +195,12 @@ def _build_settings(job_data: dict):
     s.use_anchor_rig              = _to_bool(cfg.get("vggt_use_anchor_rig", s.use_anchor_rig))
     s.anchor_view                 = cfg.get("vggt_anchor_view", s.anchor_view)
     s.rig_optimization_min_points = int(cfg.get("vggt_rig_optimization_min_points", s.rig_optimization_min_points))
+    s.use_rig_xmp                 = _to_bool(cfg.get("export_xmp", s.use_rig_xmp))
+    s.run_colmap                  = _to_bool(cfg.get("run_colmap", s.run_colmap))
+    s.colmap_mode                 = cfg.get("colmap_mode", s.colmap_mode)
+    s.colmap_matcher              = cfg.get("colmap_matcher", s.colmap_matcher)
+    s.colmap_visualize            = _to_bool(cfg.get("colmap_visualize", s.colmap_visualize))
+    s.colmap_gravity_align        = _to_bool(cfg.get("colmap_gravity_align", s.colmap_gravity_align))
     s.sky_sensitivity_threshold   = int(float(cfg.get("sky_sensitivity_threshold", s.sky_sensitivity_threshold)))
 
     # ── Postshot ──────────────────────────────────────────────────
@@ -213,6 +232,7 @@ def _build_settings(job_data: dict):
     s.brush_path       = cfg.get("brush_path") or s.brush_path
     s.rs_path          = cfg.get("rs_path") or s.rs_path
     s.rs_settings_path = cfg.get("rs_settings_path") or s.rs_settings_path
+    s.colmap_bin       = cfg.get("colmap_bin") or s.colmap_bin
 
     # ── Per-job Firestore overrides (from processing_queue.settings) ─
     js = job_data.get("settings") or {}
@@ -237,8 +257,14 @@ def _build_settings(job_data: dict):
         if "run_vggt" in ui:          s.run_vggt          = _to_bool(ui["run_vggt"])
         if "run_brush" in ui:         s.run_brush         = _to_bool(ui["run_brush"])
         if "run_postshot" in ui:      s.run_postshot      = _to_bool(ui["run_postshot"])
+        if "run_colmap" in ui:        s.run_colmap        = _to_bool(ui["run_colmap"])
+        if "colmap_mode" in ui:       s.colmap_mode       = ui["colmap_mode"]
+        if "colmap_matcher" in ui:    s.colmap_matcher    = ui["colmap_matcher"]
+        if "colmap_visualize" in ui:    s.colmap_visualize    = _to_bool(ui["colmap_visualize"])
+        if "colmap_gravity_align" in ui: s.colmap_gravity_align = _to_bool(ui["colmap_gravity_align"])
         if "yaw_steps" in ui:         s.yaw_steps         = int(ui["yaw_steps"])
         if "fov" in ui:               s.fov               = float(ui["fov"])
+        if "horizon_ref" in ui:       s.horizon_ref       = _to_bool(ui["horizon_ref"])
         if "pitch_angles_str" in ui:
             raw = ui["pitch_angles_str"]
             s.pitch_angles = [float(x.strip()) for x in raw.split(",") if x.strip() and float(x.strip()) != 0]
@@ -416,7 +442,7 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                 f for f in (proj_root / "import from camera").iterdir()
                 if f.is_file() and f.suffix.lower() in img_exts
             ]) if (proj_root / "import from camera").exists() else 0
-            expected_views = input_count * len(settings.pitch_angles) * settings.yaw_steps
+            expected_views = input_count * (len(settings.pitch_angles) * settings.yaw_steps + (1 if getattr(settings, "horizon_ref", False) else 0))
             if existing_views > 0 and expected_views > 0 and existing_views != expected_views:
                 queue_manager.update_job_progress(job_id, 2,
                     f"⚠️ Stale output detected ({existing_views} views, expected {expected_views}) — clearing and restarting")
@@ -425,10 +451,14 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     if d.exists():
                         shutil.rmtree(str(d))
 
-        use_rs_brush = not settings.run_vggt and settings.run_brush
+        use_colmap   = getattr(settings, "run_colmap", False)
+        use_rs_brush = not settings.run_vggt and not use_colmap and settings.run_brush
         if use_rs_brush:
             stage_map = _STAGE_RANGE_RS_BRUSH_POST_STITCH if insp_count else _STAGE_RANGE_RS_BRUSH
             print(f"  → Stage map: RS+Brush {'(post-stitch)' if insp_count else '(direct)'}")
+        elif use_colmap:
+            stage_map = _STAGE_RANGE_COLMAP_POST_STITCH if insp_count else _STAGE_RANGE_COLMAP
+            print(f"  → Stage map: COLMAP {'(post-stitch)' if insp_count else '(direct)'}")
         else:
             stage_map = _STAGE_RANGE_POST_STITCH if insp_count else _STAGE_RANGE
             print(f"  → Stage map: VGGT {'(post-stitch)' if insp_count else '(direct)'}")
@@ -437,9 +467,10 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             lo, hi = stage_map.get(sp.stage.value, (0, 97))
             overall = int(lo + (sp.progress / 100) * (hi - lo))
             print(f"  → {sp.stage.value} {sp.progress}% → overall {overall}% [{lo}–{hi}]")
+            _mode = "rs_brush" if use_rs_brush else ("colmap" if use_colmap else "vggt")
             extra = {
                 "currentStage": sp.stage.value,
-                "pipelineMode": "rs_brush" if use_rs_brush else "vggt",
+                "pipelineMode": _mode,
             }
             queue_manager.update_job_progress(
                 job_id, overall, sp.message[:200],

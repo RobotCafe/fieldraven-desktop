@@ -12,6 +12,7 @@ class PipelineStage(str, Enum):
     VIEW_EXTRACTION = "view_extraction"
     REALITYSCAN = "realityscan"
     VGGT_ALIGNMENT = "vggt_alignment"
+    COLMAP_ALIGNMENT = "colmap_alignment"
     COLMAP_EXPORT = "colmap_export"
     BRUSH_TRAINING = "brush_training"
     TRAINING = "training"

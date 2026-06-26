@@ -41,11 +41,21 @@ def _load_splatpipe(vggt_app_path: str):
 # ── Progress helper ───────────────────────────────────────────
 
 def _make_reporter(on_progress: Optional[Callable[[StageProgress], None]]):
-    """Return a callable that fires on_progress and logs to stdout."""
+    """Return a callable that fires on_progress and logs to stdout.
+
+    Firebase writes are deduplicated: only pushes when (stage, pct) changes.
+    Without this, every COLMAP log line triggers a synchronous Firebase write,
+    filling the stdout pipe buffer and stalling the COLMAP subprocess.
+    """
+    _last: list = [None]  # (stage, pct) of last Firebase push
+
     def report(stage: PipelineStage, pct: int, message: str, detail: str = None):
         print(f"  [{stage.value}] {pct}% — {message}")
         if on_progress:
-            on_progress(StageProgress(stage=stage, progress=pct, message=message, detail=detail))
+            key = (stage, pct)
+            if key != _last[0]:
+                _last[0] = key
+                on_progress(StageProgress(stage=stage, progress=pct, message=message, detail=detail))
     return report
 
 
@@ -335,7 +345,7 @@ def run_pipeline(
     views_dir = job_dir / "02_views"
     training_dir = job_dir / "04_training"
 
-    for d in [frames_dir, views_dir, training_dir]:
+    for d in [frames_dir, views_dir, job_dir / "03_alignment", training_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     input_p = Path(input_path)
@@ -346,11 +356,12 @@ def run_pipeline(
 
     # Determine which stages to skip when resuming from a saved state.
     # Each key implies all earlier stages are also skipped.
-    _SKIP_STAGE1 = {'view_extraction', 'realityscan', 'brush_training', 'vggt_alignment', 'colmap_export'}
-    _SKIP_STAGE2 = {'realityscan', 'brush_training', 'vggt_alignment', 'colmap_export'}
-    skip_stage1 = start_from in _SKIP_STAGE1
-    skip_stage2 = start_from in _SKIP_STAGE2
-    skip_rs     = start_from == 'brush_training'
+    _SKIP_STAGE1 = {'view_extraction', 'realityscan', 'brush_training', 'vggt_alignment', 'colmap_export', 'colmap_alignment'}
+    _SKIP_STAGE2 = {'realityscan', 'brush_training', 'vggt_alignment', 'colmap_export', 'colmap_alignment'}
+    skip_stage1  = start_from in _SKIP_STAGE1
+    skip_stage2  = start_from in _SKIP_STAGE2
+    skip_colmap  = start_from == 'brush_training'
+    skip_rs      = start_from == 'brush_training'
 
     # ═══════════════════════════════════════════════════════════
     # STAGE 1 — Frame Extraction
@@ -421,7 +432,7 @@ def run_pipeline(
             )
 
         n_frames = len(frame_paths)
-        views_per_frame = len(settings.pitch_angles) * settings.yaw_steps
+        views_per_frame = len(settings.pitch_angles) * settings.yaw_steps + (1 if getattr(settings, "horizon_ref", False) else 0)
         total_views = n_frames * views_per_frame
         view_counter = [0]   # mutable counter shared across loop closures
 
@@ -434,8 +445,9 @@ def run_pipeline(
                 return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
 
             def _view_cb(current_view, total_per_frame, _fi=fi):
-                view_counter[0] += 1
-                pct = int(view_counter[0] / total_views * 100)
+                if current_view < total_per_frame:  # skip the per-frame completion ping
+                    view_counter[0] += 1
+                pct = min(int(view_counter[0] / total_views * 100), 100)
                 display = min(current_view + 1, total_per_frame)
                 report(
                     PipelineStage.VIEW_EXTRACTION, pct,
@@ -452,6 +464,7 @@ def run_pipeline(
                 save_images=True,
                 cancel_event=cancel_event,
                 progress_callback=_view_cb,
+                horizon_ref=getattr(settings, "horizon_ref", False),
             )
 
         if cancel_event.is_set():
@@ -459,6 +472,59 @@ def run_pipeline(
 
         report(PipelineStage.VIEW_EXTRACTION, 100,
                f"View extraction complete — {total_views} views rendered")
+
+    # ═══════════════════════════════════════════════════════════
+    # STAGE 3 — COLMAP alignment  (when run_colmap=True)
+    # ═══════════════════════════════════════════════════════════
+    if settings.run_colmap:
+        if cancel_event.is_set():
+            return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        from .colmap_runner import run_colmap_pipeline  # type: ignore
+
+        colmap_dir      = job_dir / "03_alignment" / "colmap"
+        brush_input_dir = training_dir / "brush_input"
+
+        if skip_colmap:
+            report(PipelineStage.COLMAP_ALIGNMENT, 100,
+                   "COLMAP alignment skipped — resuming from saved brush_input/")
+        else:
+            run_colmap_pipeline(
+                frames_dir=frames_dir,
+                views_dir=views_dir,
+                colmap_dir=colmap_dir,
+                brush_input_dir=brush_input_dir,
+                settings=settings,
+                report=report,
+                cancel_event=cancel_event,
+                project_dir=job_dir,
+            )
+
+            if cancel_event.is_set():
+                return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        colmap_files = list(brush_input_dir.glob("*.txt")) if brush_input_dir.exists() else []
+        if not colmap_files:
+            return PipelineResult(
+                success=False, job_id=job_id, output_dir=str(job_dir),
+                error="COLMAP produced no text files in brush_input/. "
+                      "Check that pycolmap is installed and reconstruction succeeded.",
+            )
+
+        report(PipelineStage.COLMAP_ALIGNMENT, 100,
+               f"COLMAP complete — {len(colmap_files)} file(s) in brush_input/")
+
+        if not settings.run_brush and not skip_colmap:
+            return PipelineResult(
+                success=True, job_id=job_id, output_dir=str(job_dir),
+                stats={"frames_extracted": n_frames, "views_rendered": total_views},
+            )
+
+        _run_brush_training(training_dir, settings, report, cancel_event)
+        return PipelineResult(
+            success=True, job_id=job_id, output_dir=str(job_dir),
+            stats={"frames_extracted": n_frames, "views_rendered": total_views},
+        )
 
     # ═══════════════════════════════════════════════════════════
     # STAGE 3 — RealityScan alignment  (when run_vggt=False)
@@ -475,6 +541,16 @@ def run_pipeline(
         alignment_dir   = job_dir / "03_alignment"
         brush_input_dir = training_dir / "brush_input"
         colmap_src      = alignment_dir / "COLMAP_for_Brush"
+
+        if settings.use_rig_xmp:
+            try:
+                from xmp_rig_export import export_all_frame_rigs  # type: ignore
+                report(PipelineStage.REALITYSCAN, 0, "Generating XMP rig sidecar files…")
+                export_all_frame_rigs(str(views_dir), settings.pitch_angles, settings.yaw_steps,
+                                      horizon_ref=getattr(settings, "horizon_ref", False))
+                report(PipelineStage.REALITYSCAN, 2, "XMP rig files generated — starting RS alignment")
+            except ImportError as exc:
+                print(f"  [xmp_rig] Warning: xmp_rig_export not importable: {exc}")
 
         if skip_rs:
             # Resume from Brush: verify existing COLMAP export and copy to brush_input

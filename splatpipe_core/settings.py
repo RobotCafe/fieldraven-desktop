@@ -33,6 +33,16 @@ class PipelineSettings:
     use_anchor_rig: bool = False
     anchor_view: str = "y00"
     rig_optimization_min_points: int = 500000
+    use_rig_xmp: bool = False       # RS path: generate XMP rig sidecar files before alignment
+
+    # ── COLMAP ───────────────────────────────────────────────────
+    run_colmap: bool = False
+    colmap_mode: str = "rig"          # "rig" | "spherical"
+    colmap_matcher: str = "sequential" # "sequential" | "exhaustive" | "vocabtree"
+    horizon_ref: bool = True           # prepend pitch=0° sensor as rig reference to preserve pitch in cam_from_rig
+    colmap_visualize: bool = False     # generate cameras.html visualizer after reconstruction
+    colmap_gravity_align: bool = True  # apply R_X gravity correction after mapping
+    colmap_bin: Optional[str] = None   # path to colmap.exe; enables GPU via CLI for extraction+matching
     sky_sensitivity_threshold: int = 32
     colmap_image_width: int = 1920
     colmap_image_height: int = 1920

@@ -22,6 +22,7 @@ _SECTION_MAP: dict[str, dict[str, str]] = {
         "pitch_angles_str":  "pitch_angles_str",
         "yaw_steps":         "yaw_steps",
         "fov":               "fov",
+        "horizon_ref":       "horizon_ref",
     },
     "Alignment": {
         "run_vggt":                      "run_vggt",
@@ -42,6 +43,11 @@ _SECTION_MAP: dict[str, dict[str, str]] = {
         "vggt_rig_optimization_min_points": "vggt_rig_optimization_min_points",
         "vggt_show_camera":              "vggt_show_camera",
         "sky_sensitivity_threshold":     "sky_sensitivity_threshold",
+        "run_colmap":                    "run_colmap",
+        "colmap_mode":                   "colmap_mode",
+        "colmap_matcher":                "colmap_matcher",
+        "colmap_visualize":              "colmap_visualize",
+        "colmap_gravity_align":          "colmap_gravity_align",
     },
     "Postshot": {
         "postshot_profile":          "profile",
@@ -71,6 +77,7 @@ _SECTION_MAP: dict[str, dict[str, str]] = {
         "brush_path":         "brush_path",
         "rs_settings_path":   "rs_settings_path",
         "vggt_path":          "vggt_path",
+        "colmap_bin":         "colmap_bin",
     },
     "InspStitch": {
         "insp_stitch_type":   "stitch_type",
@@ -92,6 +99,7 @@ _DEFAULTS: dict[str, str] = {
     "pitch_angles_str":  "-30",
     "yaw_steps":         "6",
     "fov":               "94.6",
+    "horizon_ref":       "True",
     # Alignment
     "run_vggt":                         "True",
     "run_postshot":                     "False",
@@ -111,6 +119,11 @@ _DEFAULTS: dict[str, str] = {
     "vggt_rig_optimization_min_points": "500000",
     "vggt_show_camera":                 "True",
     "sky_sensitivity_threshold":        "32",
+    "run_colmap":                       "False",
+    "colmap_mode":                      "rig",
+    "colmap_matcher":                   "sequential",
+    "colmap_visualize":                 "False",
+    "colmap_gravity_align":             "True",
     # Postshot
     "postshot_profile":          "Splat3",
     "postshot_max_image_size":   "3840",
@@ -144,6 +157,7 @@ _DEFAULTS: dict[str, str] = {
     "brush_path":         "",
     "rs_settings_path":   "",
     "vggt_path": r"C:\Users\DenmanNic\Projects\3DGS Pipe V13 with VGGT",
+    "colmap_bin":         "",
 }
 
 # Simple in-process cache — cleared on every save
