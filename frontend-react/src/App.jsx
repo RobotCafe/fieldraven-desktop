@@ -214,7 +214,7 @@ const API_TO_UI = {
   vggt_show_camera:'vggtShowCam', vggt_temporal_sequencing:'vggtTemporal',
   vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
   export_xmp:'exportXmp',
-  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_gravity_align:'colmapGravityAlign',
+  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_correct_translation:'colmapCorrectTranslation',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -1354,8 +1354,11 @@ function AlignmentTab({ settings, setSettings }) {
             </FieldRow>
             <Toggle checked={!!settings.colmapVisualize} label="Generate camera visualizer (cameras.html)"
               onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
-            <Toggle checked={settings.colmapGravityAlign !== false} label="Apply gravity alignment (R_X correction)"
-              onChange={v=>setSettings(s=>({...s,colmapGravityAlign:v}))} />
+            <Toggle checked={settings.colmapCorrectPitch !== false} label="Correct camera pitch to known extraction angle"
+              onChange={v=>setSettings(s=>({...s,colmapCorrectPitch:v}))} />
+            <Toggle checked={settings.colmapCorrectTranslation !== false} label="Preserve camera position when correcting pitch"
+              disabled={settings.colmapCorrectPitch===false}
+              onChange={v=>setSettings(s=>({...s,colmapCorrectTranslation:v}))} />
           </div>
         )}
       </Accordion>
@@ -1835,7 +1838,7 @@ const defaultSettings = {
   skipRS:false, runVggt:false, runPostshot:true, runBrush:false,
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
   vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false,
-  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapGravityAlign:true,
+  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapCorrectTranslation:true,
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,

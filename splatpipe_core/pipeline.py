@@ -214,6 +214,14 @@ def _run_brush_training(
 
     creation_flags = 0 if settings.brush_spawn_viewer else _WIN_NO_WINDOW
 
+    # Kill any Brush instance left over from a previous job (e.g. a viewer
+    # window that stayed open after we moved on at the final training step)
+    # so it doesn't hold onto GPU memory while this job trains.
+    subprocess.run(
+        ["taskkill", "/IM", brush_exe.name, "/F"],
+        capture_output=True, creationflags=_WIN_NO_WINDOW,
+    )
+
     report(PipelineStage.BRUSH_TRAINING, 0,
            f"Starting Brush training ({total_steps:,} steps, export every {export_every:,})…")
     print(f"  [brush_training] CMD: {' '.join(command)}")
@@ -241,6 +249,7 @@ def _run_brush_training(
 
     current_pct = [0]
     last_poll   = time.time()
+    reached_final_step = False
 
     while process.poll() is None:
         if cancel_event.is_set():
@@ -267,6 +276,12 @@ def _run_brush_training(
                     m = re.search(r'[_\-](\d+)\.ply$', f.name, re.IGNORECASE)
                     if m:
                         max_step = max(max_step, int(m.group(1)))
+                if max_step >= total_steps:
+                    # Final export written — training is done even if the Brush
+                    # process itself stays alive (e.g. --with-viewer keeps its
+                    # window open). Stop waiting on the process and move on.
+                    reached_final_step = True
+                    break
                 if max_step > 0:
                     pct = min(99, int(max_step / total_steps * 100))
                     current_pct[0] = pct
@@ -280,15 +295,20 @@ def _run_brush_training(
 
         time.sleep(2)
 
-    rc = process.wait()
-    ply_files = list(training_dir.glob("*.ply"))
+    if reached_final_step:
+        ply_files = list(training_dir.glob("*.ply"))
+        print(f"  [brush_training] Reached final step {total_steps:,} — "
+              f"marking complete (Brush process/viewer left running)")
+    else:
+        rc = process.wait()
+        ply_files = list(training_dir.glob("*.ply"))
 
-    if not ply_files:
-        raise RuntimeError(
-            f"Brush exited with code {rc} and produced no PLY output. "
-            f"Verify brush_input/ contains a valid COLMAP structure "
-            f"(cameras.txt/images.txt + images/ folder)."
-        )
+        if not ply_files:
+            raise RuntimeError(
+                f"Brush exited with code {rc} and produced no PLY output. "
+                f"Verify brush_input/ contains a valid COLMAP structure "
+                f"(cameras.txt/images.txt + images/ folder)."
+            )
 
     report(PipelineStage.BRUSH_TRAINING, 100,
            f"Brush training complete — {len(ply_files)} splat file(s) exported")

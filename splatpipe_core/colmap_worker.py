@@ -164,12 +164,15 @@ def main():
                 "--database_path", str(db_path),
             ]
             if matcher == "sequential":
-                # Disable quadratic overlap — avoids degenerate within-rig pairs
-                # that cause RANSAC to stall (near-zero baseline, no epipolar constraint).
-                # overlap=7 = one full rig-frame worth of sequential neighbors.
+                # Wider-than-default overlap for denser matches/point cloud. The
+                # earlier stall at image [5/196] was actually Firebase write
+                # backpressure on the progress-reporting pipe (see
+                # COLMAP_POSE_CORRECTION_BRIEF.md Problem 5 / Problem 6 follow-up),
+                # not quadratic_overlap — restoring it (COLMAP default) and
+                # raising overlap now that the real bottleneck is fixed.
                 cli_args += [
-                    "--SequentialMatching.overlap",           "7",
-                    "--SequentialMatching.quadratic_overlap", "0",
+                    "--SequentialMatching.overlap",           "20",
+                    "--SequentialMatching.quadratic_overlap", "1",
                 ]
             _run_cli(cli_args, pct=40)
         else:

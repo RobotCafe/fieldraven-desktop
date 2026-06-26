@@ -252,54 +252,11 @@ def _mat_to_quat(R: np.ndarray) -> tuple:
     return float(qw), float(qx), float(qy), float(qz)
 
 
-def _fix_images(path: Path, Rg: np.ndarray) -> None:
-    """Apply Rg to camera rotation matrices in images.txt (in-place)."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    out   = []
-    data_line = False  # alternates: True for image header, False for keypoints
-    for line in lines:
-        if line.startswith("#") or not line.strip():
-            out.append(line)
-            continue
-        if not data_line:
-            # IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
-            parts = line.split()
-            qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-            R_new = _quat_to_mat(qw, qx, qy, qz) @ Rg
-            nw, nx, ny, nz = _mat_to_quat(R_new)
-            parts[1], parts[2], parts[3], parts[4] = (
-                f"{nw:.10f}", f"{nx:.10f}", f"{ny:.10f}", f"{nz:.10f}"
-            )
-            out.append(" ".join(parts))
-            data_line = True
-        else:
-            out.append(line)  # keypoints line — pass through
-            data_line = False
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
-
-
-def _fix_points3D(path: Path, Rg: np.ndarray) -> None:
-    """Apply Rg.T to 3D point coordinates in points3D.txt (in-place)."""
-    RgT   = Rg.T
-    lines = path.read_text(encoding="utf-8").splitlines()
-    out   = []
-    for line in lines:
-        if line.startswith("#") or not line.strip():
-            out.append(line)
-            continue
-        parts    = line.split()
-        xyz      = RgT @ np.array([float(parts[1]), float(parts[2]), float(parts[3])])
-        parts[1] = f"{xyz[0]:.6f}"
-        parts[2] = f"{xyz[1]:.6f}"
-        parts[3] = f"{xyz[2]:.6f}"
-        out.append(" ".join(parts))
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
-
-
 def _correct_camera_pitches_from_extraction(
     sparse_txt_dir: Path,
     anchor_diag_pitch: float = 0.0,
     sibling_diag_pitch: float = 10.0,
+    preserve_center: bool = True,
 ) -> int:
     """
     For each camera in images.txt: keep the COLMAP-estimated yaw (azimuthal
@@ -313,6 +270,12 @@ def _correct_camera_pitches_from_extraction(
     anchor_diag_pitch: DIAG pitch target for pano_camera0 (0.0 = horizontal)
     sibling_diag_pitch: DIAG pitch target for pano_camera1+ (positive = downward
         in COLMAP Y-down; use abs(extraction_pitch_deg) e.g. 10.0 for -10°)
+    preserve_center: when True (default), recompute the translation so the
+        camera's world position is unchanged by the rotation update. When
+        False, the translation is left exactly as COLMAP wrote it, so only
+        the rotation is overwritten — useful for isolating whether the
+        translation recompute itself is responsible for any downstream
+        Brush training regression.
 
     Returns count of cameras corrected.
     """
@@ -366,19 +329,21 @@ def _correct_camera_pitches_from_extraction(
                 RT = np.column_stack([right, down, fwd])   # R.T
                 R_new = RT.T                               # cam_from_world
 
-                # Preserve camera position: center = -R_old.T @ t  →  t_new = -R_new @ center
-                t_old  = np.array([float(parts[5]), float(parts[6]), float(parts[7])])
-                center = -R_cur.T @ t_old
-                t_new  = -R_new @ center
-
                 nw, nx, ny, nz = _mat_to_quat(R_new)
                 parts[1] = f"{nw:.10f}"
                 parts[2] = f"{nx:.10f}"
                 parts[3] = f"{ny:.10f}"
                 parts[4] = f"{nz:.10f}"
-                parts[5] = f"{t_new[0]:.10f}"
-                parts[6] = f"{t_new[1]:.10f}"
-                parts[7] = f"{t_new[2]:.10f}"
+
+                if preserve_center:
+                    # Preserve camera position: center = -R_old.T @ t  →  t_new = -R_new @ center
+                    t_old  = np.array([float(parts[5]), float(parts[6]), float(parts[7])])
+                    center = -R_cur.T @ t_old
+                    t_new  = -R_new @ center
+                    parts[5] = f"{t_new[0]:.10f}"
+                    parts[6] = f"{t_new[1]:.10f}"
+                    parts[7] = f"{t_new[2]:.10f}"
+                # else: leave TX TY TZ exactly as COLMAP produced them.
                 n_corrected += 1
             out.append(" ".join(parts))
             data_line = True
@@ -418,18 +383,6 @@ def _measure_anchor_pitch(sparse_txt_dir: Path) -> float:
         else:
             data_line = False
     return float(np.mean(pitches)) if pitches else 0.0
-
-
-def _apply_gravity_alignment(sparse_txt_dir: Path, correction_deg: float) -> None:
-    """Apply R_X(correction_deg) to all camera rotations and 3D points in sparse_txt/."""
-    theta = np.radians(correction_deg)
-    Rg = np.array([
-        [1, 0,              0             ],
-        [0, np.cos(theta), -np.sin(theta) ],
-        [0, np.sin(theta),  np.cos(theta) ],
-    ], dtype=np.float64)
-    _fix_images(sparse_txt_dir / "images.txt", Rg)
-    _fix_points3D(sparse_txt_dir / "points3D.txt", Rg)
 
 
 def _generate_visualizer(colmap_dir: Path, pitch_deg: float, correction_deg: float = 0.0) -> None:
@@ -669,47 +622,36 @@ def _run_perspective_rig(
 
     if cancel_event.is_set(): return
 
-    # Scene-tilt correction: COLMAP biases the world frame toward the mean pitch
-    # of all extracted cameras. Because siblings outnumber the anchor, the world
-    # tilts upward. We compute the exact correction from the known extraction angles
-    # (sibling_pitch and sensor count) — no measurement from the reconstruction needed.
-    if getattr(settings, "colmap_gravity_align", True) and settings.pitch_angles:
+    # Per-camera pitch correction: COLMAP has no concept of gravity, so its world
+    # frame ends up biased toward the mean pitch of all extracted cameras. Rather
+    # than reverse-engineer that bias, we overwrite each camera's pitch with the
+    # known extraction angle directly (yaw preserved, roll zeroed).
+    if getattr(settings, "colmap_correct_pitch", True) and settings.pitch_angles:
         sibling_pitch = float(settings.pitch_angles[0])
         # sibling_diag: positive DIAG value (pointing down in COLMAP Y-down)
         # e.g. extraction pitch -10° → DIAG target +10°
         sibling_diag = abs(sibling_pitch)
+        preserve_center = getattr(settings, "colmap_correct_translation", True)
 
-        # Measure anchor pitch now so we can apply the same rotation to points3D
-        # to keep the point cloud approximately consistent with corrected camera poses.
         anchor_pitch_before = _measure_anchor_pitch(sparse_txt)
-        points_correction_deg = -anchor_pitch_before  # approx global shift for points
 
         report(PipelineStage.COLMAP_ALIGNMENT, 91,
                f"Per-camera pitch correction: anchor→0°, siblings→{sibling_diag:.1f}° DIAG "
-               f"(COLMAP world tilted ~{anchor_pitch_before:.2f}° from horizontal)…")
+               f"(COLMAP world tilted ~{anchor_pitch_before:.2f}° from horizontal, "
+               f"preserve_center={preserve_center})…")
         n_cams = _correct_camera_pitches_from_extraction(
             sparse_txt,
             anchor_diag_pitch=0.0,
             sibling_diag_pitch=sibling_diag,
+            preserve_center=preserve_center,
         )
-        # Apply approximate global rotation to points3D for consistency.
-        # All cameras received roughly the same pitch shift (~anchor_pitch_before),
-        # so rotating the point cloud by the same amount keeps projections valid.
-        if abs(points_correction_deg) > 0.5:
-            theta = np.radians(points_correction_deg)
-            Rg = np.array([
-                [1, 0,              0             ],
-                [0, np.cos(theta), -np.sin(theta) ],
-                [0, np.sin(theta),  np.cos(theta) ],
-            ], dtype=np.float64)
-            _fix_points3D(sparse_txt / "points3D.txt", Rg)
 
         post_pitch = _measure_anchor_pitch(sparse_txt)
         report(PipelineStage.COLMAP_ALIGNMENT, 91,
                f"Per-camera correction applied to {n_cams} cameras — "
                f"anchor DIAG: {post_pitch:.3f}° (expected 0°)")
     else:
-        report(PipelineStage.COLMAP_ALIGNMENT, 91, "Scene-tilt correction skipped.")
+        report(PipelineStage.COLMAP_ALIGNMENT, 91, "Pitch correction skipped — using raw COLMAP poses.")
 
     # ── finalise brush_input/ (file copies only — no pycolmap) ───────────────
     report(PipelineStage.COLMAP_ALIGNMENT, 93,

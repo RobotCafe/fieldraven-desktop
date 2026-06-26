@@ -376,3 +376,22 @@ const _pitchDeg = THREE.MathUtils.radToDeg(
   Math.asin(THREE.MathUtils.clamp(_fw.dot(_fdata.avgUp), -1, 1)));
 ```
 Anchor now reads `0.0°`, siblings read `-10.0°` — matching `pitch_angles` exactly. This was purely a hover-text display bug; it never affected the actual camera poses in `images.txt` or the 3D frustum orientations.
+
+---
+
+### Problem 8: Removed the points3D global-rotation "gravity align" step; exposed translation correction as its own toggle
+
+Even after the per-camera pitch fix made the frustums point the correct direction, Brush training quality was still suspect. Two structural issues were identified as candidates:
+
+1. **The points3D correction was never upgraded to the per-camera approach.** `_run_perspective_rig` was still rotating the entire point cloud by a *single global* `R_X(-anchor_pitch_before)` rotation (via `_fix_points3D`), gated by the same `colmap_gravity_align` setting that also gated the (correct, per-camera) camera fix. This is exactly the "global R_X is the wrong tool" problem from Problem 1 — just applied to points instead of cameras. Since the real per-camera pitch correction is *not* a single global rotation (each camera gets a different correction depending on its yaw), rotating the points by one global angle could leave them inconsistent with the corrected camera frusta, especially for frames whose yaw was far from whatever heading dominated the anchor-pitch measurement.
+
+2. **The camera-center-preserving translation recompute (`t_new = -R_new @ center`) was bundled into the pitch correction with no way to disable it**, making it impossible to test in isolation whether *that* specific step — not the rotation — was responsible for a downstream Brush quality regression.
+
+**Fix:**
+- Deleted the points3D global-rotation step entirely (`_fix_points3D`, `_fix_images`, and the now-fully-dead `_apply_gravity_alignment` were removed from `colmap_runner.py`). `points3D.txt` is no longer touched — it stays in COLMAP's raw output frame.
+- Replaced the single `colmap_gravity_align` setting with two independent, UI-exposed settings:
+  - `colmap_correct_pitch` (default `True`) — whether to run the per-camera pitch/yaw/roll correction at all.
+  - `colmap_correct_translation` (default `True`) — whether, while correcting pitch, to also recompute `TX TY TZ` to keep the camera's world position fixed. Set to `False` to leave translation exactly as COLMAP wrote it (only `QW QX QY QZ` change), to A/B test whether the translation recompute itself is contributing to any Brush training regression.
+- `_correct_camera_pitches_from_extraction` now takes a `preserve_center: bool` parameter controlling this.
+
+**Still open:** whether the point cloud now being left in COLMAP's raw (biased) frame, while cameras are corrected, introduces its own inconsistency for Brush's initialization — this trade-off (global-rotation approximation vs. no correction at all) has not yet been resolved, only made independently testable.

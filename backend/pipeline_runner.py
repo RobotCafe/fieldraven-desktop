@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import queue_manager
+from . import firebase_client
 
 JOBS_DIR = Path("C:/FieldRaven/Jobs")
 
@@ -200,7 +201,8 @@ def _build_settings(job_data: dict):
     s.colmap_mode                 = cfg.get("colmap_mode", s.colmap_mode)
     s.colmap_matcher              = cfg.get("colmap_matcher", s.colmap_matcher)
     s.colmap_visualize            = _to_bool(cfg.get("colmap_visualize", s.colmap_visualize))
-    s.colmap_gravity_align        = _to_bool(cfg.get("colmap_gravity_align", s.colmap_gravity_align))
+    s.colmap_correct_pitch        = _to_bool(cfg.get("colmap_correct_pitch", s.colmap_correct_pitch))
+    s.colmap_correct_translation  = _to_bool(cfg.get("colmap_correct_translation", s.colmap_correct_translation))
     s.sky_sensitivity_threshold   = int(float(cfg.get("sky_sensitivity_threshold", s.sky_sensitivity_threshold)))
 
     # ── Postshot ──────────────────────────────────────────────────
@@ -261,7 +263,8 @@ def _build_settings(job_data: dict):
         if "colmap_mode" in ui:       s.colmap_mode       = ui["colmap_mode"]
         if "colmap_matcher" in ui:    s.colmap_matcher    = ui["colmap_matcher"]
         if "colmap_visualize" in ui:    s.colmap_visualize    = _to_bool(ui["colmap_visualize"])
-        if "colmap_gravity_align" in ui: s.colmap_gravity_align = _to_bool(ui["colmap_gravity_align"])
+        if "colmap_correct_pitch" in ui:       s.colmap_correct_pitch       = _to_bool(ui["colmap_correct_pitch"])
+        if "colmap_correct_translation" in ui: s.colmap_correct_translation = _to_bool(ui["colmap_correct_translation"])
         if "yaw_steps" in ui:         s.yaw_steps         = int(ui["yaw_steps"])
         if "fov" in ui:               s.fov               = float(ui["fov"])
         if "horizon_ref" in ui:       s.horizon_ref       = _to_bool(ui["horizon_ref"])
@@ -506,7 +509,7 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             if stats.get("point_count"):
                 _write_stage_progress(proj_root, "colmap", {"points": stats["point_count"]})
 
-            # ── Convert .ply → .ksplat and upload to R2 ──────────────
+            # ── Convert .ply → .spz → .rad and upload to R2 ──────────
             r2_url = None
             gaussian_count = 0
             try:
@@ -651,9 +654,17 @@ def _publish_to_gallery(
     from google.cloud.firestore import SERVER_TIMESTAMP
     try:
         db = firebase_client.get_db()
+        # Prefer the project folder name (e.g. "nile creek") over the generic
+        # upload label (e.g. "Nicolas de Cosson — 2026-06-03") so the gallery
+        # entry actually identifies the scene, not the upload session.
+        project_dir = job_data.get('projectDir')
+        display_name = (
+            Path(project_dir).name if project_dir
+            else job_data.get("name") or job_data.get("display_name") or "Untitled"
+        )
         doc: dict = {
             "jobId":         job_id,
-            "name":          job_data.get("name") or job_data.get("display_name") or "Untitled",
+            "name":          display_name,
             "splatUrl":      splat_url,
             "gaussianCount": gaussian_count,
             "pipelineMode":  job_data.get("pipelineMode") or job_data.get("pipeline_mode") or "rs_brush",
