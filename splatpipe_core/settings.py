@@ -34,6 +34,8 @@ class PipelineSettings:
     anchor_view: str = "y00"
     rig_optimization_min_points: int = 500000
     use_rig_xmp: bool = False       # RS path: generate XMP rig sidecar files before alignment
+    gps_priors_rs: bool = False     # RS path: include GPS position priors in XMP sidecars
+    gps_priors_colmap: bool = False # COLMAP path: geo-register reconstruction using GPS positions
 
     # ── COLMAP ───────────────────────────────────────────────────
     run_colmap: bool = False

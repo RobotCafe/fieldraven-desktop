@@ -272,7 +272,9 @@ def _build_settings(job_data: dict):
         if "run_vggt" in ui:          s.run_vggt          = _to_bool(ui["run_vggt"])
         if "run_brush" in ui:         s.run_brush         = _to_bool(ui["run_brush"])
         if "run_postshot" in ui:      s.run_postshot      = _to_bool(ui["run_postshot"])
-        if "export_xmp" in ui:        s.use_rig_xmp       = _to_bool(ui["export_xmp"])
+        if "export_xmp" in ui:        s.use_rig_xmp        = _to_bool(ui["export_xmp"])
+        if "gps_priors_rs" in ui:     s.gps_priors_rs      = _to_bool(ui["gps_priors_rs"])
+        if "gps_priors_colmap" in ui: s.gps_priors_colmap  = _to_bool(ui["gps_priors_colmap"])
         if "run_colmap" in ui:        s.run_colmap        = _to_bool(ui["run_colmap"])
         if "colmap_mode" in ui:       s.colmap_mode       = ui["colmap_mode"]
         if "colmap_matcher" in ui:    s.colmap_matcher    = ui["colmap_matcher"]

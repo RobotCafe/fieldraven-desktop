@@ -868,6 +868,66 @@ def run_colmap_pipeline(
     if cancel_event.is_set():
         return
 
+    # ── GPS geo-registration (optional) ──────────────────────────
+    # If GPS sidecars exist in the input dir and gps_priors_colmap is enabled,
+    # run COLMAP model_aligner to fit the reconstruction to real-world GPS
+    # coordinates (correcting scale, orientation, and absolute position).
+    if getattr(settings, "gps_priors_colmap", False) and settings.colmap_bin:
+        sparse_txt = colmap_dir / "sparse_txt"
+        input_dir  = colmap_dir.parent.parent / "import from camera"
+        if not input_dir.exists():
+            input_dir = colmap_dir.parent.parent / "imported photos"
+        if sparse_txt.exists() and input_dir.exists():
+            import json as _json
+            # Collect anchor-sensor image names and their GPS (only view_00 per frame)
+            ref_lines = []
+            for gps_file in sorted(input_dir.glob("*.gps.json")):
+                try:
+                    gps = _json.loads(gps_file.read_text(encoding="utf-8"))
+                    stem = gps_file.stem  # e.g. IMG_xxx_00_040
+                    # anchor view is view_00 (first view per frame)
+                    view_name = f"pano_camera0/{stem}.jpg"
+                    ref_lines.append(
+                        f"{view_name} {gps['lon']:.8f} {gps['lat']:.8f} {gps.get('alt', 0):.3f}"
+                    )
+                except Exception:
+                    pass
+            if ref_lines:
+                ref_file = colmap_dir / "gps_ref.txt"
+                ref_file.write_text("\n".join(ref_lines) + "\n", encoding="utf-8")
+                georeg_dir = colmap_dir / "sparse_georeg"
+                georeg_dir.mkdir(exist_ok=True)
+                report(PipelineStage.COLMAP_ALIGNMENT, 96,
+                       f"GPS geo-registration — {len(ref_lines)} reference points…")
+                try:
+                    import subprocess as _sp
+                    result = _sp.run([
+                        settings.colmap_bin, "model_aligner",
+                        "--input_path",  str(sparse_txt),
+                        "--output_path", str(georeg_dir),
+                        "--ref_images_path", str(ref_file),
+                        "--ref_is_gps",  "1",
+                        "--alignment_type", "ecef",
+                        "--robust_alignment", "1",
+                        "--robust_alignment_max_error", "5.0",  # 5 m GPS tolerance
+                    ], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        # Replace sparse_txt with geo-registered version
+                        import shutil as _shutil
+                        for f in georeg_dir.iterdir():
+                            _shutil.copy2(str(f), str(sparse_txt / f.name))
+                        report(PipelineStage.COLMAP_ALIGNMENT, 97,
+                               "GPS geo-registration applied — reconstruction is now in ECEF/GPS coordinates")
+                    else:
+                        report(PipelineStage.COLMAP_ALIGNMENT, 97,
+                               f"GPS geo-registration failed (non-fatal): {result.stderr[:200]}")
+                except Exception as e:
+                    report(PipelineStage.COLMAP_ALIGNMENT, 97,
+                           f"GPS geo-registration skipped: {e}")
+            else:
+                report(PipelineStage.COLMAP_ALIGNMENT, 97,
+                       "GPS geo-registration: no .gps.json sidecars found in input dir")
+
     txt_count = len(list(brush_input_dir.glob("*.txt"))) if brush_input_dir.exists() else 0
     report(PipelineStage.COLMAP_ALIGNMENT, 98,
            f"COLMAP alignment complete — {txt_count} text files in brush_input/")

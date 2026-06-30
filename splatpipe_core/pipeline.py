@@ -576,7 +576,14 @@ def run_pipeline(
                 report(PipelineStage.REALITYSCAN, 0, "Generating XMP rig sidecar files…")
                 export_all_frame_rigs(str(views_dir), settings.pitch_angles, settings.yaw_steps,
                                       fov_deg=settings.fov,
-                                      horizon_ref=getattr(settings, "horizon_ref", False))
+                                      horizon_ref=getattr(settings, "horizon_ref", False),
+                                      # GPS position priors: auto-discovered from .gps.json
+                                      # sidecars in the input dir when gps_priors_rs is on.
+                                      gps_sidecar_dir=(
+                                          str(Path(job_dir) / "import from camera")
+                                          if getattr(settings, "gps_priors_rs", False)
+                                          else None
+                                      ))
                 report(PipelineStage.REALITYSCAN, 2, "XMP rig files generated — starting RS alignment")
             except ImportError as exc:
                 report(PipelineStage.REALITYSCAN, 0,

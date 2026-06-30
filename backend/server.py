@@ -639,8 +639,10 @@ async def import_from_camera(
     except Exception as e:
         print(f"⚠️ Could not save projectDir to Firestore: {e}")
 
-    # Resolve which filenames belong to this job via the field job in Firestore
+    # Resolve which filenames belong to this job via the field job in Firestore.
+    # Also build a GPS map: {filename_stem: {lat, lon}} for files that have GPS.
     target_filenames: set[str] | None = None
+    gps_by_stem: dict[str, dict] = {}
     try:
         pq_doc = firebase_client.get_processing_queue().document(job_id).get()
         if pq_doc.exists:
@@ -655,6 +657,15 @@ async def import_from_camera(
                     if names:
                         target_filenames = set(names)
                         print(f"📷 Job has {len(target_filenames)} recorded filenames")
+                    for p in photos:
+                        fn = p.get('cameraFileName')
+                        gps = p.get('gps')
+                        if fn and gps and gps.get('lat') is not None and gps.get('lon') is not None:
+                            stem = Path(fn).stem
+                            gps_by_stem[stem] = {'lat': float(gps['lat']), 'lon': float(gps['lon']),
+                                                 'alt': float(gps.get('alt', 0))}
+                    if gps_by_stem:
+                        print(f"📍 GPS available for {len(gps_by_stem)}/{len(photos)} photos")
     except Exception as e:
         print(f"⚠️ Could not fetch job filenames from Firestore: {e}")
 
@@ -706,12 +717,27 @@ async def import_from_camera(
         f"Import complete — {imported} files copied, {skipped} skipped"
     )
 
+    # Write GPS sidecars alongside each imported file so the pipeline can use
+    # position priors without a second Firestore lookup.
+    # File: <dest_dir>/<stem>.gps.json  →  {"lat": ..., "lon": ..., "alt": ...}
+    gps_written = 0
+    if gps_by_stem:
+        for f in dest_dir.iterdir():
+            if f.is_file() and f.stem in gps_by_stem:
+                sidecar = dest_dir / f"{f.stem}.gps.json"
+                if not sidecar.exists():
+                    sidecar.write_text(json.dumps(gps_by_stem[f.stem]), encoding="utf-8")
+                    gps_written += 1
+        if gps_written:
+            print(f"📍 Wrote {gps_written} GPS sidecar files")
+
     return {
         "imported":    imported,
         "skipped":     skipped,
         "errors":      errors,
         "destination": str(dest_dir),
         "jobId":       job_id,
+        "gpsWritten":  gps_written,
     }
 
 
@@ -1180,6 +1206,8 @@ async def resume_project(
             "colmap_matcher":    saved_settings.get("colmap_matcher", "sequential"),
             "colmap_visualize":  saved_settings.get("colmap_visualize", False),
             "export_xmp":        saved_settings.get("export_xmp", False),
+            "gps_priors_rs":     saved_settings.get("gps_priors_rs", False),
+            "gps_priors_colmap": saved_settings.get("gps_priors_colmap", False),
             "yaw_steps":         saved_settings.get("yaw_steps", 6),
             "pitch_angles_str":  saved_settings.get("pitch_angles_str", "-7"),
             "fov":               saved_settings.get("fov", 94.6),

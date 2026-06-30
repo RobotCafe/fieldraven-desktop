@@ -213,7 +213,7 @@ const API_TO_UI = {
   sky_sensitivity_threshold:'vggtSky', vggt_mask_sky:'vggtMaskSky',
   vggt_show_camera:'vggtShowCam', vggt_temporal_sequencing:'vggtTemporal',
   vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
-  export_xmp:'exportXmp',
+  export_xmp:'exportXmp', gps_priors_rs:'gpsTriggersRS', gps_priors_colmap:'gpsPriorsColmap',
   run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_correct_translation:'colmapCorrectTranslation',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
@@ -1309,9 +1309,18 @@ function AlignmentTab({ settings, setSettings }) {
             runBrush: v && !s.runVggt ? false : s.runBrush,
           }))} />
         {!skipRS && (
-          <div style={{ marginTop:8 }}>
+          <div style={{ marginTop:8, display:'flex', flexDirection:'column', gap:6 }}>
             <Toggle checked={settings.exportXmp} label="Rig-Aware XMP (inject rig geometry into RS)"
               onChange={v=>setSettings(s=>({...s,exportXmp:v}))} />
+            {settings.exportXmp && (
+              <div style={{ paddingLeft:12, borderLeft:`2px solid ${T.border}` }}>
+                <Toggle checked={!!settings.gpsTriggersRS} label="Include GPS position priors in XMP"
+                  onChange={v=>setSettings(s=>({...s,gpsTriggersRS:v}))} />
+                <div style={{ color:T.textDim, fontSize:10, marginTop:2 }}>
+                  Requires GPS captured during survey. Uses ~3–10 m accuracy as a draft prior.
+                </div>
+              </div>
+            )}
           </div>
         )}
         {skipRS && (
@@ -1387,6 +1396,14 @@ function AlignmentTab({ settings, setSettings }) {
             <Toggle checked={settings.colmapCorrectTranslation !== false} label="Preserve camera position when correcting pitch"
               disabled={settings.colmapCorrectPitch===false}
               onChange={v=>setSettings(s=>({...s,colmapCorrectTranslation:v}))} />
+            <Toggle checked={!!settings.gpsPriorsColmap} label="Geo-register reconstruction using GPS"
+              onChange={v=>setSettings(s=>({...s,gpsPriorsColmap:v}))} />
+            {settings.gpsPriorsColmap && (
+              <div style={{ color:T.textDim, fontSize:10 }}>
+                Requires GPS captured during survey + COLMAP binary path set.
+                Aligns the reconstruction to real-world GPS coordinates (ECEF).
+              </div>
+            )}
           </div>
         )}
       </Accordion>
@@ -1866,7 +1883,7 @@ const defaultSettings = {
   pitchAngles:"-50, -7", yawSteps:"6", fov:"94.6", overlayOpacity:0.6,
   skipRS:false, runVggt:false, runPostshot:true, runBrush:false,
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
-  vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false,
+  vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false, gpsTriggersRS:false, gpsPriorsColmap:false,
   runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapCorrectTranslation:true,
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
@@ -1946,7 +1963,10 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   }, [api]);
 
   useEffect(() => {
-    if (activeMainTab === 0) loadFieldJobs();
+    if (activeMainTab !== 0) return;
+    loadFieldJobs();
+    const iv = setInterval(loadFieldJobs, 30_000);
+    return () => clearInterval(iv);
   }, [activeMainTab, loadFieldJobs]);
 
   // ── Processing queue polling ──────────────────────────────
