@@ -281,11 +281,10 @@ function statusColor(s) {
 }
 
 // ─── Queue Panel ──────────────────────────────────────────────────────────────
-function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq }) {
+function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq, onAddImageFolder }) {
   const addLocal = (type) => {
     const names = {
-      video:  ["site_walkthrough_01.mp4","panorama_beach.mov","survey_run_B.insv"],
-      folder: ["images_equirect_01","raw_stills_set_A","beach_captures"],
+      video: ["site_walkthrough_01.mp4","panorama_beach.mov","survey_run_B.insv"],
     };
     const pick = names[type][Math.floor(Math.random()*3)];
     const item = { id:`${type}_${Date.now()}`, type, name:pick };
@@ -293,11 +292,17 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
     setSelected(item);
   };
 
+  const queuedOrProcessing = j => j.status === 'queued' || j.status === 'processing';
   const frItems = pqItems
-    .filter(j => j.status === 'queued' || j.status === 'processing')
+    .filter(j => queuedOrProcessing(j) && j.jobType !== 'local_folder')
     .map(j => ({ id: j.docId||j.id, type:'fieldraven', name: j.name||j.clientName||'Field Job', status: j.status }));
   const vidItems = localQueue.filter(i=>i.type==='video');
-  const imgItems = localQueue.filter(i=>i.type==='folder');
+  const imgItems = [
+    ...pqItems
+      .filter(j => j.jobType === 'local_folder')
+      .map(j => ({ id: j.docId||j.id, type:'folder', name: j.name||'Image Folder', status: j.status })),
+    ...localQueue.filter(i=>i.type==='folder'),
+  ];
 
   const groups = [
     { type:"fieldraven", label:"FieldRaven Jobs", items: frItems },
@@ -356,13 +361,17 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
               <div style={{ display:"flex", gap:3 }}>
                 <Btn small variant="ghost"
                   style={{ flex:1, fontSize:10, borderColor:`${cfg.color}44`, color:cfg.color }}
-                  onClick={()=>addLocal(type)}>
+                  onClick={()=> type==='folder' ? onAddImageFolder?.() : addLocal(type)}>
                   + Add
                 </Btn>
                 {items.length > 0 && (
                   <Btn small variant="ghost"
                     onClick={()=>{
                       if(selected && items.find(i=>i.id===selected.id)) setSelected(null);
+                      // Firestore-backed items (jobType local_folder, or queued field jobs)
+                      // carry a `status` — those must be cancelled server-side, not just
+                      // dropped from local React state, or they silently stay in the queue.
+                      items.forEach(it => { if (it.status) onCancelPq(it.id); });
                       setLocalQueue(q=>q.filter(i=>i.type!==type));
                     }}>
                     ✕
@@ -385,6 +394,11 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
           {selected.type !== 'fieldraven' && (
             <div style={{ marginTop:6 }}>
               <Btn small variant="danger" full onClick={()=>{
+                // Firestore-backed items (e.g. image-folder jobs, jobType
+                // local_folder) must be cancelled server-side — filtering
+                // localQueue alone does nothing for them since they were
+                // never added to that array.
+                if (selected.status) onCancelPq(selected.id);
                 setLocalQueue(q=>q.filter(i=>i.id!==selected.id));
                 setSelected(null);
               }}>Remove</Btn>
@@ -647,10 +661,12 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
   const isFR     = selected?.type === 'fieldraven';
   const isFolder = selected?.type === 'folder' || isFR;
 
-  // Files already on disk for this job
-  const jobFiles  = isFR ? (importedFiles[selected?.id] || null) : null;
+  // Files already on disk for this job — FieldRaven (camera) jobs AND local
+  // image-folder jobs both browse a raw file gallery; only 'video' falls
+  // through to the extracted-frames preview below.
+  const jobFiles  = isFolder ? (importedFiles[selected?.id] || null) : null;
   const hasFiles  = jobFiles && jobFiles.total > 0;
-  const projectDir = isFR ? (projectDirs?.[selected?.id] || null) : null;
+  const projectDir = isFolder ? (projectDirs?.[selected?.id] || null) : null;
 
   // Camera availability
   const camConnected = cameraStatus?.camera_connected;
@@ -665,13 +681,13 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
     ? ((jobFiles?.files || []).find(f => f.ext === '.jpg' || f.ext === '.jpeg')?.name || null)
     : null;
   const currentFileName = selectedFile || firstJpgName;
-  const currentPreviewUrl = (isFR && currentFileName && selected?.id)
+  const currentPreviewUrl = (isFolder && currentFileName && selected?.id)
     ? `/api/jobs/${selected.id}/input/${encodeURIComponent(currentFileName)}?projectDir=${encodeURIComponent(projectDir || '')}`
     : null;
 
   // Pre-load gallery images into cache so canvas draws are instant on click
   useEffect(() => {
-    if (!isFR || !hasFiles || !selected?.id) return;
+    if (!isFolder || !hasFiles || !selected?.id) return;
     const jpgs = (jobFiles?.files || []).filter(f => f.ext === '.jpg' || f.ext === '.jpeg');
     jpgs.slice(0, 30).forEach(f => {
       const url = `/api/jobs/${selected.id}/input/${encodeURIComponent(f.name)}?projectDir=${encodeURIComponent(projectDir || '')}`;
@@ -681,7 +697,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         img.src = url;
       }
     });
-  }, [isFR, hasFiles, jobFiles, selected?.id, projectDir]);
+  }, [isFolder, hasFiles, jobFiles, selected?.id, projectDir]);
 
   // Stable label used in canvas — prevents canvas redraw on every stitch poll when nothing visible changed
   const canvasFileLabel = useMemo(() => {
@@ -703,7 +719,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
       return;
     }
 
-    if (isFR && !hasFiles) {
+    if (isFolder && !hasFiles) {
       ctx.fillStyle = T.void; ctx.fillRect(0,0,W,H);
       ctx.strokeStyle = `${T.amber}55`; ctx.lineWidth = 1; ctx.setLineDash([4,6]);
       ctx.strokeRect(2,2,W-4,H-4);
@@ -794,7 +810,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
     drawGradientBg();
     drawOverlays();
-  }, [selected, settings, hasFiles, camConnected, camDrive, isFR, currentPreviewUrl, canvasFileLabel]);
+  }, [selected, settings, hasFiles, camConnected, camDrive, isFolder, currentPreviewUrl, canvasFileLabel]);
 
   const doExtract = () => {
     if (!selected) return;
@@ -817,7 +833,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
   // Gallery content
   const galleryContent = () => {
-    if (isFR) {
+    if (isFolder) {
       if (!hasFiles) return null;
       const jpgFiles = (jobFiles.files || []).filter(f => f.ext === '.jpg' || f.ext === '.jpeg');
       const inspCount = (jobFiles.files || []).filter(f => f.ext === '.insp').length;
@@ -885,7 +901,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         <div style={{ position:"relative", flexShrink:0 }}>
           <canvas ref={canvasRef} width={680} height={340}
             style={{ width:"100%", height:"auto", borderRadius:4,
-              border:`1px solid ${isFR && !hasFiles ? T.amber+'44' : T.border}`,
+              border:`1px solid ${isFolder && !hasFiles ? T.amber+'44' : T.border}`,
               background:T.void, display:"block" }} />
 
           {/* "Select item" overlay */}
@@ -899,7 +915,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
           )}
 
           {/* "No images imported" overlay */}
-          {selected && isFR && !hasFiles && (
+          {selected && isFolder && !hasFiles && (
             <div style={{ position:"absolute", inset:0, display:"flex",
               flexDirection:"column", alignItems:"center", justifyContent:"center",
               pointerEvents:"none", gap:6 }}>
@@ -908,9 +924,11 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
               </span>
               <span style={{ fontSize:11, color:T.textDim, textAlign:"center",
                 padding:"0 24px" }}>
-                {camConnected
-                  ? `Camera connected (${camDrive}) — click Import from Camera`
-                  : 'Connect your Insta360 camera and click Import from Camera'}
+                {isFR
+                  ? (camConnected
+                    ? `Camera connected (${camDrive}) — click Import from Camera`
+                    : 'Connect your Insta360 camera and click Import from Camera')
+                  : 'No images found in this folder'}
               </span>
             </div>
           )}
@@ -943,9 +961,9 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         {/* Gallery */}
         <div style={{ flex:1, background:T.void, border:`1px solid ${T.border}`, borderRadius:4,
           padding:6, overflowY:"auto" }}>
-          {isFR && !hasFiles ? (
+          {isFolder && !hasFiles ? (
             <div style={{ color:T.textDim, fontSize:11, textAlign:"center", padding:20 }}>
-              Import camera files to populate this area
+              {isFR ? 'Import camera files to populate this area' : 'No images found in this folder'}
             </div>
           ) : (
             galleryContent()
@@ -957,16 +975,16 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
           padding:"6px 10px", fontSize:11, color:T.textSec, flexShrink:0,
           display:"flex", alignItems:"center", gap:8 }}>
           <span style={{ color:T.amber }}>
-            {isFR ? '360 Source Files' : '360 Extracted View Preview'}
+            {isFolder ? '360 Source Files' : '360 Extracted View Preview'}
           </span>
           {hasFiles && (() => {
             const jpgCount = (jobFiles?.files||[]).filter(f=>f.ext==='.jpg'||f.ext==='.jpeg').length;
             const inspCount = (jobFiles?.files||[]).filter(f=>f.ext==='.insp').length;
             return <span style={{ color: jpgCount > 0 ? T.live : T.amber, fontFamily:"monospace" }}>
-              {jpgCount > 0 ? `${jpgCount} equirectangular ready` : `${inspCount} .insp (not converted)`}
+              {jpgCount > 0 ? `${jpgCount} files ready` : `${inspCount} .insp (not converted)`}
             </span>;
           })()}
-          {!isFR && frames.length > 0 && (
+          {!isFolder && frames.length > 0 && (
             <span style={{ color:T.textDim, fontFamily:"monospace" }}>
               frame {String(currentFrame+1).padStart(3,"0")}/{frames.length}
             </span>
@@ -1163,7 +1181,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
           </div>
         </Accordion>
 
-        {!isFR && (
+        {!isFolder && (
           <Accordion title="Frame Navigator" defaultOpen={false}>
             {frames.length===0
               ? <div style={{ fontSize:11, color:T.textDim }}>Extract frames to enable</div>
@@ -1244,6 +1262,16 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
                 </span>
               </div>
             </>
+          ) : isFolder ? (
+            <div style={{ display:"flex", alignItems:"center", gap:6, padding:"5px 8px",
+              background:T.void, border:`1px solid ${T.border}`, borderRadius:3 }}>
+              <span style={{ fontSize:9, color:T.textDim, flexShrink:0, textTransform:"uppercase", letterSpacing:1 }}>Dir</span>
+              <span style={{ fontSize:10, color:T.textSec,
+                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                fontFamily:"monospace", flex:1, minWidth:0 }}>
+                {projectDir || 'Unknown'}
+              </span>
+            </div>
           ) : (
             <Btn onClick={doExtract} disabled={!selected} full variant="primary">
               Extract Frames
@@ -1503,13 +1531,14 @@ const PIPE_TABS = ["Frame & View Extraction","Alignment","Postshot","Brush","Con
 
 function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected,
     settings, setSettings, onSaveConfig, onCancelPq, machineInfo,
-    cameraStatus, importedFiles, projectDirs, onImport,
+    cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder,
     importStep, importPct, stitching, stitchStep, stitchPct }) {
   const [pipeTab, setPipeTab] = useState(0);
   return (
     <div style={{ display:"flex", height:"100%", overflow:"hidden", gap:10 }}>
       <QueuePanel pqItems={pqItems} localQueue={localQueue} setLocalQueue={setLocalQueue}
-        selected={selected} setSelected={setSelected} onCancelPq={onCancelPq} />
+        selected={selected} setSelected={setSelected} onCancelPq={onCancelPq}
+        onAddImageFolder={onAddImageFolder} />
 
       <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
         <div style={{ display:"flex", gap:1, marginBottom:0, flexShrink:0, overflowX:"auto" }}>
@@ -1923,11 +1952,22 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   // ── Processing queue polling ──────────────────────────────
   const loadQueue = useCallback(() => {
     api('/api/jobs/queue').then(d => {
-      const all = [
+      const fresh = [
         ...(d.queued || []),
         ...(d.current ? [d.current] : []),
       ];
-      setPqItems(all);
+      // Preserve any local_folder items already in state that the server didn't
+      // return (e.g. if their status is complete/error and the backend query
+      // missed them due to a transient issue). Avoids the "flashes then
+      // disappears" problem when openProjectFolder injects an item right before
+      // loadQueue overwrites pqItems.
+      setPqItems(prev => {
+        const freshIds = new Set(fresh.map(j => j.docId || j.id));
+        const pinned = prev.filter(
+          j => j.jobType === 'local_folder' && !freshIds.has(j.docId || j.id)
+        );
+        return [...fresh, ...pinned];
+      });
       if (d.current?.docId && !currentJobId) {
         setCurrentJobId(d.current.docId);
       }
@@ -2010,29 +2050,78 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   const openProjectFolder = useCallback(async (dir) => {
     if (!dir) return;
     setLastBrowseDir(dir);
-    setSettings(s => ({ ...s, projectDir: dir }));
-    if (selected?.id) setProjectDirs(prev => ({ ...prev, [selected.id]: dir }));
 
+    // 1. Read the save file to discover the stored jobId, imported files, and
+    //    saved settings. This works regardless of what (if anything) is selected
+    //    in the queue — the save file is the source of truth.
+    let jobId = null;
+    let jobType = 'folder';
+    let savedSettings = null;
+    try {
+      const data = await api(`/api/project/config?dir=${encodeURIComponent(dir)}`);
+      jobId        = data.config?.jobId   || null;
+      savedSettings = data.config?.settings || null;
+      // Populate the gallery immediately so it's ready before anything else
+      if (data.files && data.files.length > 0) {
+        setImportedFiles(prev => ({
+          ...prev,
+          [jobId]: { files: data.files, total: data.total, path: data.path },
+        }));
+      }
+    } catch (e) {
+      addLog(`Could not read project: ${e.message}`);
+      return;
+    }
+
+    if (!jobId) {
+      // No save file (new/unregistered folder) — fall back to wiring up whatever
+      // job is currently selected, the same as the old Browse… button behaviour.
+      setSettings(s => ({ ...s, projectDir: dir }));
+      if (selected?.id) {
+        setProjectDirs(prev => ({ ...prev, [selected.id]: dir }));
+        loadProjectDir(selected.id, dir);
+      }
+      return;
+    }
+
+    // 2. Wire up the project directory for this job
+    setProjectDirs(prev => ({ ...prev, [jobId]: dir }));
+    setSettings(s => ({ ...s, projectDir: dir }));
+    if (savedSettings) {
+      setSettings(s => ({ ...s, ...apiConfigToSettings(savedSettings) }));
+    }
+
+    // 3. Fetch the specific job doc by id (works regardless of its Firestore status —
+    //    poll_for_jobs only returns 'queued' docs, so a completed/errored project
+    //    would never appear via loadQueue alone).  Inject it into pqItems so the
+    //    Image Folders queue box shows it immediately, then select it.
+    const dirName = dir.split(/[\\/]/).filter(Boolean).pop() || 'Project';
+    try {
+      const jobData = await api(`/api/jobs/${jobId}/status`);
+      if (jobData) {
+        const entry = { ...jobData, docId: jobId };
+        setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
+        setSelected({ id: jobId, type: jobType, name: jobData.name || dirName, status: jobData.status });
+      } else {
+        setSelected({ id: jobId, type: jobType, name: dirName, status: 'queued' });
+      }
+    } catch {
+      setSelected({ id: jobId, type: jobType, name: dirName, status: 'queued' });
+    }
+    loadQueue();
+
+    // 4. Check pipeline history and show the resume modal if appropriate
     try {
       const state = await api(`/api/project/state?dir=${encodeURIComponent(dir)}`);
-      // Show modal only when meaningful pipeline work exists (views or beyond)
       const hasMeaningfulHistory = state?.hasHistory &&
         (state.completedStages || []).some(s => s !== 'import');
       if (hasMeaningfulHistory) {
         setProjectState(state);
-        // Apply saved project settings to the UI so the 1500ms auto-save
-        // writes the correct values (not the UI defaults) back to disk.
-        if (state.settings) {
-          setSettings(s => ({ ...s, ...apiConfigToSettings(state.settings) }));
-        }
-        return; // modal handles what happens next
       }
     } catch (e) {
-      addLog(`Project state check: ${e.message}`);
+      // non-fatal — gallery is already populated, user can still run
     }
-    // No history — just load the dir normally
-    if (selected?.id) loadProjectDir(selected.id, dir);
-  }, [api, selected, loadProjectDir, setSettings]);
+  }, [api, loadQueue, loadProjectDir, selected, setSettings, addLog]);
 
   // ── Resume a project from a specific stage ────────────────────
   const runPipelineResume = useCallback(async (projectDir, jobId, startFrom, savedApiSettings = null) => {
@@ -2205,6 +2294,58 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     }
   }, [api, projectDirs, lastBrowseDir, setSettings]);
 
+  // Entry point for a project whose photos already exist on disk (not a field job,
+  // not a camera import) — establish/create a project folder, pick the source photos
+  // folder, optionally copy them into "imported photos", then register a job so it
+  // runs through the same pipeline as an accepted FieldRaven job.
+  const onAddImageFolder = useCallback(async () => {
+    addLog('Select or create a project folder…');
+    const dirRes = await api(`/api/browse/folder?initial=${encodeURIComponent(lastBrowseDir)}`);
+    if (!dirRes.path) { addLog('Cancelled.'); return; }
+    const projectDir = dirRes.path;
+    setLastBrowseDir(projectDir);
+
+    addLog('Select the folder containing your photos…');
+    const srcRes = await api(`/api/browse/folder?initial=${encodeURIComponent(projectDir)}&title=${encodeURIComponent('Select the folder containing your photos')}`);
+    if (!srcRes.path) { addLog('Cancelled.'); return; }
+    const sourceFolder = srcRes.path;
+
+    const doCopy = window.confirm(
+      `Copy photos from:\n${sourceFolder}\n\ninto the project folder as "imported photos"?`
+    );
+    if (!doCopy) { addLog('Import skipped — no photos copied.'); return; }
+
+    let created;
+    try {
+      const folderName = sourceFolder.split(/[\\/]/).filter(Boolean).pop() || 'Imported Photos';
+      created = await api('/api/jobs/create-local', 'POST', { name: folderName, projectDir });
+    } catch (e) {
+      addLog(`Could not create project: ${e.message}`);
+      return;
+    }
+    setProjectDirs(prev => ({ ...prev, [created.processingJobId]: projectDir }));
+
+    addLog(`Importing photos from ${sourceFolder}…`);
+    try {
+      const result = await api('/api/project/import-folder', 'POST', {
+        jobId: created.processingJobId, projectDir, sourceFolder,
+      });
+      addLog(`Import complete: ${result.imported} copied, ${result.skipped} skipped`);
+    } catch (e) {
+      addLog(`Import failed: ${e.message}`);
+      return;
+    }
+
+    // Populate the gallery the same way the camera-import flow does.
+    const pdParam = encodeURIComponent(projectDir);
+    const files = await api(`/api/jobs/${created.processingJobId}/files?projectDir=${pdParam}`);
+    setImportedFiles(prev => ({ ...prev, [created.processingJobId]: files }));
+
+    api('/api/project/config', 'POST', { dir: projectDir, jobId: created.processingJobId }).catch(() => {});
+    addLog(`Project ready: ${created.name}`);
+    loadQueue();
+  }, [api, lastBrowseDir, loadQueue, setImportedFiles]);
+
   const onQueueJob = useCallback(async (job) => {
     try {
       const result = await api('/api/jobs/queue-for-processing', 'POST', { userJobId: job.id });
@@ -2218,7 +2359,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
 
   const runPipeline = useCallback(async () => {
     if (!selected) return;
-    if (selected.type === 'fieldraven') {
+    if (selected.type === 'fieldraven' || selected.type === 'folder') {
       try {
         addLog(`Accepting job...`);
         await api('/api/jobs/accept', 'POST', { jobId: selected.id });
@@ -2384,7 +2525,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
 
         {/* Action buttons */}
         <Btn onClick={runPipeline}
-          disabled={!selected || isProcessing || selected.type !== 'fieldraven'}
+          disabled={!selected || isProcessing || (selected.type !== 'fieldraven' && selected.type !== 'folder')}
           variant="live">
           ▶ Run Pipeline
         </Btn>
@@ -2484,6 +2625,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
             onSaveConfig={onSaveConfig} onCancelPq={onCancelPq}
             machineInfo={machineInfo}
             cameraStatus={cameraStatus} importedFiles={importedFiles} projectDirs={projectDirs} onImport={onImport}
+            onAddImageFolder={onAddImageFolder}
             importStep={importStep} importPct={importPct}
             stitching={!!stitchingJobId} stitchStep={stitchStep} stitchPct={stitchPct}
           />

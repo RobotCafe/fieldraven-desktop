@@ -301,9 +301,17 @@ def _run_brush_training(
               f"marking complete (Brush process/viewer left running)")
     else:
         rc = process.wait()
+        if cancel_event.is_set():
+            return False  # app Cancel button — not an error
         ply_files = list(training_dir.glob("*.ply"))
 
         if not ply_files:
+            if rc == 0:
+                # Clean exit (e.g. user closed the Brush viewer window before the
+                # first export checkpoint). Not a crash — nothing to do.
+                report(PipelineStage.BRUSH_TRAINING, 100,
+                       "Brush closed before first PLY export — no splat file produced")
+                return True
             raise RuntimeError(
                 f"Brush exited with code {rc} and produced no PLY output. "
                 f"Verify brush_input/ contains a valid COLMAP structure "
@@ -567,10 +575,17 @@ def run_pipeline(
                 from xmp_rig_export import export_all_frame_rigs  # type: ignore
                 report(PipelineStage.REALITYSCAN, 0, "Generating XMP rig sidecar files…")
                 export_all_frame_rigs(str(views_dir), settings.pitch_angles, settings.yaw_steps,
+                                      fov_deg=settings.fov,
                                       horizon_ref=getattr(settings, "horizon_ref", False))
                 report(PipelineStage.REALITYSCAN, 2, "XMP rig files generated — starting RS alignment")
             except ImportError as exc:
-                print(f"  [xmp_rig] Warning: xmp_rig_export not importable: {exc}")
+                report(PipelineStage.REALITYSCAN, 0,
+                       f"WARNING: xmp_rig_export not importable — XMP skipped ({exc})")
+            except Exception as exc:
+                report(PipelineStage.REALITYSCAN, 0,
+                       f"WARNING: XMP generation failed — {exc}")
+        else:
+            report(PipelineStage.REALITYSCAN, 0, "XMP rig files disabled — proceeding without rig priors")
 
         if skip_rs:
             # Resume from Brush: verify existing COLMAP export and copy to brush_input

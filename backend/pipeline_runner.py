@@ -108,6 +108,19 @@ def _job_root(job_id: str, job_data: Optional[dict] = None) -> Path:
     return JOBS_DIR / job_id
 
 
+def _input_dir(proj_root: Path) -> Path:
+    """Return the project's source-photos directory: 'import from camera' (camera/cloud
+    imports) or 'imported photos' (a local folder imported via /api/project/import-folder),
+    whichever exists. Defaults to 'import from camera' when neither exists yet."""
+    camera_dir = proj_root / "import from camera"
+    if camera_dir.exists():
+        return camera_dir
+    manual_dir = proj_root / "imported photos"
+    if manual_dir.exists():
+        return manual_dir
+    return camera_dir
+
+
 def _write_stage_progress(project_dir: Path, stage: str, data: dict) -> None:
     """Write a stage completion record into fieldraven.json."""
     config_path = project_dir / "fieldraven.json"
@@ -142,7 +155,7 @@ def find_output_glb(job_id: str, job_data: Optional[dict] = None) -> Optional[Pa
 
 def _find_primary_input(job_id: str, job_data: Optional[dict] = None) -> Optional[str]:
     """Return path to a video file or image folder in the job's input dir."""
-    input_dir = _job_root(job_id, job_data) / "import from camera"
+    input_dir = _input_dir(_job_root(job_id, job_data))
     if not input_dir.exists():
         return None
     files = sorted(input_dir.iterdir())
@@ -259,6 +272,7 @@ def _build_settings(job_data: dict):
         if "run_vggt" in ui:          s.run_vggt          = _to_bool(ui["run_vggt"])
         if "run_brush" in ui:         s.run_brush         = _to_bool(ui["run_brush"])
         if "run_postshot" in ui:      s.run_postshot      = _to_bool(ui["run_postshot"])
+        if "export_xmp" in ui:        s.use_rig_xmp       = _to_bool(ui["export_xmp"])
         if "run_colmap" in ui:        s.run_colmap        = _to_bool(ui["run_colmap"])
         if "colmap_mode" in ui:       s.colmap_mode       = ui["colmap_mode"]
         if "colmap_matcher" in ui:    s.colmap_matcher    = ui["colmap_matcher"]
@@ -287,7 +301,7 @@ def _stitch_insp_files(job_id: str, cancel_event: threading.Event, job_data: Opt
     Returns number of files successfully stitched."""
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
-    input_dir = _job_root(job_id, job_data) / "import from camera"
+    input_dir = _input_dir(_job_root(job_id, job_data))
     insp_files = sorted(input_dir.glob("*.insp"))
     if not insp_files:
         return 0
@@ -376,7 +390,7 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         queue_manager.update_job_progress(job_id, 1, "Initialising pipeline…")
 
         # Stitch any .insp files to equirectangular JPEGs before the pipeline runs
-        input_dir = _job_root(job_id, job_data) / "import from camera"
+        input_dir = _input_dir(_job_root(job_id, job_data))
         insp_count = len(list(input_dir.glob("*.insp"))) if input_dir.exists() else 0
         if insp_count:
             queue_manager.update_job_progress(job_id, 3, f"Found {insp_count} Insta360 files — stitching…")
@@ -441,10 +455,11 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         img_exts = {'.jpg', '.jpeg', '.png'}
         if not _resume_start and views_dir.exists():
             existing_views = sum(1 for f in views_dir.rglob("*") if f.is_file() and f.suffix.lower() in img_exts)
+            _proj_input_dir = _input_dir(proj_root)
             input_count = len([
-                f for f in (proj_root / "import from camera").iterdir()
+                f for f in _proj_input_dir.iterdir()
                 if f.is_file() and f.suffix.lower() in img_exts
-            ]) if (proj_root / "import from camera").exists() else 0
+            ]) if _proj_input_dir.exists() else 0
             expected_views = input_count * (len(settings.pitch_angles) * settings.yaw_steps + (1 if getattr(settings, "horizon_ref", False) else 0))
             if existing_views > 0 and expected_views > 0 and existing_views != expected_views:
                 queue_manager.update_job_progress(job_id, 2,
@@ -615,7 +630,7 @@ def _upload_thumbnail(job_id: str, proj_root: "Path") -> "str | None":
         from . import r2_client
         from PIL import Image
 
-        input_dir = proj_root / "import from camera"
+        input_dir = _input_dir(proj_root)
         jpegs = sorted(input_dir.glob("*.jpg"))
         if not jpegs:
             print("  [thumbnail] No stitched JPEGs found, skipping thumbnail")

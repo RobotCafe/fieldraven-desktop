@@ -204,9 +204,17 @@ async def update_machine_settings(
 
 @app.get("/api/jobs/queue")
 async def get_job_queue(user: CurrentUser = Depends(require_auth)):
-    """Get all queued jobs assigned to this machine."""
+    """Get all queued jobs assigned to this machine, plus all local-folder
+    projects (regardless of status — those are persistent user projects that
+    should always appear in the Image Folders panel)."""
     jobs = queue_manager.poll_for_jobs()
+    local_folder_jobs = queue_manager.get_local_folder_jobs()
     current = queue_manager.get_current_job()
+    # Merge: queued jobs first, then any local-folder projects not already listed
+    queued_ids = {j.get('docId') or j.get('id') for j in jobs}
+    for lj in local_folder_jobs:
+        if (lj.get('docId') or lj.get('id')) not in queued_ids:
+            jobs.append(lj)
     return {
         "queued": jobs,
         "current": current,
@@ -282,6 +290,35 @@ async def queue_for_processing(
     job_dir.mkdir(parents=True, exist_ok=True)
 
     return {"processingJobId": doc_id, "status": "queued", "name": display_name}
+
+
+class CreateLocalJobRequest(BaseModel):
+    name: Optional[str] = None
+    projectDir: str
+
+@app.post("/api/jobs/create-local")
+async def create_local_job(
+    request: CreateLocalJobRequest,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Create a processing-queue job for a local folder of photos — no field job involved."""
+    import datetime
+
+    display_name = request.name or Path(request.projectDir).name or 'Imported Photos'
+
+    db = firebase_client.get_db()
+    new_ref = db.collection('processing_queue').document()
+    new_ref.set({
+        'assignedMachine': machine_module.get_machine_id(),
+        'status': 'queued',
+        'jobType': 'local_folder',  # distinguishes from real field jobs in the UI queue
+        'name': display_name,
+        'projectDir': request.projectDir,
+        'createdAt': datetime.datetime.utcnow(),
+        'settings': {},
+    })
+
+    return {"processingJobId": new_ref.id, "status": "queued", "name": display_name}
 
 
 @app.get("/api/jobs/{job_id}/status")
@@ -481,7 +518,7 @@ async def camera_status(user: CurrentUser = Depends(require_auth)):
     }
 
 
-def _tk_browse_folder(initial: str) -> Optional[str]:
+def _tk_browse_folder(initial: str, title: str = "Select or create a project folder (click Make New Folder to create one)") -> Optional[str]:
     import tkinter as tk
     from tkinter import filedialog
     root = tk.Tk()
@@ -489,7 +526,7 @@ def _tk_browse_folder(initial: str) -> Optional[str]:
     root.wm_attributes('-topmost', True)
     path = filedialog.askdirectory(
         initialdir=initial,
-        title="Select or create a project folder (click Make New Folder to create one)",
+        title=title,
     )
     root.destroy()
     return path.replace('/', '\\') if path else None
@@ -540,9 +577,11 @@ async def browse_file(initial: str = "C:\\Users", type: str = "json"):
 
 
 @app.get("/api/browse/folder")
-async def browse_folder(initial: str = "C:\\Users"):
+async def browse_folder(initial: str = "C:\\Users", title: Optional[str] = None):
     """Open a folder-picker dialog; returns selected path or null."""
-    path = await asyncio.get_event_loop().run_in_executor(None, _tk_browse_folder, initial)
+    import functools
+    fn = functools.partial(_tk_browse_folder, initial, title) if title else functools.partial(_tk_browse_folder, initial)
+    path = await asyncio.get_event_loop().run_in_executor(None, fn)
     return {"path": path}
 
 
@@ -737,6 +776,81 @@ async def import_manual(
     }
 
 
+class ImportFolderRequest(BaseModel):
+    jobId: Optional[str] = None
+    projectDir: str
+    sourceFolder: str
+
+_IMPORT_FOLDER_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+
+@app.post("/api/project/import-folder")
+async def import_folder(
+    request: ImportFolderRequest,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Copy photos from an arbitrary local folder into <projectDir>/imported photos/.
+    Entry point for projects that already have images on disk (not a field job import,
+    not a camera import) -- e.g. picture files already sitting on the user's hard drive.
+    Only plain picture formats are copied (no .insp/.insv/.dng -- those are camera-raw
+    formats handled by the camera-import flow, not this one). Only the top level of the
+    source folder is scanned (no subfolders), so camera-generated thumbnail/cache
+    subfolders never get swept in alongside the real photos.
+    pipeline_runner._input_dir() resolves either "import from camera" or
+    "imported photos" so every other endpoint (gallery, thumbnails, stitching) finds
+    these files regardless of which import path was used."""
+    import shutil as _shutil
+    source_dir  = Path(request.sourceFolder)
+    project_dir = Path(request.projectDir)
+    if not source_dir.is_dir():
+        raise HTTPException(status_code=400, detail=f"Source folder not found: {source_dir}")
+
+    dest_dir = project_dir / "imported photos"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if request.jobId:
+        try:
+            firebase_client.get_processing_queue().document(request.jobId).update(
+                {"projectDir": str(project_dir)}
+            )
+        except Exception as e:
+            print(f"⚠️ Could not save projectDir: {e}")
+
+    files = sorted(
+        f for f in source_dir.glob("*")
+        if f.is_file() and f.suffix.lower() in _IMPORT_FOLDER_EXTS
+    )
+    total = len(files)
+    if total == 0:
+        return {"imported": 0, "skipped": 0, "errors": 0, "destination": str(dest_dir)}
+
+    imported = skipped = errors = 0
+    if request.jobId:
+        queue_manager.update_job_progress(request.jobId, 1, f"Starting import of {total} files…")
+
+    for i, f in enumerate(files):
+        dst = dest_dir / f.name
+        if dst.exists():
+            skipped += 1
+            continue
+        try:
+            _shutil.copy2(str(f), str(dst))
+            imported += 1
+            if request.jobId:
+                pct = int((i + 1) / total * 30)
+                queue_manager.update_job_progress(request.jobId, pct, f"Copied {imported}/{total}: {f.name}")
+        except Exception as exc:
+            errors += 1
+            print(f"⚠️ Import error {f.name}: {exc}")
+
+    if request.jobId:
+        queue_manager.update_job_progress(request.jobId, 30, f"Import complete — {imported} copied, {skipped} skipped")
+
+    return {
+        "imported": imported, "skipped": skipped, "errors": errors,
+        "destination": str(dest_dir),
+    }
+
+
 # ── Project config ───────────────────────────────────────────
 
 class ProjectConfigWriteRequest(BaseModel):
@@ -760,7 +874,7 @@ async def read_project_config(
         except Exception:
             pass
 
-    input_dir = project_dir / "import from camera"
+    input_dir = pipeline_runner._input_dir(project_dir)
     files: list[dict] = []
     if input_dir.exists():
         for f in sorted(input_dir.iterdir()):
@@ -863,11 +977,11 @@ async def get_project_state(
             return 0
         return sum(1 for f in d.rglob("*") if f.is_file() and f.suffix.lower() in _img_exts)
 
-    # Import stage: stitched JPGs in "import from camera"
-    import_dir    = project_dir / "import from camera"
+    # Import stage: stitched/imported photos in "import from camera" or "imported photos"
+    import_dir    = pipeline_runner._input_dir(project_dir)
     stitched_count = sum(
         1 for f in import_dir.iterdir()
-        if f.is_file() and f.suffix.lower() == ".jpg"
+        if f.is_file() and f.suffix.lower() in _img_exts
     ) if import_dir.exists() else 0
 
     # View extraction: 02_views
@@ -1065,6 +1179,7 @@ async def resume_project(
             "colmap_mode":       saved_settings.get("colmap_mode", "rig"),
             "colmap_matcher":    saved_settings.get("colmap_matcher", "sequential"),
             "colmap_visualize":  saved_settings.get("colmap_visualize", False),
+            "export_xmp":        saved_settings.get("export_xmp", False),
             "yaw_steps":         saved_settings.get("yaw_steps", 6),
             "pitch_angles_str":  saved_settings.get("pitch_angles_str", "-7"),
             "fov":               saved_settings.get("fov", 94.6),
@@ -1091,7 +1206,7 @@ async def list_job_files(
 ):
     """List files in a job's input directory."""
     if projectDir:
-        input_dir = Path(projectDir) / "import from camera"
+        input_dir = pipeline_runner._input_dir(Path(projectDir))
     else:
         # Fall back to Firestore lookup then hardcoded path
         input_dir = None
@@ -1100,11 +1215,11 @@ async def list_job_files(
             if doc.exists:
                 pd = doc.to_dict().get('projectDir')
                 if pd:
-                    input_dir = Path(pd) / "import from camera"
+                    input_dir = pipeline_runner._input_dir(Path(pd))
         except Exception:
             pass
         if input_dir is None:
-            input_dir = JOBS_DIR / job_id / "import from camera"
+            input_dir = pipeline_runner._input_dir(JOBS_DIR / job_id)
     if not input_dir.exists():
         return {"files": [], "total": 0}
 
@@ -1138,7 +1253,7 @@ async def stitch_job(
     except Exception:
         job_data = {}
 
-    input_dir = pipeline_runner._job_root(job_id, job_data) / "import from camera"
+    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
     insp_files = list(input_dir.glob("*.insp")) if input_dir.exists() else []
     if not insp_files:
         return {"total": 0, "message": "No .insp files to convert"}
@@ -1177,7 +1292,7 @@ async def serve_input_file(
     if projectDir:
         job_data = {**job_data, "projectDir": projectDir}
 
-    input_dir = pipeline_runner._job_root(job_id, job_data) / "import from camera"
+    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
     file_path = (input_dir / filename).resolve()
 
     if not str(file_path).startswith(str(input_dir.resolve())):
@@ -1195,7 +1310,7 @@ async def serve_input_file(
                 from PIL import Image as _PILImage
                 thumb_dir.mkdir(exist_ok=True)
                 with _PILImage.open(str(file_path)) as img:
-                    img.thumbnail((400, 200), _PILImage.LANCZOS)
+                    img.thumbnail((600, 600), _PILImage.LANCZOS)
                     img.save(str(thumb_path), "JPEG", quality=80, optimize=True)
             except Exception as e:
                 print(f"⚠️ Thumb failed for {filename}: {e}")

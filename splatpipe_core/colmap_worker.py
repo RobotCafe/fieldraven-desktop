@@ -43,6 +43,35 @@ def _match(matcher: str, db_str: str, options) -> None:
         raise ValueError(f"Unknown COLMAP matcher: {matcher!r}")
 
 
+def _purge_same_frame_pairs(db_path: Path) -> int:
+    """
+    Delete verified two-view geometries (and their raw matches) between
+    sibling sensors of the same rig frame -- e.g. pano_camera0/IMG_..._167.jpg
+    <-> pano_camera1/IMG_..._167.jpg. All sensors in a frame are rendered from
+    the same panorama at the same position (zero baseline), so these pairs
+    have no triangulation information; COLMAP's geometric verifier accepts
+    them anyway (it's a legitimate "panoramic"/pure-rotation match), and
+    triangulating one collapses to the shared camera center. Returns count
+    of pairs purged.
+    """
+    import pycolmap
+    n_purged = 0
+    with pycolmap.Database.open(str(db_path)) as db:
+        images = db.read_all_images()
+        id_to_name = {img.image_id: img.name for img in images}
+        pair_ids, _ = db.read_two_view_geometry_num_inliers()
+        for pid in pair_ids:
+            id1, id2 = pycolmap.pair_id_to_image_pair(pid)
+            n1, n2 = id_to_name.get(id1), id_to_name.get(id2)
+            if n1 is None or n2 is None:
+                continue
+            if Path(n1).stem == Path(n2).stem and Path(n1).parent.name != Path(n2).parent.name:
+                db.delete_two_view_geometry(id1, id2)
+                db.delete_matches(id1, id2)
+                n_purged += 1
+    return n_purged
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -61,6 +90,34 @@ def main():
         # cam_from_rig rotation matrices (sensor 0 = identity = reference sensor)
         rotations   = [np.array(r, dtype=np.float64) for r in rig["rotations"]]
         prefixes    = rig["image_prefixes"]   # ["pano_camera0/", "pano_camera1/", …]
+
+        # Dump the exact rig config we're about to apply to COLMAP, straight from
+        # the data used to build it below — a faithful record, not a re-derivation.
+        def _pitch_yaw(R: np.ndarray) -> tuple:
+            fwd = R[2]
+            pitch = float(np.degrees(np.arcsin(np.clip(fwd[1], -1, 1))))
+            yaw = float(np.degrees(np.arctan2(fwd[0], fwd[2])))
+            return pitch, yaw
+
+        rig_config_dump = {
+            "focal": focal,
+            "image_size": image_size,
+            "n_sensors": len(rotations),
+            "sensors": [
+                {
+                    "index": i,
+                    "image_prefix": prefix,
+                    "is_ref_sensor": i == 0,
+                    "pitch_deg": _pitch_yaw(R)[0],
+                    "yaw_deg": _pitch_yaw(R)[1],
+                    "cam_from_rig": R.tolist(),
+                }
+                for i, (R, prefix) in enumerate(zip(rotations, prefixes))
+            ],
+        }
+        (db_path.parent / "rig_config.json").write_text(
+            json.dumps(rig_config_dump, indent=2), encoding="utf-8"
+        )
 
         import pycolmap
 
@@ -104,7 +161,8 @@ def main():
                 f"image_path={image_path}\n"
                 f"ImageReader.camera_model=SIMPLE_PINHOLE\n"
                 f"ImageReader.camera_params={params_str}\n"
-                f"ImageReader.single_camera_per_folder=1\n",
+                f"ImageReader.single_camera_per_folder=1\n"
+                f"SiftExtraction.max_num_features=16384\n",
                 encoding="utf-8",
             )
             _run_cli(["feature_extractor", "--project_path", str(proj_ini)], pct=20)
@@ -181,6 +239,21 @@ def main():
             mo.skip_image_pairs_in_same_frame = True
             _match(matcher, str(db_path), mo)
         _prog(58, "Feature matching complete.")
+
+        # ── 4b. Purge same-rig-frame sibling pairs ──────────────────────────────
+        # pycolmap's own matcher excludes these via skip_image_pairs_in_same_frame
+        # (set above), but the GPU CLI matcher has no equivalent flag. Sibling
+        # sensors within one rig frame share a single optical center (zero
+        # baseline) -- COLMAP's geometric verification happily accepts these as
+        # real "panoramic" matches (the genuine overlap seam between adjacent
+        # virtual sensors), but triangulating them is degenerate: it collapses
+        # to the shared camera center. Confirmed empirically: 252 such verified
+        # pairs with 800-7000+ inliers each, producing points with reprojection
+        # error in the thousands of px. See COLMAP_POSE_CORRECTION_BRIEF.md
+        # Problem 12. Cheap no-op when the matcher already excluded them.
+        n_purged = _purge_same_frame_pairs(db_path)
+        if n_purged:
+            _prog(58, f"Purged {n_purged} same-rig-frame sibling pairs (zero-baseline, non-triangulable).")
 
         # ── 5. Incremental mapping ─────────────────────────────────────────────
         # Seed world frame from anchor (pano_camera0) image pair so COLMAP

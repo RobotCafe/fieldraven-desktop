@@ -4,12 +4,17 @@ Polls Firebase for jobs assigned to this machine, reports status.
 """
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional, Callable
 from google.cloud.firestore import SERVER_TIMESTAMP, DocumentSnapshot
 
 from . import firebase_client
 from .machine import get_machine_id
+
+# Single-worker pool so progress writes are fire-and-forget and never block
+# the pipeline thread. One worker is enough — writes are sequential anyway.
+_write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fstore-write")
 
 
 # ── Status constants (match web app expectations) ────────────
@@ -59,6 +64,28 @@ def poll_for_jobs() -> list[dict]:
         return []
 
 
+def get_local_folder_jobs() -> list[dict]:
+    """Return all local-folder projects for this machine, regardless of status.
+    Unlike poll_for_jobs these are persistent user projects, not one-shot queue
+    entries, so they should always be visible in the Image Folders panel."""
+    machine_id = get_machine_id()
+    try:
+        docs = firebase_client.get_processing_queue() \
+            .where('assignedMachine', '==', machine_id) \
+            .where('jobType', '==', 'local_folder') \
+            .limit(20) \
+            .get()
+        jobs = []
+        for doc in docs:
+            data = doc.to_dict()
+            data['docId'] = doc.id
+            jobs.append(data)
+        return jobs
+    except Exception as e:
+        print(f"⚠️ Local folder jobs query failed: {e}")
+        return []
+
+
 def get_job_status(job_id: str) -> Optional[dict]:
     """Get current status of a specific job."""
     try:
@@ -97,20 +124,26 @@ def accept_job(job_id: str) -> bool:
 
 def update_job_progress(job_id: str, progress: int, current_step: str,
                         extra: Optional[dict] = None) -> bool:
-    """Update job progress (0-100) and current step description."""
-    try:
-        update = {
-            'progress': min(100, max(0, progress)),
-            'currentStep': current_step,
-            'updatedAt': SERVER_TIMESTAMP,
-        }
-        if extra:
-            update.update(extra)
-        firebase_client.get_processing_queue().document(job_id).update(update)
-        return True
-    except Exception as e:
-        print(f"⚠️ Update progress failed: {e}")
-        return False
+    """Update job progress (0-100) and current step description.
+    The Firestore write is submitted to a background thread so it never blocks
+    the pipeline (each synchronous write could otherwise pause the pipeline
+    thread for several hundred ms while Firestore ACKs)."""
+    update = {
+        'progress': min(100, max(0, progress)),
+        'currentStep': current_step,
+        'updatedAt': SERVER_TIMESTAMP,
+    }
+    if extra:
+        update.update(extra)
+
+    def _write():
+        try:
+            firebase_client.get_processing_queue().document(job_id).update(update)
+        except Exception as e:
+            print(f"⚠️ Update progress failed: {e}")
+
+    _write_pool.submit(_write)
+    return True
 
 
 def complete_job(job_id: str, output_path: str, output_format: str,
