@@ -1271,31 +1271,52 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
 // ─── Alignment Tab ────────────────────────────────────────────────────────────
 function AlignmentTab({ settings, setSettings }) {
-  const { skipRS, runVggt, runPostshot, runBrush } = settings;
-  const runColmap = !!settings.runColmap;
-  const training = [runPostshot&&"Postshot", runBrush&&"Brush"].filter(Boolean).join(", ") || "None";
-  const plan = skipRS
-    ? runVggt
-      ? `VGGT → Training: ${training}`
-      : runColmap
-        ? `COLMAP → Training: ${training}`
-        : runPostshot
-          ? "Direct Postshot (handles alignment internally)"
-          : "⚠️ No alignment method selected"
-    : [runPostshot&&"Postshot export", runBrush&&"Brush export"].filter(Boolean).join(" + ") || "RealityScan align only";
+  const { runPostshot, runBrush } = settings;
+
+  // Derive a single active mode from the underlying flags
+  const mode = settings.runColmap ? 'colmap' : (settings.runVggt ? 'vggt' : 'rs');
+
+  const setMode = (m) => setSettings(s => ({
+    ...s,
+    skipRS:    m !== 'rs',
+    runVggt:   m === 'vggt',
+    runColmap: m === 'colmap',
+    // Brush only makes sense after COLMAP or RS; clear it for VGGT
+    runBrush: m === 'vggt' ? false : s.runBrush,
+  }));
+
+  const MODES = [
+    { id:'rs',     label:'RealityScan', desc:'Epic photogrammetry — high accuracy, requires RS licence' },
+    { id:'colmap', label:'COLMAP',      desc:'Open-source SfM — no licence required, needs COLMAP binary' },
+    { id:'vggt',   label:'VGGT',        desc:'AI pose estimation — GPU-based, fastest for small captures' },
+  ];
 
   return (
     <div style={{ overflowY:"auto", height:"100%" }}>
+
+      {/* ── Mode selector ───────────────────────────────────────── */}
       <Accordion title="Alignment Method" accent={T.amber}>
-        <Toggle checked={skipRS} label="Skip RealityScan"
-          onChange={v=>setSettings(s=>({
-            ...s,
-            skipRS: v,
-            runVggt: v ? s.runVggt : false,       // turning RS on forces VGGT off
-            runBrush: v && !s.runVggt ? false : s.runBrush,
-          }))} />
-        {!skipRS && (
-          <div style={{ marginTop:8, display:'flex', flexDirection:'column', gap:6 }}>
+        <div style={{ display:'flex', gap:4, marginBottom:10 }}>
+          {MODES.map(({ id, label }) => (
+            <button key={id} onClick={() => setMode(id)}
+              style={{
+                flex:1, padding:"6px 4px", fontSize:11, fontWeight:600,
+                borderRadius:4, cursor:"pointer", border:"none",
+                background: mode === id ? T.amber : T.surfaceEl,
+                color: mode === id ? T.void : T.textSec,
+                transition:"background .15s",
+              }}>
+              {label}
+            </button>
+          ))}
+        </div>
+        <div style={{ fontSize:10, color:T.textDim, marginBottom:12 }}>
+          {MODES.find(m => m.id === mode)?.desc}
+        </div>
+
+        {/* ── RealityScan options ───────────────────────────────── */}
+        {mode === 'rs' && (
+          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
             <Toggle checked={settings.exportXmp} label="Rig-Aware XMP (inject rig geometry into RS)"
               onChange={v=>setSettings(s=>({...s,exportXmp:v}))} />
             {settings.exportXmp && (
@@ -1309,56 +1330,10 @@ function AlignmentTab({ settings, setSettings }) {
             )}
           </div>
         )}
-        {skipRS && (
-          <div style={{ marginTop:10, paddingLeft:10, borderLeft:`2px solid ${T.border}` }}>
-            <Toggle checked={runVggt} label="Use VGGT for camera pose estimation"
-              onChange={v=>setSettings(s=>({...s,runVggt:v,runBrush:!v?false:s.runBrush}))} />
-            {runVggt && (
-              <div style={{ marginTop:10 }}>
-                <Accordion title="VGGT Options" defaultOpen={false}>
-                  <FieldRow label="Confidence">
-                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
-                      <input type="range" min={0} max={100} value={settings.vggtConf}
-                        onChange={e=>setSettings(s=>({...s,vggtConf:+e.target.value}))}
-                        style={{ flex:1, accentColor:T.amber }} />
-                      <span style={{ fontSize:10, color:T.textDim, width:28 }}>{settings.vggtConf}%</span>
-                    </div>
-                  </FieldRow>
-                  <FieldRow label="Sky Sensitivity">
-                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
-                      <input type="range" min={8} max={128} value={settings.vggtSky}
-                        onChange={e=>setSettings(s=>({...s,vggtSky:+e.target.value}))}
-                        style={{ flex:1, accentColor:T.amber }} />
-                      <span style={{ fontSize:10, color:T.textDim, width:28 }}>{settings.vggtSky}</span>
-                    </div>
-                  </FieldRow>
-                  <div style={{ display:"flex", flexWrap:"wrap", gap:10, marginTop:6 }}>
-                    {[["vggtMaskSky","Filter Sky"],["vggtShowCam","Show Camera Frustums"],
-                      ["vggtTemporal","Temporal Sequencing"],["vggtAnchorRig","Anchor+Rig Mode"]].map(([k,l])=>(
-                      <Toggle key={k} checked={settings[k]} label={l}
-                        onChange={v=>setSettings(s=>({...s,[k]:v}))} />
-                    ))}
-                  </div>
-                  <FieldRow label="Prediction Mode">
-                    <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
-                      <Radio value="depthmap" checked={settings.vggtMode==="depthmap"}
-                        onChange={v=>setSettings(s=>({...s,vggtMode:v}))} label="Depthmap" />
-                      <Radio value="pointmap" checked={settings.vggtMode==="pointmap"}
-                        onChange={v=>setSettings(s=>({...s,vggtMode:v}))} label="Pointmap" />
-                    </div>
-                  </FieldRow>
-                </Accordion>
-              </div>
-            )}
-          </div>
-        )}
-      </Accordion>
 
-      <Accordion title="COLMAP (experimental)" accent={T.amber}>
-        <Toggle checked={settings.runColmap} label="Use COLMAP alignment"
-          onChange={v=>setSettings(s=>({...s,runColmap:v}))} />
-        {settings.runColmap && (
-          <div style={{ marginTop:10, display:"flex", flexDirection:"column", gap:10 }}>
+        {/* ── COLMAP options ────────────────────────────────────── */}
+        {mode === 'colmap' && (
+          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
             <FieldRow label="Mode">
               <div style={{ display:"flex", gap:12 }}>
                 <Radio value="rig" checked={settings.colmapMode==="rig"}
@@ -1375,8 +1350,6 @@ function AlignmentTab({ settings, setSettings }) {
                 ))}
               </div>
             </FieldRow>
-            <Toggle checked={!!settings.colmapVisualize} label="Generate camera visualizer (cameras.html)"
-              onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
             <Toggle checked={settings.colmapCorrectPitch !== false} label="Align reconstruction to rig 0° pitch reference"
               onChange={v=>setSettings(s=>({...s,colmapCorrectPitch:v}))} />
             <Toggle checked={!!settings.colmapOrientationAlign} label="Refine level using scene geometry (IMAGE_ORIENTATION)"
@@ -1391,23 +1364,73 @@ function AlignmentTab({ settings, setSettings }) {
                 Aligns the reconstruction to real-world GPS coordinates (ECEF).
               </div>
             )}
+            <Toggle checked={!!settings.colmapVisualize} label="Generate camera visualizer (cameras.html)"
+              onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
+          </div>
+        )}
+
+        {/* ── VGGT options ──────────────────────────────────────── */}
+        {mode === 'vggt' && (
+          <div>
+            <Accordion title="VGGT Options" defaultOpen={false}>
+              <FieldRow label="Confidence">
+                <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                  <input type="range" min={0} max={100} value={settings.vggtConf}
+                    onChange={e=>setSettings(s=>({...s,vggtConf:+e.target.value}))}
+                    style={{ flex:1, accentColor:T.amber }} />
+                  <span style={{ fontSize:10, color:T.textDim, width:28 }}>{settings.vggtConf}%</span>
+                </div>
+              </FieldRow>
+              <FieldRow label="Sky Sensitivity">
+                <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                  <input type="range" min={8} max={128} value={settings.vggtSky}
+                    onChange={e=>setSettings(s=>({...s,vggtSky:+e.target.value}))}
+                    style={{ flex:1, accentColor:T.amber }} />
+                  <span style={{ fontSize:10, color:T.textDim, width:28 }}>{settings.vggtSky}</span>
+                </div>
+              </FieldRow>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:10, marginTop:6 }}>
+                {[["vggtMaskSky","Filter Sky"],["vggtShowCam","Show Camera Frustums"],
+                  ["vggtTemporal","Temporal Sequencing"],["vggtAnchorRig","Anchor+Rig Mode"]].map(([k,l])=>(
+                  <Toggle key={k} checked={settings[k]} label={l}
+                    onChange={v=>setSettings(s=>({...s,[k]:v}))} />
+                ))}
+              </div>
+              <FieldRow label="Prediction Mode">
+                <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                  <Radio value="depthmap" checked={settings.vggtMode==="depthmap"}
+                    onChange={v=>setSettings(s=>({...s,vggtMode:v}))} label="Depthmap" />
+                  <Radio value="pointmap" checked={settings.vggtMode==="pointmap"}
+                    onChange={v=>setSettings(s=>({...s,vggtMode:v}))} label="Pointmap" />
+                </div>
+              </FieldRow>
+            </Accordion>
           </div>
         )}
       </Accordion>
 
+      {/* ── Training ────────────────────────────────────────────── */}
       <Accordion title="Training" accent={T.amber}>
         <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
           <Toggle checked={runPostshot} label="Run Postshot Training"
             onChange={v=>setSettings(s=>({...s,runPostshot:v}))} />
           <Toggle checked={runBrush} label="Run Brush Training"
-            disabled={skipRS&&!runVggt&&!settings.runColmap}
+            disabled={mode === 'vggt'}
             onChange={v=>setSettings(s=>({...s,runBrush:v}))} />
+          {mode === 'vggt' && (
+            <div style={{ color:T.textDim, fontSize:10 }}>Brush training uses COLMAP/RS output — not available in VGGT mode.</div>
+          )}
         </div>
       </Accordion>
 
-      <Accordion title="Pipeline Plan" accent={T.live}>
-        <div style={{ fontFamily:"monospace", fontSize:11, color:T.textSec, lineHeight:1.7 }}>
-          {plan}
+      {/* ── Pipeline summary ─────────────────────────────────────── */}
+      <Accordion title="Pipeline Summary" accent={T.live}>
+        <div style={{ fontFamily:"monospace", fontSize:11, color:T.textSec, lineHeight:1.8 }}>
+          {mode === 'rs'     && `RealityScan alignment${settings.exportXmp?' + XMP rig priors':''}`}
+          {mode === 'colmap' && `COLMAP ${settings.colmapMode} (${settings.colmapMatcher} matcher)`}
+          {mode === 'vggt'   && `VGGT ${settings.vggtMode} pose estimation`}
+          {'\n'}
+          {[runPostshot&&'→ Postshot training', runBrush&&'→ Brush training'].filter(Boolean).join('\n') || (mode==='vggt'?'':'→ Alignment only (no training selected)')}
         </div>
       </Accordion>
     </div>
