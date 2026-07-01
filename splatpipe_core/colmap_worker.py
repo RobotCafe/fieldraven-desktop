@@ -177,13 +177,23 @@ def main():
         _prog(28, "Feature extraction complete.")
 
         # ── 2. Build rig config ────────────────────────────────────────────────
-        camera = pycolmap.Camera.create(
-            camera_id=0,
-            model=pycolmap.CameraModelId.SIMPLE_PINHOLE,
-            focal_length=focal,
-            width=image_size,
-            height=image_size,
-        )
+        try:
+            # pycolmap ≥ 3.11: create_from_model_id replaces deprecated create()
+            camera = pycolmap.Camera.create_from_model_id(
+                camera_id=0,
+                model_id=pycolmap.CameraModelId.SIMPLE_PINHOLE,
+                focal_length=focal,
+                width=image_size,
+                height=image_size,
+            )
+        except AttributeError:
+            camera = pycolmap.Camera.create(
+                camera_id=0,
+                model=pycolmap.CameraModelId.SIMPLE_PINHOLE,
+                focal_length=focal,
+                width=image_size,
+                height=image_size,
+            )
         camera.has_prior_focal_length = True
 
         zero_t = np.zeros((3, 1), dtype=np.float64)
