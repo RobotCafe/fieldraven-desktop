@@ -801,6 +801,31 @@ def _run_perspective_rig(
     else:
         report(PipelineStage.COLMAP_ALIGNMENT, 91, "Leveling skipped — using raw COLMAP poses.")
 
+    # Optional: refine level using COLMAP's own scene-geometry aligner.
+    # Runs after the rig-reference correction so the two stack rather than conflict.
+    # Non-fatal — if the aligner fails the rig-reference correction is still in place.
+    if getattr(settings, "colmap_orientation_align", False) and getattr(settings, "colmap_bin", None):
+        report(PipelineStage.COLMAP_ALIGNMENT, 92,
+               "Refining level using scene geometry (model_orientation_aligner IMAGE_ORIENTATION)…")
+        try:
+            result = subprocess.run(
+                [settings.colmap_bin, "model_orientation_aligner",
+                 "--input_path",  str(sparse_txt),
+                 "--output_path", str(sparse_txt),
+                 "--method",      "IMAGE_ORIENTATION"],
+                capture_output=True, text=True, timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+            )
+            if result.returncode == 0:
+                report(PipelineStage.COLMAP_ALIGNMENT, 92,
+                       "Scene-geometry orientation refinement complete")
+            else:
+                report(PipelineStage.COLMAP_ALIGNMENT, 92,
+                       f"Orientation aligner failed (non-fatal): {(result.stderr or '')[:300]}")
+        except Exception as exc:
+            report(PipelineStage.COLMAP_ALIGNMENT, 92,
+                   f"Orientation aligner error (non-fatal): {exc}")
+
     # ── finalise brush_input/ (file copies only — no pycolmap) ───────────────
     report(PipelineStage.COLMAP_ALIGNMENT, 93,
            f"COLMAP: {n_imgs} images, {n_pts} points — finalising brush input…")

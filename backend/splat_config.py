@@ -48,6 +48,7 @@ _SECTION_MAP: dict[str, dict[str, str]] = {
         "colmap_matcher":                "colmap_matcher",
         "colmap_visualize":              "colmap_visualize",
         "colmap_correct_pitch":          "colmap_correct_pitch",
+        "colmap_orientation_align":      "colmap_orientation_align",
     },
     "Postshot": {
         "postshot_profile":          "profile",
@@ -124,6 +125,7 @@ _DEFAULTS: dict[str, str] = {
     "colmap_matcher":                   "sequential",
     "colmap_visualize":                 "False",
     "colmap_correct_pitch":             "True",
+    "colmap_orientation_align":         "False",
     # Postshot
     "postshot_profile":          "Splat3",
     "postshot_max_image_size":   "3840",

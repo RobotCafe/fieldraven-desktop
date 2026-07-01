@@ -214,7 +214,7 @@ const API_TO_UI = {
   vggt_show_camera:'vggtShowCam', vggt_temporal_sequencing:'vggtTemporal',
   vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
   export_xmp:'exportXmp', gps_priors_rs:'gpsTriggersRS', gps_priors_colmap:'gpsPriorsColmap',
-  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch',
+  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -1379,6 +1379,10 @@ function AlignmentTab({ settings, setSettings }) {
               onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
             <Toggle checked={settings.colmapCorrectPitch !== false} label="Align reconstruction to rig 0° pitch reference"
               onChange={v=>setSettings(s=>({...s,colmapCorrectPitch:v}))} />
+            <Toggle checked={!!settings.colmapOrientationAlign} label="Refine level using scene geometry (IMAGE_ORIENTATION)"
+              disabled={!settings.colmapBin}
+              onChange={v=>setSettings(s=>({...s,colmapOrientationAlign:v}))}
+              title={!settings.colmapBin ? "Requires COLMAP binary path to be set" : undefined} />
             <Toggle checked={!!settings.gpsPriorsColmap} label="Geo-register reconstruction using GPS"
               onChange={v=>setSettings(s=>({...s,gpsPriorsColmap:v}))} />
             {settings.gpsPriorsColmap && (
@@ -1867,7 +1871,7 @@ const defaultSettings = {
   skipRS:false, runVggt:false, runPostshot:true, runBrush:false,
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
   vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false, gpsTriggersRS:false, gpsPriorsColmap:false,
-  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true,
+  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false,
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,
