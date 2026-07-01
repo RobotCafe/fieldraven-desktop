@@ -2133,13 +2133,15 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   }, [api, loadQueue, loadProjectDir, selected, setSettings, addLog]);
 
   // ── Resume a project from a specific stage ────────────────────
-  const runPipelineResume = useCallback(async (projectDir, jobId, startFrom, savedApiSettings = null) => {
+  const runPipelineResume = useCallback(async (projectDir, jobId, startFrom) => {
     setProjectState(null);
     try {
       addLog(`Resuming from ${startFrom || 'beginning'}…`);
-      // Use the project's own saved settings when available (prevents the current
-      // UI mode from overriding the pipeline that was originally configured).
-      const apiCfg = savedApiSettings || settingsToApiConfig(settings);
+      // Always use the current UI settings — openProjectFolder already populates
+      // them from the save file, so if the user hasn't changed anything they're
+      // identical. If the user DID change them (e.g. switching RS → COLMAP), their
+      // changes should take effect rather than being overridden by the stale save.
+      const apiCfg = settingsToApiConfig(settings);
       const r = await api('/api/project/resume', 'POST', {
         dir: projectDir, jobId, startFrom: startFrom || '',
         settings: apiCfg,
@@ -2147,10 +2149,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       setCurrentJobId(r.jobId);
       setProgress(0);
       setCurrentStage('');
-      const _rc = savedApiSettings?.run_colmap ?? settings.runColmap;
-      const _rv = savedApiSettings?.run_vggt   ?? settings.runVggt;
-      const _rb = savedApiSettings?.run_brush   ?? settings.runBrush;
-      const _mode = _rc ? 'colmap' : (!_rv && _rb ? 'rs_brush' : 'vggt');
+      const _mode = settings.runColmap ? 'colmap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
       setPipelineMode(_mode);
       setStatusMsg(`Resuming from ${startFrom || 'beginning'}`);
       addLog(`Pipeline resumed — jobId: ${r.jobId}`);
@@ -2475,13 +2474,13 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         <ProjectStateModal
           state={projectState}
           onContinue={async (nextStage) => {
-            await runPipelineResume(projectState.projectDir, projectState.jobId, nextStage, projectState.settings);
+            await runPipelineResume(projectState.projectDir, projectState.jobId, nextStage);
           }}
           onRerunFrom={async (stage) => {
             try {
               addLog(`Preparing rerun from ${stage}…`);
               await api('/api/project/prepare', 'POST', { dir: projectState.projectDir, startFrom: stage });
-              await runPipelineResume(projectState.projectDir, projectState.jobId, stage, projectState.settings);
+              await runPipelineResume(projectState.projectDir, projectState.jobId, stage);
             } catch (e) {
               addLog(`Rerun failed: ${e.message}`);
               setProjectState(null);
