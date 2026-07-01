@@ -65,24 +65,26 @@ def poll_for_jobs() -> list[dict]:
 
 
 def get_local_folder_jobs() -> list[dict]:
-    """Return all local-folder projects for this machine, regardless of status.
-    Unlike poll_for_jobs these are persistent user projects, not one-shot queue
-    entries, so they should always be visible in the Image Folders panel."""
+    """Return active (queued or processing) local-folder and local-video jobs for
+    this machine. Only active jobs are returned so that completed/errored jobs
+    do not persist across server restarts."""
     machine_id = get_machine_id()
     try:
         docs = firebase_client.get_processing_queue() \
             .where('assignedMachine', '==', machine_id) \
-            .where('jobType', '==', 'local_folder') \
-            .limit(20) \
+            .limit(50) \
             .get()
         jobs = []
         for doc in docs:
             data = doc.to_dict()
-            data['docId'] = doc.id
-            jobs.append(data)
+            jtype = data.get('jobType', '')
+            status = data.get('status', '')
+            if jtype in ('local_folder', 'local_video') and status in ('queued', 'processing'):
+                data['docId'] = doc.id
+                jobs.append(data)
         return jobs
     except Exception as e:
-        print(f"⚠️ Local folder jobs query failed: {e}")
+        print(f"⚠️ Local jobs query failed: {e}")
         return []
 
 

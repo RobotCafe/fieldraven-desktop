@@ -321,6 +321,61 @@ async def create_local_job(
     return {"processingJobId": new_ref.id, "status": "queued", "name": display_name}
 
 
+class CreateVideoJobRequest(BaseModel):
+    projectDir: str
+    videoPath: str
+    name: Optional[str] = None
+
+@app.post("/api/jobs/create-video")
+async def create_video_job(
+    request: CreateVideoJobRequest,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Create a processing-queue job for a local video file.
+    The video is copied into <projectDir>/import from camera/ so the pipeline
+    can find it via _find_primary_input and trigger frame extraction as stage 1."""
+    import datetime, shutil as _shutil
+
+    video_path = Path(request.videoPath)
+    project_dir = Path(request.projectDir)
+
+    input_dir = project_dir / "import from camera"
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = input_dir / video_path.name
+    if not dest.exists():
+        _shutil.copy2(str(video_path), str(dest))
+
+    display_name = request.name or video_path.stem
+
+    db = firebase_client.get_db()
+    new_ref = db.collection('processing_queue').document()
+    new_ref.set({
+        'assignedMachine': machine_module.get_machine_id(),
+        'status': 'queued',
+        'jobType': 'local_video',
+        'name': display_name,
+        'projectDir': str(project_dir),
+        'videoFile': video_path.name,
+        'createdAt': datetime.datetime.utcnow(),
+        'settings': {},
+    })
+
+    return {"processingJobId": new_ref.id, "status": "queued", "name": display_name}
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(
+    job_id: str,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Permanently delete a local processing-queue job (local_folder or local_video).
+    Cancels any running pipeline thread first, then removes the Firestore doc."""
+    pipeline_runner.cancel(job_id)
+    firebase_client.get_processing_queue().document(job_id).delete()
+    return {"status": "deleted"}
+
+
 @app.get("/api/jobs/{job_id}/status")
 async def get_job_status(
     job_id: str,
@@ -565,6 +620,24 @@ def _tk_browse_file(initial: str, filetypes: list) -> Optional[str]:
     return path.replace('/', '\\') if path else None
 
 
+def _tk_browse_video(initial: str) -> Optional[str]:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes('-topmost', True)
+    path = filedialog.askopenfilename(
+        initialdir=initial,
+        title="Select video file",
+        filetypes=[
+            ("Video files", "*.mp4 *.mov *.avi *.mkv *.insv"),
+            ("All files", "*.*"),
+        ],
+    )
+    root.destroy()
+    return path.replace('/', '\\') if path else None
+
+
 @app.get("/api/browse/file")
 async def browse_file(initial: str = "C:\\Users", type: str = "json"):
     """Open a single-file picker dialog; returns selected path or null."""
@@ -582,6 +655,13 @@ async def browse_folder(initial: str = "C:\\Users", title: Optional[str] = None)
     import functools
     fn = functools.partial(_tk_browse_folder, initial, title) if title else functools.partial(_tk_browse_folder, initial)
     path = await asyncio.get_event_loop().run_in_executor(None, fn)
+    return {"path": path}
+
+
+@app.get("/api/browse/video")
+async def browse_video(initial: str = "C:\\Users"):
+    """Open a video file-picker dialog; returns selected path or null."""
+    path = await asyncio.get_event_loop().run_in_executor(None, _tk_browse_video, initial)
     return {"path": path}
 
 

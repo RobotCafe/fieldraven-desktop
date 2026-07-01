@@ -281,28 +281,17 @@ function statusColor(s) {
 }
 
 // ─── Queue Panel ──────────────────────────────────────────────────────────────
-function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq, onAddImageFolder }) {
-  const addLocal = (type) => {
-    const names = {
-      video: ["site_walkthrough_01.mp4","panorama_beach.mov","survey_run_B.insv"],
-    };
-    const pick = names[type][Math.floor(Math.random()*3)];
-    const item = { id:`${type}_${Date.now()}`, type, name:pick };
-    setLocalQueue(q=>[...q, item]);
-    setSelected(item);
-  };
-
+function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq, onDeletePq, onAddImageFolder, onAddVideoFile }) {
   const queuedOrProcessing = j => j.status === 'queued' || j.status === 'processing';
   const frItems = pqItems
-    .filter(j => queuedOrProcessing(j) && j.jobType !== 'local_folder')
+    .filter(j => queuedOrProcessing(j) && j.jobType !== 'local_folder' && j.jobType !== 'local_video')
     .map(j => ({ id: j.docId||j.id, type:'fieldraven', name: j.name||j.clientName||'Field Job', status: j.status }));
-  const vidItems = localQueue.filter(i=>i.type==='video');
-  const imgItems = [
-    ...pqItems
-      .filter(j => j.jobType === 'local_folder')
-      .map(j => ({ id: j.docId||j.id, type:'folder', name: j.name||'Image Folder', status: j.status })),
-    ...localQueue.filter(i=>i.type==='folder'),
-  ];
+  const vidItems = pqItems
+    .filter(j => j.jobType === 'local_video')
+    .map(j => ({ id: j.docId||j.id, type:'video', name: j.name||'Video', status: j.status }));
+  const imgItems = pqItems
+    .filter(j => j.jobType === 'local_folder')
+    .map(j => ({ id: j.docId||j.id, type:'folder', name: j.name||'Image Folder', status: j.status }));
 
   const groups = [
     { type:"fieldraven", label:"FieldRaven Jobs", items: frItems },
@@ -361,17 +350,16 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
               <div style={{ display:"flex", gap:3 }}>
                 <Btn small variant="ghost"
                   style={{ flex:1, fontSize:10, borderColor:`${cfg.color}44`, color:cfg.color }}
-                  onClick={()=> type==='folder' ? onAddImageFolder?.() : addLocal(type)}>
+                  onClick={()=> type==='folder' ? onAddImageFolder?.() : onAddVideoFile?.()}>
                   + Add
                 </Btn>
                 {items.length > 0 && (
                   <Btn small variant="ghost"
                     onClick={()=>{
                       if(selected && items.find(i=>i.id===selected.id)) setSelected(null);
-                      // Firestore-backed items (jobType local_folder, or queued field jobs)
-                      // carry a `status` — those must be cancelled server-side, not just
-                      // dropped from local React state, or they silently stay in the queue.
-                      items.forEach(it => { if (it.status) onCancelPq(it.id); });
+                      // Local jobs (local_folder / local_video) are deleted from Firestore
+                      // entirely when removed — not just failed/cancelled.
+                      items.forEach(it => { if (it.status) onDeletePq?.(it.id); });
                       setLocalQueue(q=>q.filter(i=>i.type!==type));
                     }}>
                     ✕
@@ -395,10 +383,8 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
             <div style={{ marginTop:6 }}>
               <Btn small variant="danger" full onClick={()=>{
                 // Firestore-backed items (e.g. image-folder jobs, jobType
-                // local_folder) must be cancelled server-side — filtering
-                // localQueue alone does nothing for them since they were
-                // never added to that array.
-                if (selected.status) onCancelPq(selected.id);
+                // local_folder / local_video jobs are deleted from Firestore entirely.
+                if (selected.status) onDeletePq?.(selected.id);
                 setLocalQueue(q=>q.filter(i=>i.id!==selected.id));
                 setSelected(null);
               }}>Remove</Btn>
@@ -1547,15 +1533,15 @@ function Console({ logs, visible }) {
 const PIPE_TABS = ["Frame & View Extraction","Alignment","Postshot","Brush","Configuration"];
 
 function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected,
-    settings, setSettings, onSaveConfig, onCancelPq, machineInfo,
-    cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder,
+    settings, setSettings, onSaveConfig, onCancelPq, onDeletePq, machineInfo,
+    cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder, onAddVideoFile,
     importStep, importPct, stitching, stitchStep, stitchPct }) {
   const [pipeTab, setPipeTab] = useState(0);
   return (
     <div style={{ display:"flex", height:"100%", overflow:"hidden", gap:10 }}>
       <QueuePanel pqItems={pqItems} localQueue={localQueue} setLocalQueue={setLocalQueue}
         selected={selected} setSelected={setSelected} onCancelPq={onCancelPq}
-        onAddImageFolder={onAddImageFolder} />
+        onDeletePq={onDeletePq} onAddImageFolder={onAddImageFolder} onAddVideoFile={onAddVideoFile} />
 
       <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
         <div style={{ display:"flex", gap:1, marginBottom:0, flexShrink:0, overflowX:"auto" }}>
@@ -1972,19 +1958,21 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   // ── Processing queue polling ──────────────────────────────
   const loadQueue = useCallback(() => {
     api('/api/jobs/queue').then(d => {
-      const fresh = [
-        ...(d.queued || []),
-        ...(d.current ? [d.current] : []),
-      ];
-      // Preserve any local_folder items already in state that the server didn't
-      // return (e.g. if their status is complete/error and the backend query
-      // missed them due to a transient issue). Avoids the "flashes then
-      // disappears" problem when openProjectFolder injects an item right before
-      // loadQueue overwrites pqItems.
+      // Dedup by docId/id — a processing local job appears in both d.queued and d.current
+      const seenIds = new Set();
+      const fresh = [...(d.queued || []), ...(d.current ? [d.current] : [])].filter(j => {
+        const id = j.docId || j.id;
+        if (seenIds.has(id)) return false;
+        seenIds.add(id);
+        return true;
+      });
+      // Preserve any openProjectFolder-injected items that arrived right before
+      // this poll fired and aren't yet in the server response.
       setPqItems(prev => {
         const freshIds = new Set(fresh.map(j => j.docId || j.id));
         const pinned = prev.filter(
-          j => j.jobType === 'local_folder' && !freshIds.has(j.docId || j.id)
+          j => (j.jobType === 'local_folder' || j.jobType === 'local_video') &&
+               !freshIds.has(j.docId || j.id)
         );
         return [...fresh, ...pinned];
       });
@@ -2425,6 +2413,37 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     } catch {}
   }, [api, loadQueue, selected]);
 
+  const onDeletePq = useCallback(async (jobId) => {
+    try {
+      await api(`/api/jobs/${jobId}`, 'DELETE');
+      // Remove immediately from local state; don't wait for next poll
+      setPqItems(prev => prev.filter(j => (j.docId || j.id) !== jobId));
+      if (selected?.id === jobId) setSelected(null);
+    } catch {}
+  }, [api, selected]);
+
+  const onAddVideoFile = useCallback(async () => {
+    addLog('Select or create a project folder for this video…');
+    const dirRes = await api(`/api/browse/folder?initial=${encodeURIComponent(lastBrowseDir)}`);
+    if (!dirRes.path) { addLog('Cancelled.'); return; }
+    const projectDir = dirRes.path;
+    setLastBrowseDir(projectDir);
+
+    addLog('Select the video file…');
+    const fileRes = await api(`/api/browse/video?initial=${encodeURIComponent(projectDir)}`);
+    if (!fileRes.path) { addLog('Cancelled.'); return; }
+
+    let created;
+    try {
+      created = await api('/api/jobs/create-video', 'POST', { projectDir, videoPath: fileRes.path });
+    } catch (e) {
+      addLog(`Could not create video project: ${e.message}`);
+      return;
+    }
+    addLog(`Video project ready: ${created.name}`);
+    loadQueue();
+  }, [api, lastBrowseDir, loadQueue]);
+
   const onSaveConfig = useCallback(async () => {
     try {
       await api('/api/config', 'PUT', settingsToApiConfig(settings));
@@ -2642,10 +2661,10 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
             pqItems={pqItems} localQueue={localQueue} setLocalQueue={setLocalQueue}
             selected={selected} setSelected={setSelected}
             settings={settings} setSettings={setSettings}
-            onSaveConfig={onSaveConfig} onCancelPq={onCancelPq}
+            onSaveConfig={onSaveConfig} onCancelPq={onCancelPq} onDeletePq={onDeletePq}
             machineInfo={machineInfo}
             cameraStatus={cameraStatus} importedFiles={importedFiles} projectDirs={projectDirs} onImport={onImport}
-            onAddImageFolder={onAddImageFolder}
+            onAddImageFolder={onAddImageFolder} onAddVideoFile={onAddVideoFile}
             importStep={importStep} importPct={importPct}
             stitching={!!stitchingJobId} stitchStep={stitchStep} stitchPct={stitchPct}
           />
