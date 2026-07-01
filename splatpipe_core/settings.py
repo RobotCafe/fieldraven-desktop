@@ -43,7 +43,7 @@ class PipelineSettings:
     colmap_matcher: str = "sequential" # "sequential" | "exhaustive" | "vocabtree"
     horizon_ref: bool = True           # prepend pitch=0° sensor as rig reference to preserve pitch in cam_from_rig
     colmap_visualize: bool = False     # generate cameras.html visualizer after reconstruction
-    colmap_correct_pitch: bool = True        # apply single global rotation to level the reconstruction using mean anchor camera orientation
+    colmap_correct_pitch: bool = True        # rotate entire reconstruction so the mean 0°-pitch extraction views align with zero pitch/roll in COLMAP world space
     colmap_bin: Optional[str] = None   # path to colmap.exe; enables GPU via CLI for extraction+matching
     sky_sensitivity_threshold: int = 32
     colmap_image_width: int = 1920

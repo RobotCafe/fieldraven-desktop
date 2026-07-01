@@ -1377,7 +1377,7 @@ function AlignmentTab({ settings, setSettings }) {
             </FieldRow>
             <Toggle checked={!!settings.colmapVisualize} label="Generate camera visualizer (cameras.html)"
               onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
-            <Toggle checked={settings.colmapCorrectPitch !== false} label="Re-approximate level (average of all anchor cameras)"
+            <Toggle checked={settings.colmapCorrectPitch !== false} label="Align reconstruction to rig 0° pitch reference"
               onChange={v=>setSettings(s=>({...s,colmapCorrectPitch:v}))} />
             <Toggle checked={!!settings.gpsPriorsColmap} label="Geo-register reconstruction using GPS"
               onChange={v=>setSettings(s=>({...s,gpsPriorsColmap:v}))} />
@@ -2485,9 +2485,12 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
           }}
           onStartOver={async () => {
             try {
-              addLog('Starting over — clearing all output…');
+              addLog('Clearing output (views, alignment, training) — import kept…');
               await api('/api/project/prepare', 'POST', { dir: projectState.projectDir, startFrom: 'view_extraction' });
-              await runPipelineResume(projectState.projectDir, projectState.jobId, 'view_extraction', projectState.settings);
+              addLog('Ready — adjust settings then click Run.');
+              // Keep the project dir loaded so the user can tweak settings and run manually
+              if (selected?.id) loadProjectDir(selected.id, projectState.projectDir);
+              setProjectState(null);
             } catch (e) {
               addLog(`Start over failed: ${e.message}`);
               setProjectState(null);
