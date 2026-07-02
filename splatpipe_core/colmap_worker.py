@@ -81,8 +81,10 @@ def main():
         image_path  = Path(payload["image_path"])
         sparse_path = Path(payload["sparse_path"])
         sparse_txt  = Path(payload["sparse_txt_path"])
-        matcher     = payload.get("colmap_matcher", "sequential")
-        colmap_bin  = payload.get("colmap_bin", "")   # empty → pycolmap CPU fallback
+        matcher         = payload.get("colmap_matcher", "sequential")
+        colmap_bin      = payload.get("colmap_bin", "")      # empty → pycolmap CPU fallback
+        colmap_mapper   = payload.get("colmap_mapper", "incremental")  # "incremental" | "global"
+        vocab_tree_path = payload.get("vocab_tree_path", "")  # optional second-pass loop closure
 
         rig         = payload["rig"]
         focal       = float(rig["focal"])
@@ -250,7 +252,25 @@ def main():
             _match(matcher, str(db_path), mo)
         _prog(58, "Feature matching complete.")
 
-        # ── 4b. Purge same-rig-frame sibling pairs ──────────────────────────────
+        # ── 4b. Vocab tree loop closure pass (optional second pass) ────────────
+        # Runs AFTER sequential matching and adds non-sequential image pairs that
+        # share visual content — essential for walks that loop back or cross
+        # themselves. Sequential matching misses these; vocab tree retrieval finds
+        # them by global visual similarity. Only fires when a vocab tree .bin is
+        # configured AND colmap_bin is set (no pycolmap vocab tree path API).
+        if vocab_tree_path and colmap_bin and matcher == "sequential":
+            _prog(58, f"Vocab tree loop closure pass — {vocab_tree_path.rsplit('/', 1)[-1].rsplit(chr(92), 1)[-1]}…")
+            _run_cli([
+                "vocab_tree_matcher",
+                "--database_path",                   str(db_path),
+                "--VocabTreeMatching.vocab_tree_path", vocab_tree_path,
+                "--VocabTreeMatching.num_images_after_verification", "50",
+                "--SiftMatching.use_gpu",  "1",
+                "--SiftMatching.gpu_index", "0",
+            ], pct=58)
+            _prog(60, "Vocab tree loop closure pass complete.")
+
+        # ── 4c. Purge same-rig-frame sibling pairs ──────────────────────────────
         # pycolmap's own matcher excludes these via skip_image_pairs_in_same_frame
         # (set above), but the GPU CLI matcher has no equivalent flag. Sibling
         # sensors within one rig frame share a single optical center (zero
@@ -265,33 +285,74 @@ def main():
         if n_purged:
             _prog(58, f"Purged {n_purged} same-rig-frame sibling pairs (zero-baseline, non-triangulable).")
 
-        # ── 5. Incremental mapping ─────────────────────────────────────────────
-        # Seed world frame from anchor (pano_camera0) image pair so COLMAP
-        # initialises with a horizontal baseline. Without this, the 6 siblings
-        # at -10° dominate and COLMAP tilts the whole world +10° to compensate.
-        _prog(60, "Running incremental mapping (fixed rig)…")
+        # ── 5. Mapping ─────────────────────────────────────────────────────────
         sparse_path.mkdir(parents=True, exist_ok=True)
-        map_opts = pycolmap.IncrementalPipelineOptions(
-            ba_refine_sensor_from_rig=False,
-            ba_refine_focal_length=False,
-            ba_refine_principal_point=False,
-            ba_refine_extra_params=False,
-        )
-        recs = pycolmap.incremental_mapping(
-            str(db_path), str(image_path), str(sparse_path), map_opts
-        )
+        sparse_txt.mkdir(parents=True, exist_ok=True)
 
-        if not recs:
-            raise RuntimeError("COLMAP incremental mapping produced no reconstructions.")
+        if colmap_mapper == "global" and colmap_bin:
+            # GLOMAP global SfM — integrated into COLMAP as --Mapper.mapper_type GLOBAL.
+            # Solves all cameras simultaneously rather than incrementally, giving better
+            # global consistency for large sequential captures (long walks, drone surveys).
+            # Does NOT respect rig constraints (apply_rig_config tables are ignored),
+            # so each sensor is reconstructed independently. This is a valid tradeoff
+            # for large-scale captures where global drift matters more than local rig accuracy.
+            _prog(60, "Running GLOMAP global SfM (--Mapper.mapper_type GLOBAL)…")
+            _run_cli([
+                "mapper",
+                "--database_path", str(db_path),
+                "--image_path",    str(image_path),
+                "--output_path",   str(sparse_path),
+                "--Mapper.mapper_type", "GLOBAL",
+            ], pct=80)
 
-        best   = max(recs.values(), key=lambda r: len(r.images))
-        n_imgs = len(best.images)
-        n_pts  = len(best.points3D)
-        _prog(86, f"Mapping complete — {n_imgs} images, {n_pts} 3D points.")
+            # Global mapper writes binary to sparse_path/0/ — find the best sub-model
+            sub_dirs = sorted(sparse_path.iterdir(), key=lambda p: p.name)
+            best_dir = None
+            best_count = -1
+            for sd in sub_dirs:
+                cam_bin = sd / "cameras.bin"
+                img_bin = sd / "images.bin"
+                if cam_bin.exists() and img_bin.exists():
+                    rec_tmp = pycolmap.Reconstruction()
+                    rec_tmp.read(str(sd))
+                    if len(rec_tmp.images) > best_count:
+                        best_count = len(rec_tmp.images)
+                        best_dir = sd
+
+            if best_dir is None:
+                raise RuntimeError("GLOMAP global mapper produced no reconstructions.")
+
+            best = pycolmap.Reconstruction()
+            best.read(str(best_dir))
+            n_imgs = len(best.images)
+            n_pts  = len(best.points3D)
+            _prog(86, f"GLOMAP complete — {n_imgs} images, {n_pts} 3D points.")
+
+        else:
+            # Incremental mapping (pycolmap, rig-constrained).
+            # Seed world frame from anchor (pano_camera0) image pair so COLMAP
+            # initialises with a horizontal baseline.
+            _prog(60, "Running incremental mapping (fixed rig)…")
+            map_opts = pycolmap.IncrementalPipelineOptions(
+                ba_refine_sensor_from_rig=False,
+                ba_refine_focal_length=False,
+                ba_refine_principal_point=False,
+                ba_refine_extra_params=False,
+            )
+            recs = pycolmap.incremental_mapping(
+                str(db_path), str(image_path), str(sparse_path), map_opts
+            )
+
+            if not recs:
+                raise RuntimeError("COLMAP incremental mapping produced no reconstructions.")
+
+            best   = max(recs.values(), key=lambda r: len(r.images))
+            n_imgs = len(best.images)
+            n_pts  = len(best.points3D)
+            _prog(86, f"Mapping complete — {n_imgs} images, {n_pts} 3D points.")
 
         # ── 6. Write sparse_txt ────────────────────────────────────────────────
         _prog(88, "Writing sparse_txt output…")
-        sparse_txt.mkdir(parents=True, exist_ok=True)
         best.write_text(str(sparse_txt))
 
         print(json.dumps({

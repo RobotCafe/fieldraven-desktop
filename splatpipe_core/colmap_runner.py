@@ -674,6 +674,8 @@ def _run_perspective_rig(
         "sparse_txt_path": str(sparse_txt),
         "colmap_matcher":  settings.colmap_matcher,
         "colmap_bin":      settings.colmap_bin or "",
+        "colmap_mapper":   getattr(settings, "colmap_mapper", "incremental"),
+        "vocab_tree_path": getattr(settings, "colmap_vocab_tree", "") or "",
         "rig":             rig_params,
     }
 

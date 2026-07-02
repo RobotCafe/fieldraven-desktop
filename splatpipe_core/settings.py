@@ -45,6 +45,8 @@ class PipelineSettings:
     colmap_visualize: bool = False     # generate cameras.html visualizer after reconstruction
     colmap_correct_pitch: bool = True        # rotate entire reconstruction so the mean 0°-pitch extraction views align with zero pitch/roll in COLMAP world space
     colmap_orientation_align: bool = False   # after pitch correction, run colmap model_orientation_aligner --method IMAGE_ORIENTATION to refine level using scene geometry (requires colmap_bin)
+    colmap_mapper: str = "incremental"       # "incremental" (pycolmap rig-aware) | "global" (GLOMAP, requires colmap_bin, no rig constraints)
+    colmap_vocab_tree: str = ""              # path to COLMAP vocab tree .bin; enables a second vocab_tree_matcher pass after sequential matching for loop closure (requires colmap_bin)
     colmap_bin: Optional[str] = None   # path to colmap.exe; enables GPU via CLI for extraction+matching
     sky_sensitivity_threshold: int = 32
     colmap_image_width: int = 1920

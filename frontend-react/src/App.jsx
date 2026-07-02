@@ -214,7 +214,7 @@ const API_TO_UI = {
   vggt_show_camera:'vggtShowCam', vggt_temporal_sequencing:'vggtTemporal',
   vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
   export_xmp:'exportXmp', gps_priors_rs:'gpsTriggersRS', gps_priors_colmap:'gpsPriorsColmap',
-  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign',
+  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign', colmap_mapper:'colmapMapper', colmap_vocab_tree:'colmapVocabTree',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -241,7 +241,8 @@ function parseApiVal(v) {
 const STRING_SETTINGS = new Set(['pitchAngles', 'vggtMode', 'postshotProfile',
   'extractionMethod', 'intervalUnit', 'frameFormat', 'ffmpeg', 'rs', 'postshot',
   'brush', 'rsSettings', 'vggt', 'colmapBin', 'inspStitchType', 'inspLensGuard',
-  'inspOutputWidth', 'inspWorkers', 'colmapMode', 'colmapMatcher']);
+  'inspOutputWidth', 'inspWorkers', 'colmapMode', 'colmapMatcher',
+  'colmapMapper', 'colmapVocabTree']);
 
 function apiConfigToSettings(cfg) {
   const out = {};
@@ -1342,6 +1343,19 @@ function AlignmentTab({ settings, setSettings }) {
                   onChange={v=>setSettings(s=>({...s,colmapMode:v}))} label="Spherical" />
               </div>
             </FieldRow>
+            <FieldRow label="Mapper">
+              <div style={{ display:"flex", gap:12 }}>
+                <Radio value="incremental" checked={(settings.colmapMapper||"incremental")==="incremental"}
+                  onChange={v=>setSettings(s=>({...s,colmapMapper:v}))} label="Incremental (rig-aware)" />
+                <Radio value="global" checked={settings.colmapMapper==="global"}
+                  onChange={v=>setSettings(s=>({...s,colmapMapper:v}))} label="Global (GLOMAP)" disabled={!settings.colmapBin} />
+              </div>
+              {settings.colmapMapper==="global" && (
+                <div style={{ color:T.textDim, fontSize:10, marginTop:4 }}>
+                  GLOMAP: 10–100× faster, better for large sequential captures. No rig constraints — sensors reconstructed independently.
+                </div>
+              )}
+            </FieldRow>
             <FieldRow label="Matcher">
               <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
                 {["sequential","exhaustive","vocabtree"].map(m=>(
@@ -1350,6 +1364,22 @@ function AlignmentTab({ settings, setSettings }) {
                 ))}
               </div>
             </FieldRow>
+            {settings.colmapMatcher==="sequential" && settings.colmapBin && (
+              <div style={{ paddingLeft:12, borderLeft:`2px solid ${T.border}` }}>
+                <div style={{ fontSize:10, color:T.textDim, marginBottom:4 }}>
+                  Loop closure: vocab tree adds a second matching pass that finds non-adjacent images sharing visual content.
+                  Useful for walks that loop back or cross themselves. Requires a vocab tree .bin file (Config → Paths).
+                </div>
+                <Toggle checked={!!settings.colmapVocabTree} label="Enable vocab tree loop closure pass"
+                  disabled
+                  title="Set Vocab Tree path in Config → Paths to enable" />
+                {settings.colmapVocabTree && (
+                  <div style={{ fontSize:10, color:T.live, marginTop:2 }}>
+                    Vocab tree configured: {settings.colmapVocabTree.split(/[/\\]/).pop()}
+                  </div>
+                )}
+              </div>
+            )}
             <Toggle checked={settings.colmapCorrectPitch !== false} label="Align reconstruction to rig 0° pitch reference"
               onChange={v=>setSettings(s=>({...s,colmapCorrectPitch:v}))} />
             <Toggle checked={!!settings.colmapOrientationAlign} label="Refine level using scene geometry (IMAGE_ORIENTATION)"
@@ -1503,6 +1533,7 @@ function ConfigTab({ settings, setSettings, machineInfo, onSaveConfig }) {
     ["postshot","Postshot CLI"],["brush","Brush CLI"],
     ["rsSettings","RS Settings Folder"],["vggt","VGGT Project"],
     ["colmapBin","COLMAP Binary (.exe)"],
+    ["colmapVocabTree","Vocab Tree (.bin) — loop closure"],
   ];
   return (
     <div style={{ overflowY:"auto", height:"100%" }}>
@@ -1894,7 +1925,7 @@ const defaultSettings = {
   skipRS:false, runVggt:false, runPostshot:true, runBrush:false,
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
   vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false, gpsTriggersRS:false, gpsPriorsColmap:false,
-  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false,
+  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false, colmapMapper:"incremental", colmapVocabTree:"",
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,

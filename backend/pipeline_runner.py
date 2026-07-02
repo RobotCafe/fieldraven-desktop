@@ -216,6 +216,8 @@ def _build_settings(job_data: dict):
     s.colmap_visualize            = _to_bool(cfg.get("colmap_visualize", s.colmap_visualize))
     s.colmap_correct_pitch        = _to_bool(cfg.get("colmap_correct_pitch", s.colmap_correct_pitch))
     s.colmap_orientation_align    = _to_bool(cfg.get("colmap_orientation_align", s.colmap_orientation_align))
+    s.colmap_mapper               = cfg.get("colmap_mapper", s.colmap_mapper)
+    s.colmap_vocab_tree           = cfg.get("colmap_vocab_tree", s.colmap_vocab_tree)
     s.sky_sensitivity_threshold   = int(float(cfg.get("sky_sensitivity_threshold", s.sky_sensitivity_threshold)))
 
     # ── Postshot ──────────────────────────────────────────────────
@@ -281,6 +283,8 @@ def _build_settings(job_data: dict):
         if "colmap_visualize" in ui:    s.colmap_visualize    = _to_bool(ui["colmap_visualize"])
         if "colmap_correct_pitch" in ui:       s.colmap_correct_pitch       = _to_bool(ui["colmap_correct_pitch"])
         if "colmap_orientation_align" in ui:   s.colmap_orientation_align   = _to_bool(ui["colmap_orientation_align"])
+        if "colmap_mapper" in ui:              s.colmap_mapper              = ui["colmap_mapper"]
+        if "colmap_vocab_tree" in ui:          s.colmap_vocab_tree          = ui["colmap_vocab_tree"]
         if "yaw_steps" in ui:         s.yaw_steps         = int(ui["yaw_steps"])
         if "fov" in ui:               s.fov               = float(ui["fov"])
         if "horizon_ref" in ui:       s.horizon_ref       = _to_bool(ui["horizon_ref"])
