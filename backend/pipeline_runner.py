@@ -556,7 +556,9 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     thumbnail_url = _upload_thumbnail(job_id, proj_root)
 
                     # Publish to the public gallery Firestore collection
-                    _publish_to_gallery(job_id, job_data, r2_url, gaussian_count, thumbnail_url)
+                    _pipeline_mode = "colmap" if use_colmap else ("rs_brush" if use_rs_brush else "vggt")
+                    _publish_to_gallery(job_id, job_data, r2_url, gaussian_count, thumbnail_url,
+                                        pipeline_mode=_pipeline_mode)
                 elif ply_file and not r2_client.is_configured():
                     print("  [r2] Skipping upload — r2_config.json not configured")
             except Exception as exc:
@@ -670,6 +672,7 @@ def _publish_to_gallery(
     splat_url: str,
     gaussian_count: int,
     thumbnail_url: "str | None" = None,
+    pipeline_mode: "str | None" = None,
 ) -> None:
     """Write a public gallery document to Firestore for this completed splat."""
     from google.cloud.firestore import SERVER_TIMESTAMP
@@ -688,7 +691,7 @@ def _publish_to_gallery(
             "name":          display_name,
             "splatUrl":      splat_url,
             "gaussianCount": gaussian_count,
-            "pipelineMode":  job_data.get("pipelineMode") or job_data.get("pipeline_mode") or "rs_brush",
+            "pipelineMode":  pipeline_mode or job_data.get("pipelineMode") or job_data.get("pipeline_mode") or "rs_brush",
             "createdAt":     SERVER_TIMESTAMP,
         }
         if thumbnail_url:
