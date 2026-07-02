@@ -29,6 +29,7 @@ import queue
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -712,8 +713,11 @@ def _run_perspective_rig(
             if msg:
                 report(PipelineStage.COLMAP_ALIGNMENT, current_pct, f"[colmap] {msg}")
 
-    worker_lines = []
-    current_pct  = 12
+    worker_lines   = []
+    current_pct    = 12
+    _last_report_t = 0.0   # time of last Firestore write
+    _last_report_p = -1    # pct at last write — always write on pct change
+    _FB_INTERVAL   = 3.0   # seconds between Firebase writes during log-spam phases
     while True:
         raw = process.stdout.readline()
         if not raw and process.poll() is not None:
@@ -732,7 +736,14 @@ def _run_perspective_rig(
             except (ValueError, IndexError):
                 msg = clean
             _forward_stderr(current_pct)
-            report(PipelineStage.COLMAP_ALIGNMENT, current_pct, msg)
+            # Rate-limit Firestore writes: only push if pct changed or 3s elapsed.
+            # Prevents ~600 sequential writes during COLMAP matching (one per image)
+            # which caused a 2+ minute write backlog that made the app appear hung.
+            now = time.time()
+            if current_pct != _last_report_p or (now - _last_report_t) >= _FB_INTERVAL:
+                report(PipelineStage.COLMAP_ALIGNMENT, current_pct, msg)
+                _last_report_t = now
+                _last_report_p = current_pct
             if cancel_event.is_set():
                 process.terminate()
                 return

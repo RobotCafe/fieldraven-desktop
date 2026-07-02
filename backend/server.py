@@ -4,12 +4,53 @@ Serves the local web dashboard and provides API endpoints
 for auth, queue management, camera detection, and pipeline control.
 """
 import asyncio
+import logging
 import os
+import sys
 import json
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
+
+# ── File-based logging ────────────────────────────────────────
+# Writes timestamped logs to C:/FieldRaven/logs/server_YYYY-MM-DD.log
+# alongside all stdout output. Crashes produce full tracebacks in the log.
+_LOG_DIR = Path("C:/FieldRaven/logs")
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / f"server_{date.today().isoformat()}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(str(_LOG_FILE), encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+    force=True,
+)
+logger = logging.getLogger("fieldraven")
+
+# Tee print() to the log file too, so all existing print statements are captured
+class _LogTee:
+    """Writes to both the original stream and the log file."""
+    def __init__(self, original, log_path: Path):
+        self._orig = original
+        self._log  = open(str(log_path), "a", encoding="utf-8", buffering=1)
+    def write(self, msg):
+        self._orig.write(msg)
+        if msg.strip():
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._log.write(f"{ts} {msg}" if not msg.startswith("\n") else msg)
+    def flush(self):
+        self._orig.flush()
+        self._log.flush()
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+sys.stdout = _LogTee(sys.stdout, _LOG_FILE)
+sys.stderr = _LogTee(sys.stderr, _LOG_FILE)
 
 from fastapi import FastAPI, HTTPException, Depends, status, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -1215,16 +1256,30 @@ async def prepare_project_rerun(
     user: CurrentUser = Depends(require_auth),
 ):
     """Delete stage output directories from startFrom onwards (cascade)."""
+    import shutil as _shutil
     project_dir  = Path(request.dir)
     dirs_to_wipe = _STAGE_DIRS_TO_DELETE.get(request.startFrom, [])
     deleted = []
+    errors  = []
     for name in dirs_to_wipe:
         p = project_dir / name
         if p.exists():
-            import shutil as _shutil
-            _shutil.rmtree(str(p))
-            deleted.append(name)
-    return {"deleted": deleted, "startFrom": request.startFrom}
+            try:
+                _shutil.rmtree(str(p))
+                deleted.append(name)
+                print(f"[prepare] Deleted {p}")
+            except PermissionError as exc:
+                # Windows: files locked by a running process (COLMAP db, .ply, etc.)
+                msg = f"Could not delete {name}: {exc} — close any running processes and retry"
+                errors.append(msg)
+                print(f"⚠️ [prepare] {msg}")
+            except Exception as exc:
+                msg = f"Could not delete {name}: {exc}"
+                errors.append(msg)
+                print(f"⚠️ [prepare] {msg}")
+    if errors and not deleted:
+        raise HTTPException(status_code=500, detail="; ".join(errors))
+    return {"deleted": deleted, "startFrom": request.startFrom, "errors": errors}
 
 
 class ProjectResumeRequest(BaseModel):
