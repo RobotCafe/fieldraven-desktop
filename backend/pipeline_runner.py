@@ -607,6 +607,23 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                               else "vggt")
                     _publish_to_gallery(job_id, job_data, r2_url, gaussian_count, thumbnail_url,
                                         pipeline_mode=_pipeline_mode)
+
+                    # Auto-fetch Garmin activity for this session
+                    try:
+                        from splatpipe_core import garmin_fetcher
+                        from datetime import date as _date_cls
+                        _db  = firebase_client.get_db()
+                        # Use the project folder's date (closest to session date)
+                        _proj_dir = job_data.get("projectDir")
+                        if _proj_dir:
+                            _session_date = _date_cls.fromtimestamp(
+                                Path(_proj_dir).stat().st_mtime
+                            )
+                        else:
+                            _session_date = _date_cls.today()
+                        garmin_fetcher.fetch_and_store(job_id, _session_date, _db)
+                    except Exception as _g_exc:
+                        print(f"  [garmin] Non-fatal: {_g_exc}")
                 elif ply_file and not r2_client.is_configured():
                     print("  [r2] Skipping upload — r2_config.json not configured")
             except Exception as exc:

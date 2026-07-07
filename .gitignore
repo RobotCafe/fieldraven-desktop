@@ -2,6 +2,8 @@
 config/fieldraven-service-account.json
 config/firebase-web-config.json
 config/r2_config.json
+config/garmin_config.json
+config/garmin_tokens/
 *.env
 .env*
 
