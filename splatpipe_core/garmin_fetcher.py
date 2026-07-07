@@ -77,36 +77,90 @@ def _get_client():
 
 # ── Activity search ───────────────────────────────────────────────────────────
 
-def _find_best_activity(client, target_date: _date, search_days: int) -> Optional[dict]:
+def _parse_garmin_time(s: str) -> Optional[datetime]:
+    """Parse a Garmin startTimeLocal string to a naive datetime."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _find_activity_by_overlap(
+    client,
+    session_start: datetime,
+    session_end: datetime,
+    search_days: int,
+) -> Optional[dict]:
     """
-    Search activities within ±search_days of target_date.
-    Returns the activity with the highest elevation gain (most likely the
-    field survey hike). Returns None if nothing found.
+    Find the Garmin activity whose recording window overlaps most with the
+    field session [session_start, session_end].
+
+    Falls back to elevation-gain scoring when no temporal overlap found.
+    """
+    search_from = (session_start.date() - timedelta(days=search_days)).isoformat()
+    search_to   = (session_end.date()   + timedelta(days=search_days)).isoformat()
+
+    print(f"  [garmin] Searching activities {search_from} → {search_to} "
+          f"(session {session_start.strftime('%H:%M')}–{session_end.strftime('%H:%M')})")
+
+    activities = client.get_activities_by_date(search_from, search_to, activitytype=None)
+    if not activities:
+        print("  [garmin] No activities found")
+        return None
+
+    session_dur = (session_end - session_start).total_seconds()
+    best: Optional[dict] = None
+    best_overlap = 0.0
+
+    for act in activities:
+        act_start = _parse_garmin_time(act.get("startTimeLocal", ""))
+        if act_start is None:
+            continue
+        act_dur = float(act.get("duration") or act.get("elapsedDuration") or 0)
+        act_end = act_start + timedelta(seconds=act_dur)
+
+        overlap_start = max(session_start, act_start)
+        overlap_end   = min(session_end,   act_end)
+        overlap_sec   = max(0.0, (overlap_end - overlap_start).total_seconds())
+
+        if overlap_sec > best_overlap:
+            best_overlap = overlap_sec
+            best = act
+
+    if best and best_overlap > 0:
+        pct = best_overlap / session_dur * 100 if session_dur > 0 else 0
+        print(
+            f"  [garmin] Matched '{best.get('activityName')}' — "
+            f"{pct:.0f}% overlap ({best_overlap/60:.0f} min)"
+        )
+        return best
+
+    # No temporal overlap found — fall back to elevation-gain heuristic
+    print("  [garmin] No temporal overlap — falling back to elevation-gain score")
+    return _find_best_activity_by_date(client, session_start.date(), search_days)
+
+
+def _find_best_activity_by_date(client, target_date: _date, search_days: int) -> Optional[dict]:
+    """
+    Fallback: search ±search_days and pick activity with most elevation gain.
     """
     start = (target_date - timedelta(days=search_days)).isoformat()
     end   = (target_date + timedelta(days=search_days)).isoformat()
 
-    print(f"  [garmin] Searching activities {start} → {end}")
     activities = client.get_activities_by_date(start, end, activitytype=None)
-
     if not activities:
-        print("  [garmin] No activities found in date range")
         return None
 
-    # Prefer activities with most elevation gain (field surveys tend to involve
-    # significant ascent/descent). Fall back to longest duration.
     def score(a: dict) -> float:
-        gain = a.get("elevationGain") or 0
-        dur  = a.get("duration") or 0
-        return gain * 10 + dur
+        return (a.get("elevationGain") or 0) * 10 + (a.get("duration") or 0)
 
     best = max(activities, key=score)
     print(
-        f"  [garmin] Best match: {best.get('activityName')} "
-        f"({best.get('activityType', {}).get('typeKey', '?')}) "
+        f"  [garmin] Fallback match: '{best.get('activityName')}' "
         f"on {best.get('startTimeLocal', '?')[:10]} "
-        f"— {(best.get('distance') or 0)/1000:.1f} km, "
-        f"↑{best.get('elevationGain', 0):.0f} m"
+        f"— {(best.get('distance') or 0)/1000:.1f} km"
     )
     return best
 
@@ -277,7 +331,13 @@ def _build_activity_stats(activity: dict, route: list[dict], laps: list[dict]) -
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def fetch_and_store(job_id: str, job_date: _date, db) -> bool:
+def fetch_and_store(
+    job_id: str,
+    job_date: _date,
+    db,
+    session_start: Optional[datetime] = None,
+    session_end:   Optional[datetime] = None,
+) -> bool:
     """
     Top-level function called by pipeline_runner after gallery publish.
     Finds the best matching Garmin activity, downloads GPX, builds
@@ -294,7 +354,10 @@ def fetch_and_store(job_id: str, job_date: _date, db) -> bool:
         search_days = int(cfg.get("search_days", 1))
         client      = _get_client()
 
-        activity = _find_best_activity(client, job_date, search_days)
+        if session_start and session_end:
+            activity = _find_activity_by_overlap(client, session_start, session_end, search_days)
+        else:
+            activity = _find_best_activity_by_date(client, job_date, search_days)
         if not activity:
             return False
 

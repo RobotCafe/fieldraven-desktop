@@ -608,20 +608,35 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     _publish_to_gallery(job_id, job_data, r2_url, gaussian_count, thumbnail_url,
                                         pipeline_mode=_pipeline_mode)
 
-                    # Auto-fetch Garmin activity for this session
+                    # Write GPS capture location from mobile job doc
+                    try:
+                        _db = firebase_client.get_db()
+                        _write_capture_location(job_id, job_data, _db)
+                    except Exception as _loc_exc:
+                        print(f"  [location] Non-fatal: {_loc_exc}")
+
+                    # Auto-fetch Garmin activity, matched by session time overlap
                     try:
                         from splatpipe_core import garmin_fetcher
-                        from datetime import date as _date_cls
-                        _db  = firebase_client.get_db()
-                        # Use the project folder's date (closest to session date)
-                        _proj_dir = job_data.get("projectDir")
-                        if _proj_dir:
-                            _session_date = _date_cls.fromtimestamp(
-                                Path(_proj_dir).stat().st_mtime
+                        from datetime import date as _date_cls, datetime as _dt
+                        if '_db' not in dir():
+                            _db = firebase_client.get_db()
+                        # Prefer exact session times from mobile job doc
+                        _session_start, _session_end = _get_session_times(job_id, job_data, _db)
+                        if _session_start and _session_end:
+                            garmin_fetcher.fetch_and_store(
+                                job_id, _session_start.date(), _db,
+                                session_start=_session_start,
+                                session_end=_session_end,
                             )
                         else:
-                            _session_date = _date_cls.today()
-                        garmin_fetcher.fetch_and_store(job_id, _session_date, _db)
+                            # Fall back to project folder date
+                            _proj_dir = job_data.get("projectDir")
+                            _fallback_date = (
+                                _date_cls.fromtimestamp(Path(_proj_dir).stat().st_mtime)
+                                if _proj_dir else _date_cls.today()
+                            )
+                            garmin_fetcher.fetch_and_store(job_id, _fallback_date, _db)
                     except Exception as _g_exc:
                         print(f"  [garmin] Non-fatal: {_g_exc}")
                 elif ply_file and not r2_client.is_configured():
@@ -765,6 +780,61 @@ def _publish_to_gallery(
         print(f"  [gallery] Published to Firestore gallery/{job_id}")
     except Exception as e:
         print(f"  [gallery] Could not publish gallery doc: {e}")
+
+
+# ── Mobile job helpers ────────────────────────────────────────────────────────
+
+def _get_mobile_job_doc(job_id: str, job_data: dict, db) -> "Optional[dict]":
+    """Fetch the mobile app job document from Firestore users/{uid}/jobs/{job_id}."""
+    from typing import Optional
+    uid = job_data.get("userId")
+    if not uid:
+        return None
+    try:
+        snap = db.collection("users").document(uid).collection("jobs").document(job_id).get()
+        return snap.to_dict() if snap.exists else None
+    except Exception as e:
+        print(f"  [mobile] Could not read job doc: {e}")
+        return None
+
+
+def _get_session_times(job_id: str, job_data: dict, db):
+    """
+    Return (start_datetime, end_datetime) from the mobile app job doc.
+    Both values are naive local datetimes, or (None, None) if unavailable.
+    """
+    from datetime import datetime
+    doc = _get_mobile_job_doc(job_id, job_data, db)
+    if not doc:
+        return None, None
+    start_ms = doc.get("startTime")
+    end_ms   = doc.get("endTime")
+    start = datetime.fromtimestamp(start_ms / 1000) if start_ms else None
+    end   = datetime.fromtimestamp(end_ms   / 1000) if end_ms   else None
+    if start and end:
+        print(f"  [mobile] Session: {start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%H:%M')}")
+    return start, end
+
+
+def _write_capture_location(job_id: str, job_data: dict, db) -> None:
+    """
+    Read gpsStart from the mobile job doc and write captureLocation to the
+    gallery/{job_id} document so the web map can show a pin.
+    """
+    doc = _get_mobile_job_doc(job_id, job_data, db)
+    if not doc:
+        return
+    gps = doc.get("gpsStart") or doc.get("gpsEnd")
+    if not gps:
+        return
+    lat = gps.get("lat")
+    lon = gps.get("lon") or gps.get("lng")
+    if lat is None or lon is None:
+        return
+    db.collection("gallery").document(job_id).update({
+        "captureLocation": {"lat": round(lat, 6), "lon": round(lon, 6)}
+    })
+    print(f"  [location] Capture pin: {lat:.4f}, {lon:.4f}")
 
 
 # ── Camera JSON export (all pipeline paths) ───────────────────────────────────
