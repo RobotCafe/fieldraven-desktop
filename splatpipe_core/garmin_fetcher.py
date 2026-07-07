@@ -218,6 +218,18 @@ def _find_best_activity_by_date(client, target_date: _date, search_days: int) ->
 
 # ── GPX parsing ───────────────────────────────────────────────────────────────
 
+def _find_cad_in_extensions(pt: ET.Element) -> Optional[int]:
+    """Extract cadence from a GPX track point's extensions (any namespace)."""
+    for ext in pt.iter():
+        local = ext.tag.split("}")[-1] if "}" in ext.tag else ext.tag
+        if local.lower() in ("cad", "cadence") and ext.text:
+            try:
+                return int(float(ext.text))
+            except ValueError:
+                pass
+    return None
+
+
 def _find_hr_in_extensions(pt: ET.Element) -> Optional[int]:
     """Extract heart rate from a GPX track point's extensions (any namespace)."""
     for ext in pt.iter():
@@ -259,18 +271,54 @@ def _parse_gpx(gpx_bytes: bytes, max_points: int = 500) -> list[dict]:
         try:
             lat = float(pt.attrib["lat"])
             lon = float(pt.attrib["lon"])
-            ele_el = pt.find(f"{{{_GPX_NS['gpx']}}}ele") or pt.find("ele")
+            # Use explicit is-not-None checks — ElementTree elements with text but
+            # no children evaluate as False in Python 3.13 (DeprecationWarning).
+            ele_el = pt.find(f"{{{_GPX_NS['gpx']}}}ele")
+            if ele_el is None:
+                ele_el = pt.find("ele")
             alt = float(ele_el.text) if ele_el is not None and ele_el.text else 0.0
             entry: dict = {"lat": round(lat, 6), "lon": round(lon, 6), "alt": round(alt, 1)}
+
+            # Time (seconds from start — needed for pace chart and crosshair sync)
+            time_el = pt.find(f"{{{_GPX_NS['gpx']}}}time")
+            if time_el is None:
+                time_el = pt.find("time")
+            if time_el is not None and time_el.text:
+                entry["_iso"] = time_el.text.strip()
+
             hr = _find_hr_in_extensions(pt)
             if hr is not None:
                 entry["hr"] = hr
+
+            # Cadence from extensions
+            cad = _find_cad_in_extensions(pt)
+            if cad is not None:
+                entry["cad"] = cad
+
             route.append(entry)
         except (KeyError, ValueError, AttributeError):
             continue
 
-    has_hr = sum(1 for p in route if "hr" in p)
-    print(f"  [garmin] GPX: {len(trkpts)} points → {len(route)} sampled ({has_hr} with HR)")
+    # Convert ISO timestamps → elapsed seconds from first point, then remove _iso
+    t0 = None
+    for p in route:
+        iso = p.pop("_iso", None)
+        if iso:
+            try:
+                from datetime import timezone as _tz
+                ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                if t0 is None:
+                    t0 = ts
+                p["t"] = round((ts - t0).total_seconds(), 1)
+            except Exception as _te:
+                if t0 is None:   # only log the first failure
+                    print(f"  [garmin] Time parse failed: {_te!r}  iso={iso!r}")
+
+    has_hr  = sum(1 for p in route if "hr" in p)
+    has_t   = sum(1 for p in route if "t" in p)
+    has_cad = sum(1 for p in route if "cad" in p)
+    print(f"  [garmin] GPX: {len(trkpts)} pts → {len(route)} sampled "
+          f"({has_hr} HR, {has_t} time, {has_cad} cad)")
     return route
 
 
