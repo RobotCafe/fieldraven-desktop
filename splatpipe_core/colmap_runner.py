@@ -545,11 +545,10 @@ def _measure_anchor_pitch(sparse_txt_dir: Path) -> float:
 
 def _generate_visualizer(colmap_dir: Path, pitch_deg: float, correction_deg: float = 0.0) -> None:
     """
-    Run visualize_cameras.py under Python 3.14 to generate cameras.html.
-
-    Uses Python 3.14 because the visualizer calls image.cam_from_world() and
-    image.has_pose — pycolmap 4.x API that doesn't exist in 3.12.4.
+    Run visualize_cameras.py under Python 3.14 to generate cameras.html,
+    then open it automatically in the default browser.
     """
+    import webbrowser
     sparse_txt = colmap_dir / "sparse_txt"
     out_html   = colmap_dir / "cameras.html"
     if not Path(_VISUALIZER).exists() or not sparse_txt.exists():
@@ -559,6 +558,9 @@ def _generate_visualizer(colmap_dir: Path, pitch_deg: float, correction_deg: flo
          str(pitch_deg), str(correction_deg)],
         check=False,  # visualizer failure must not abort the pipeline
     )
+    if out_html.exists():
+        webbrowser.open(out_html.as_uri())
+        print(f"  [colmap] Opened camera visualizer: {out_html}")
 
 
 # ── Spherical mode ────────────────────────────────────────────────────────────
