@@ -449,6 +449,13 @@ def fetch_and_store(
         return False
 
     try:
+        import garminconnect  # noqa: F401 — confirm package is available
+    except ImportError:
+        print("  [garmin] 'garminconnect' not installed in this Python — run: "
+              "py -3.13 -m pip install garminconnect")
+        return False
+
+    try:
         cfg         = _load_config()
         search_days = int(cfg.get("search_days", 1))
         client      = _get_client()
