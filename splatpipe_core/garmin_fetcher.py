@@ -113,10 +113,22 @@ def _find_best_activity(client, target_date: _date, search_days: int) -> Optiona
 
 # ── GPX parsing ───────────────────────────────────────────────────────────────
 
+def _find_hr_in_extensions(pt: ET.Element) -> Optional[int]:
+    """Extract heart rate from a GPX track point's extensions (any namespace)."""
+    for ext in pt.iter():
+        local = ext.tag.split("}")[-1] if "}" in ext.tag else ext.tag
+        if local.lower() == "hr" and ext.text:
+            try:
+                return int(float(ext.text))
+            except ValueError:
+                pass
+    return None
+
+
 def _parse_gpx(gpx_bytes: bytes, max_points: int = 500) -> list[dict]:
     """
-    Parse GPX XML → list of {lat, lon, alt} dicts, subsampled to max_points.
-    Handles both GPX 1.0 and 1.1 namespaces.
+    Parse GPX XML → list of {lat, lon, alt, hr?} dicts, subsampled to max_points.
+    Handles both GPX 1.0 and 1.1 namespaces. Extracts HR from extensions when present.
     """
     try:
         root = ET.fromstring(gpx_bytes)
@@ -124,7 +136,6 @@ def _parse_gpx(gpx_bytes: bytes, max_points: int = 500) -> list[dict]:
         print(f"  [garmin] GPX parse error: {e}")
         return []
 
-    # Try both namespace variants
     trkpts: list[ET.Element] = []
     for ns in (_GPX_NS["gpx"], ""):
         prefix = f"{{{ns}}}" if ns else ""
@@ -145,40 +156,82 @@ def _parse_gpx(gpx_bytes: bytes, max_points: int = 500) -> list[dict]:
             lon = float(pt.attrib["lon"])
             ele_el = pt.find(f"{{{_GPX_NS['gpx']}}}ele") or pt.find("ele")
             alt = float(ele_el.text) if ele_el is not None and ele_el.text else 0.0
-            route.append({"lat": round(lat, 6), "lon": round(lon, 6), "alt": round(alt, 1)})
+            entry: dict = {"lat": round(lat, 6), "lon": round(lon, 6), "alt": round(alt, 1)}
+            hr = _find_hr_in_extensions(pt)
+            if hr is not None:
+                entry["hr"] = hr
+            route.append(entry)
         except (KeyError, ValueError, AttributeError):
             continue
 
-    print(f"  [garmin] GPX: {len(trkpts)} points → {len(route)} sampled")
+    has_hr = sum(1 for p in route if "hr" in p)
+    print(f"  [garmin] GPX: {len(trkpts)} points → {len(route)} sampled ({has_hr} with HR)")
     return route
+
+
+def _fmt_pace(sec_per_km: float) -> str:
+    """Convert seconds-per-km to MM:SS string."""
+    m = int(sec_per_km) // 60
+    s = int(sec_per_km) % 60
+    return f"{m}:{s:02d}"
+
+
+def _parse_laps(activity_details: dict) -> list[dict]:
+    """Extract lap data from full activity details dict."""
+    raw_laps = activity_details.get("laps") or []
+    laps = []
+    for i, lap in enumerate(raw_laps, 1):
+        dist_m   = lap.get("distance") or 0
+        dist_km  = dist_m / 1000
+        dur_sec  = int(lap.get("elapsedDuration") or lap.get("duration") or 0)
+        asc      = lap.get("totalAscent")
+        desc     = lap.get("totalDescent")
+        avg_hr   = lap.get("averageHR")
+        max_hr   = lap.get("maxHR")
+        cad      = lap.get("averageCadence")
+        cal      = lap.get("calories")
+
+        entry: dict = {
+            "index":       i,
+            "durationSec": dur_sec,
+            "distanceKm":  round(dist_km, 2),
+        }
+        if avg_hr is not None:   entry["avgHR"]        = int(avg_hr)
+        if max_hr is not None:   entry["maxHR"]        = int(max_hr)
+        if asc    is not None:   entry["totalAscentM"]  = round(asc, 0)
+        if desc   is not None:   entry["totalDescentM"] = round(desc, 0)
+        if cad    is not None:   entry["avgCadence"]    = int(cad)
+        if cal    is not None:   entry["calories"]      = int(cal)
+        if dist_km > 0 and dur_sec > 0:
+            entry["avgPace"] = _fmt_pace(dur_sec / dist_km)
+
+        laps.append(entry)
+    return laps
 
 
 # ── Stats builder ─────────────────────────────────────────────────────────────
 
-def _build_activity_stats(activity: dict, route: list[dict]) -> dict:
-    """Convert a Garmin activity dict + route into the ActivityStats schema."""
+def _build_activity_stats(activity: dict, route: list[dict], laps: list[dict]) -> dict:
+    """Convert a Garmin activity dict + route + laps into the ActivityStats schema."""
 
     alts = [p["alt"] for p in route if p["alt"] != 0]
 
-    # Elevation gain/loss — prefer Garmin's computed values, fall back to
-    # computing from track deltas if Garmin returns None
     gain = activity.get("elevationGain")
     loss = activity.get("elevationLoss")
-
     if gain is None and alts:
         deltas = [alts[i+1] - alts[i] for i in range(len(alts)-1)]
         gain = sum(d for d in deltas if d > 0)
         loss = abs(sum(d for d in deltas if d < 0))
 
     activity_type_map = {
-        "hiking":        "Hike",
-        "trail_running": "Trail Run",
-        "running":       "Run",
-        "cycling":       "Ride",
+        "hiking":          "Hike",
+        "trail_running":   "Trail Run",
+        "running":         "Run",
+        "cycling":         "Ride",
         "mountain_biking": "MTB",
-        "swimming":      "Swim",
-        "kayaking":      "Kayak",
-        "walking":       "Walk",
+        "swimming":        "Swim",
+        "kayaking":        "Kayak",
+        "walking":         "Walk",
     }
     type_key    = (activity.get("activityType") or {}).get("typeKey", "")
     pretty_type = activity_type_map.get(type_key, type_key.replace("_", " ").title() or "Activity")
@@ -189,19 +242,37 @@ def _build_activity_stats(activity: dict, route: list[dict]) -> dict:
     except ValueError:
         start_iso = start_raw
 
-    return {
-        "activityName":    activity.get("activityName", "Untitled"),
-        "activityType":    pretty_type,
-        "startDate":       start_iso,
-        "distanceKm":      round((activity.get("distance") or 0) / 1000, 2),
-        "elevationGainM":  round(gain or 0, 1),
-        "elevationLossM":  round(loss or 0, 1),
-        "durationSec":     int(activity.get("elapsedDuration") or activity.get("duration") or 0),
-        "movingTimeSec":   int(activity.get("movingDuration") or activity.get("duration") or 0),
-        "maxElevationM":   round(max(alts), 1) if alts else 0,
-        "minElevationM":   round(min(alts), 1) if alts else 0,
-        "route":           route,
+    dist_km  = round((activity.get("distance") or 0) / 1000, 2)
+    dur_sec  = int(activity.get("elapsedDuration") or activity.get("duration") or 0)
+    move_sec = int(activity.get("movingDuration") or activity.get("duration") or 0)
+
+    stats: dict = {
+        "activityName":   activity.get("activityName", "Untitled"),
+        "activityType":   pretty_type,
+        "startDate":      start_iso,
+        "distanceKm":     dist_km,
+        "elevationGainM": round(gain or 0, 1),
+        "elevationLossM": round(loss or 0, 1),
+        "durationSec":    dur_sec,
+        "movingTimeSec":  move_sec,
+        "maxElevationM":  round(max(alts), 1) if alts else 0,
+        "minElevationM":  round(min(alts), 1) if alts else 0,
+        "route":          route,
     }
+
+    # Optional extended fields
+    avg_hr = activity.get("averageHR")
+    max_hr = activity.get("maxHR")
+    cal    = activity.get("calories")
+    if avg_hr is not None:  stats["avgHR"]    = int(avg_hr)
+    if max_hr is not None:  stats["maxHR"]    = int(max_hr)
+    if cal    is not None:  stats["calories"] = int(cal)
+    if dist_km > 0 and move_sec > 0:
+        stats["avgPace"] = _fmt_pace(move_sec / dist_km)
+    if laps:
+        stats["laps"] = laps
+
+    return stats
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -229,7 +300,7 @@ def fetch_and_store(job_id: str, job_date: _date, db) -> bool:
 
         activity_id = activity["activityId"]
 
-        # Download GPX
+        # Download GPX (track + HR)
         print(f"  [garmin] Downloading GPX for activity {activity_id}…")
         from garminconnect import Garmin
         gpx_bytes = client.download_activity(
@@ -237,7 +308,17 @@ def fetch_and_store(job_id: str, job_date: _date, db) -> bool:
         )
         route = _parse_gpx(gpx_bytes)
 
-        stats = _build_activity_stats(activity, route)
+        # Fetch full activity details for laps + HR summary
+        print(f"  [garmin] Fetching activity details for laps…")
+        try:
+            details = client.get_activity(activity_id)
+            laps = _parse_laps(details)
+            print(f"  [garmin] {len(laps)} laps parsed")
+        except Exception as e:
+            print(f"  [garmin] Could not fetch laps: {e}")
+            laps = []
+
+        stats = _build_activity_stats(activity, route, laps)
 
         # Write to Firestore
         db.collection("gallery").document(job_id).update({
