@@ -154,7 +154,7 @@ _DEFAULTS: dict[str, str] = {
     "insp_lens_guard":   "none",
     "insp_flowstate":    "True",
     "insp_cuda":         "True",
-    "insp_output_width": "5984",  # half of native 11968 — 4x faster, still 6K
+    "insp_output_width": "11968",  # native 12K — matches 72MP capture resolution
     "insp_workers":      "2",
     # Paths
     "ffmpeg_path":        "",

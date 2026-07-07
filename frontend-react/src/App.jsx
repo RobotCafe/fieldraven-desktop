@@ -2013,7 +2013,7 @@ const defaultSettings = {
   brushRerun:false, brushViewer:false,
   ffmpeg:"", rs:"", postshot:"", brush:"", rsSettings:"", vggt:"", colmapBin:"",
   inspStitchType:"ai", inspLensGuard:"none", inspFlowState:true, inspCuda:true,
-  inspOutputWidth:"5984", inspWorkers:"2",
+  inspOutputWidth:"11968", inspWorkers:"2",
   projectDir:"",
 };
 
