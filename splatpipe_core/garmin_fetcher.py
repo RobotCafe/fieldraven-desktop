@@ -47,31 +47,52 @@ def _load_config() -> dict:
 
 # ── Authentication ────────────────────────────────────────────────────────────
 
-def _get_client():
-    """Return an authenticated Garmin client, using cached tokens when possible."""
+def _token_file_for(email: str) -> Path:
+    safe = email.replace("@", "_at_").replace(".", "_")
+    return _TOKEN_DIR / f"{safe}.json"
+
+
+def _get_client(prompt_mfa=None):
+    """
+    Return an authenticated Garmin client (garminconnect 0.3.x API).
+
+    Token storage uses api.client.dumps() / login(tokenstore=json_string).
+    prompt_mfa is a constructor arg: Garmin(..., prompt_mfa=callback).
+    Pipeline runs with prompt_mfa=None — if no cached token, Garmin fetch
+    is skipped gracefully. Run scripts/setup_garmin.py once to cache tokens.
+    """
     from garminconnect import Garmin
 
     cfg        = _load_config()
     email      = cfg["email"]
     password   = cfg["password"]
-    token_file = _TOKEN_DIR / f"{email.replace('@', '_').replace('.', '_')}.json"
+    token_file = _token_file_for(email)
 
     _TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
-    client = Garmin(email=email, password=password)
-
+    # Try cached token — login() handles expiry/refresh automatically
     if token_file.exists():
         try:
-            client.garth.loads(token_file.read_text(encoding="utf-8"))
-            client.display_name  # lightweight API call to validate token
-            print("  [garmin] Using cached token")
-            return client
-        except Exception:
-            print("  [garmin] Cached token invalid — re-authenticating")
+            client = Garmin(email=email, password=password)
+            result = client.login(tokenstore=token_file.read_text(encoding="utf-8"))
+            if result[0] is None:  # (None, None) = clean login, no MFA needed
+                print(f"  [garmin] Token valid — {client.full_name or email}")
+                # Refresh serialized token in case it was silently rotated
+                token_file.write_text(client.client.dumps(), encoding="utf-8")
+                return client
+        except Exception as e:
+            print(f"  [garmin] Cached token invalid ({e}) — re-authenticating")
 
+    # Fresh login (only works interactively if MFA is required)
+    if prompt_mfa is None:
+        raise RuntimeError(
+            "No cached Garmin token. Run scripts/setup_garmin.py once to authenticate."
+        )
+
+    client = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
     client.login()
-    token_file.write_text(client.garth.dumps(), encoding="utf-8")
-    print(f"  [garmin] Authenticated as {email}, token cached")
+    token_file.write_text(client.client.dumps(), encoding="utf-8")
+    print(f"  [garmin] Authenticated as {client.full_name or email}, token cached")
     return client
 
 
