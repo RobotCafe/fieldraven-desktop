@@ -489,11 +489,28 @@ def fetch_and_store(
 
         stats = _build_activity_stats(activity, route, laps)
 
-        # Write to Firestore
-        db.collection("gallery").document(job_id).update({
-            "stravaActivityId": activity_id,  # reuse same field as Strava plan
+        # Build Firestore update
+        update: dict = {
+            "stravaActivityId": activity_id,
             "activityStats":    stats,
-        })
+        }
+
+        # If the gallery doc has no captureLocation, use the first route point
+        # as a fallback (covers cases where mobile GPS wasn't written during publish).
+        try:
+            gallery_snap = db.collection("gallery").document(job_id).get()
+            if gallery_snap.exists and not gallery_snap.to_dict().get("captureLocation"):
+                if route:
+                    update["captureLocation"] = {
+                        "lat": route[0]["lat"],
+                        "lon": route[0]["lon"],
+                    }
+                    print(f"  [garmin] captureLocation set from route start: "
+                          f"{route[0]['lat']:.5f}, {route[0]['lon']:.5f}")
+        except Exception:
+            pass
+
+        db.collection("gallery").document(job_id).update(update)
         print(
             f"  [garmin] ✅ Activity stored: {stats['activityName']} "
             f"({stats['distanceKm']} km, ↑{stats['elevationGainM']} m, "
