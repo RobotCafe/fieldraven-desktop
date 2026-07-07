@@ -47,3 +47,6 @@ scripts/spark-repo/
 # Spec / debug docs
 *_Spec.md
 *_DEBUG.md
+
+# CUDA autotune / build artifacts
+target/
