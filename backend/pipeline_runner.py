@@ -418,13 +418,13 @@ def _stitch_insp_files(job_id: str, cancel_event: threading.Event, job_data: Opt
 
 def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
     try:
-        queue_manager.update_job_progress(job_id, 1, "Initialising pipeline…")
+        queue_manager.update_job_progress(job_id, 1, "Initialising pipeline…", milestone=True)
 
         # Stitch any .insp files to equirectangular JPEGs before the pipeline runs
         input_dir = _input_dir(_job_root(job_id, job_data))
         insp_count = len(list(input_dir.glob("*.insp"))) if input_dir.exists() else 0
         if insp_count:
-            queue_manager.update_job_progress(job_id, 3, f"Found {insp_count} Insta360 files — stitching…")
+            queue_manager.update_job_progress(job_id, 3, f"Found {insp_count} Insta360 files — stitching…", milestone=True)
             stitched = _stitch_insp_files(job_id, cancel_event, job_data)
             if cancel_event.is_set():
                 queue_manager.fail_job(job_id, "Cancelled by user")
@@ -432,7 +432,7 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             if stitched == 0:
                 queue_manager.fail_job(job_id, "Stitch step produced no output — check MediaSDK setup")
                 return
-            queue_manager.update_job_progress(job_id, 45, f"Stitched {stitched}/{insp_count} files")
+            queue_manager.update_job_progress(job_id, 45, f"Stitched {stitched}/{insp_count} files", milestone=True)
             proj_root = _job_root(job_id, job_data)
             _write_stage_progress(proj_root, "import", {"stitched": stitched, "total": insp_count})
 
@@ -522,12 +522,15 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             stage_map = _STAGE_RANGE_POST_STITCH if insp_count else _STAGE_RANGE
             print(f"  → Stage map: VGGT {'(post-stitch)' if insp_count else '(direct)'}")
 
+        _last_stage = [None]  # mutable cell for closure
+
         def on_progress(sp):
             lo, hi = stage_map.get(sp.stage.value, (0, 97))
             overall = int(lo + (sp.progress / 100) * (hi - lo))
+            print(f"  [{sp.stage.value}] {sp.progress}% — {sp.message[:120]}")
             print(f"  → {sp.stage.value} {sp.progress}% → overall {overall}% [{lo}–{hi}]")
             _mode = ("rs_brush"    if use_rs_brush
-                     else "rs_brush" if use_rs_postshot   # reuse rs_brush mode tag for now
+                     else "rs_brush" if use_rs_postshot
                      else "colmap"   if use_colmap
                      else "gluemap"  if use_gluemap
                      else "vggt")
@@ -535,9 +538,15 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                 "currentStage": sp.stage.value,
                 "pipelineMode": _mode,
             }
+            # Write to Firestore only when the stage changes (milestone).
+            # All other progress ticks update in-memory only — no Firebase I/O.
+            stage_changed = sp.stage.value != _last_stage[0]
+            if stage_changed:
+                _last_stage[0] = sp.stage.value
             queue_manager.update_job_progress(
                 job_id, overall, sp.message[:200],
                 extra=extra,
+                milestone=stage_changed,
             )
 
         start_from = (job_data.get("_ui_settings") or {}).get("start_from", "")
