@@ -73,7 +73,7 @@ def _get_client(prompt_mfa=None):
 
     cfg        = _load_config()
     email      = cfg["email"]
-    password   = cfg["password"]
+    password   = cfg.get("password", "")   # empty once scrubbed after first login
     token_file = _token_file_for(email)
 
     _TOKEN_DIR.mkdir(parents=True, exist_ok=True)
