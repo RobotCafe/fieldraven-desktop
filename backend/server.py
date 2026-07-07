@@ -32,6 +32,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fieldraven")
 
+# Suppress uvicorn access-log noise for high-frequency polling endpoints.
+# These hit in-memory state and produce no useful diagnostic information
+# during a pipeline run — only clutter the console.
+class _SuppressPollingLogs(logging.Filter):
+    _QUIET = frozenset([
+        "/api/jobs/queue", "/api/camera/status",
+        "/api/health", "/api/machine/status",
+    ])
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "/api/jobs/" in msg and "/status" in msg:
+            return False
+        return not any(ep in msg for ep in self._QUIET)
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressPollingLogs())
+
 # Tee print() to the log file too, so all existing print statements are captured
 class _LogTee:
     """Writes to both the original stream and the log file."""
