@@ -215,6 +215,7 @@ const API_TO_UI = {
   vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
   export_xmp:'exportXmp', gps_priors_rs:'gpsTriggersRS', gps_priors_colmap:'gpsPriorsColmap',
   run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign', colmap_mapper:'colmapMapper', colmap_vocab_tree:'colmapVocabTree',
+  run_gluemap:'runGluemap', gluemap_backbone:'glueMapBackbone', gluemap_skip_doppelgangers:'glueMapSkipDg', gluemap_coarse_only:'glueMapCoarseOnly', gluemap_is_sequential:'glueMapSequential', gluemap_num_neighbors:'glueMapNeighbors', gluemap_batch_size:'glueMapBatchSize', gluemap_num_track_per_img:'glueMapNumTrack', gluemap_wsl_home:'glueMapWslHome', gluemap_wsl_distro:'glueMapWslDistro',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -231,8 +232,8 @@ const API_TO_UI = {
 };
 
 function parseApiVal(v) {
-  if (v === 'True')  return true;
-  if (v === 'False') return false;
+  if (v === 'True'  || v === 'true')  return true;
+  if (v === 'False' || v === 'false') return false;
   const n = Number(v);
   return (!isNaN(n) && v !== '') ? n : v;
 }
@@ -242,7 +243,8 @@ const STRING_SETTINGS = new Set(['pitchAngles', 'vggtMode', 'postshotProfile',
   'extractionMethod', 'intervalUnit', 'frameFormat', 'ffmpeg', 'rs', 'postshot',
   'brush', 'rsSettings', 'vggt', 'colmapBin', 'inspStitchType', 'inspLensGuard',
   'inspOutputWidth', 'inspWorkers', 'colmapMode', 'colmapMatcher',
-  'colmapMapper', 'colmapVocabTree']);
+  'colmapMapper', 'colmapVocabTree',
+  'glueMapBackbone', 'glueMapWslHome', 'glueMapWslDistro']);
 
 function apiConfigToSettings(cfg) {
   const out = {};
@@ -1275,21 +1277,26 @@ function AlignmentTab({ settings, setSettings }) {
   const { runPostshot, runBrush } = settings;
 
   // Derive a single active mode from the underlying flags
-  const mode = settings.runColmap ? 'colmap' : (settings.runVggt ? 'vggt' : 'rs');
+  const mode = settings.runColmap ? 'colmap'
+             : settings.runGluemap ? 'gluemap'
+             : settings.runVggt    ? 'vggt'
+             : 'rs';
 
   const setMode = (m) => setSettings(s => ({
     ...s,
-    skipRS:    m !== 'rs',
-    runVggt:   m === 'vggt',
-    runColmap: m === 'colmap',
-    // Brush only makes sense after COLMAP or RS; clear it for VGGT
+    skipRS:     m !== 'rs',
+    runVggt:    m === 'vggt',
+    runColmap:  m === 'colmap',
+    runGluemap: m === 'gluemap',
+    // Brush available after RS, COLMAP, GlueMap; not after VGGT
     runBrush: m === 'vggt' ? false : s.runBrush,
   }));
 
   const MODES = [
-    { id:'rs',     label:'RealityScan', desc:'Epic photogrammetry — high accuracy, requires RS licence' },
-    { id:'colmap', label:'COLMAP',      desc:'Open-source SfM — no licence required, needs COLMAP binary' },
-    { id:'vggt',   label:'VGGT',        desc:'AI pose estimation — GPU-based, fastest for small captures' },
+    { id:'rs',      label:'RealityScan', desc:'Epic photogrammetry — high accuracy, requires RS licence' },
+    { id:'colmap',  label:'COLMAP',      desc:'Open-source SfM — no licence required, needs COLMAP binary' },
+    { id:'vggt',    label:'VGGT',        desc:'AI pose estimation — GPU-based, fastest for small captures' },
+    { id:'gluemap', label:'GlueMap',     desc:'Global SfM + neural backbone (Pi3/VGGT) via WSL2 — best quality' },
   ];
 
   return (
@@ -1318,7 +1325,7 @@ function AlignmentTab({ settings, setSettings }) {
         {/* ── RealityScan options ───────────────────────────────── */}
         {mode === 'rs' && (
           <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-            <Toggle checked={settings.exportXmp} label="Rig-Aware XMP (inject rig geometry into RS)"
+            <Toggle checked={!!settings.exportXmp} label="Rig-Aware XMP (inject rig geometry into RS)"
               onChange={v=>setSettings(s=>({...s,exportXmp:v}))} />
             {settings.exportXmp && (
               <div style={{ paddingLeft:12, borderLeft:`2px solid ${T.border}` }}>
@@ -1399,6 +1406,58 @@ function AlignmentTab({ settings, setSettings }) {
           </div>
         )}
 
+        {/* ── GlueMap options ───────────────────────────────────── */}
+        {mode === 'gluemap' && (
+          <div>
+            <Accordion title="GlueMap Options" defaultOpen={false}>
+              <FieldRow label="Backbone">
+                <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                  {['pi3','pi3x','vggt','map_anything'].map(b => (
+                    <Radio key={b} value={b} checked={settings.glueMapBackbone===b}
+                      onChange={v=>setSettings(s=>({...s,glueMapBackbone:v}))} label={b} />
+                  ))}
+                </div>
+              </FieldRow>
+              <FieldRow label="Neighbours">
+                <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                  <input type="range" min={20} max={200} step={10} value={settings.glueMapNeighbors}
+                    onChange={e=>setSettings(s=>({...s,glueMapNeighbors:+e.target.value}))}
+                    style={{ flex:1, accentColor:T.amber }} />
+                  <span style={{ fontSize:10, color:T.textDim, width:28 }}>{settings.glueMapNeighbors}</span>
+                </div>
+              </FieldRow>
+              <FieldRow label="Batch Size">
+                <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                  <input type="range" min={10} max={120} step={10} value={settings.glueMapBatchSize}
+                    onChange={e=>setSettings(s=>({...s,glueMapBatchSize:+e.target.value}))}
+                    style={{ flex:1, accentColor:T.amber }} />
+                  <span style={{ fontSize:10, color:T.textDim, width:28 }}>{settings.glueMapBatchSize}</span>
+                </div>
+                <div style={{ fontSize:9, color:T.textDim, marginTop:2 }}>Two-view inference batch (default 30; try 60 on 16GB VRAM)</div>
+              </FieldRow>
+              <FieldRow label="Tracks / Image">
+                <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                  <input type="range" min={128} max={2048} step={128} value={settings.glueMapNumTrack}
+                    onChange={e=>setSettings(s=>({...s,glueMapNumTrack:+e.target.value}))}
+                    style={{ flex:1, accentColor:T.amber }} />
+                  <span style={{ fontSize:10, color:T.textDim, width:36 }}>{settings.glueMapNumTrack}</span>
+                </div>
+                <div style={{ fontSize:9, color:T.textDim, marginTop:2 }}>VGGSfM tracks per image (default 1024; 512 halves tracking time)</div>
+              </FieldRow>
+              <div style={{ display:'flex', flexWrap:'wrap', gap:10, marginTop:6 }}>
+                {[
+                  ['glueMapSkipDg',    'Skip Doppelgangers (faster)'],
+                  ['glueMapSequential','Sequential / Video mode'],
+                  ['glueMapCoarseOnly','Coarse only (skip SIFT refinement)'],
+                ].map(([k,l]) => (
+                  <Toggle key={k} checked={!!settings[k]} label={l}
+                    onChange={v=>setSettings(s=>({...s,[k]:v}))} />
+                ))}
+              </div>
+            </Accordion>
+          </div>
+        )}
+
         {/* ── VGGT options ──────────────────────────────────────── */}
         {mode === 'vggt' && (
           <div>
@@ -1422,7 +1481,7 @@ function AlignmentTab({ settings, setSettings }) {
               <div style={{ display:"flex", flexWrap:"wrap", gap:10, marginTop:6 }}>
                 {[["vggtMaskSky","Filter Sky"],["vggtShowCam","Show Camera Frustums"],
                   ["vggtTemporal","Temporal Sequencing"],["vggtAnchorRig","Anchor+Rig Mode"]].map(([k,l])=>(
-                  <Toggle key={k} checked={settings[k]} label={l}
+                  <Toggle key={k} checked={!!settings[k]} label={l}
                     onChange={v=>setSettings(s=>({...s,[k]:v}))} />
                 ))}
               </div>
@@ -1444,11 +1503,16 @@ function AlignmentTab({ settings, setSettings }) {
         <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
           <Toggle checked={runPostshot} label="Run Postshot Training"
             onChange={v=>setSettings(s=>({...s,runPostshot:v}))} />
+          {runPostshot && (
+            <div style={{ fontSize:10, color:T.clay, paddingLeft:4 }}>
+              ⚠ Requires PostShot Studio licence — hobby accounts cannot use the CLI.
+            </div>
+          )}
           <Toggle checked={runBrush} label="Run Brush Training"
             disabled={mode === 'vggt'}
             onChange={v=>setSettings(s=>({...s,runBrush:v}))} />
           {mode === 'vggt' && (
-            <div style={{ color:T.textDim, fontSize:10 }}>Brush training uses COLMAP/RS output — not available in VGGT mode.</div>
+            <div style={{ color:T.textDim, fontSize:10 }}>Brush training uses COLMAP/RS/GlueMap output — not available in VGGT mode.</div>
           )}
         </div>
       </Accordion>
@@ -1456,9 +1520,10 @@ function AlignmentTab({ settings, setSettings }) {
       {/* ── Pipeline summary ─────────────────────────────────────── */}
       <Accordion title="Pipeline Summary" accent={T.live}>
         <div style={{ fontFamily:"monospace", fontSize:11, color:T.textSec, lineHeight:1.8 }}>
-          {mode === 'rs'     && `RealityScan alignment${settings.exportXmp?' + XMP rig priors':''}`}
-          {mode === 'colmap' && `COLMAP ${settings.colmapMode} (${settings.colmapMatcher} matcher)`}
-          {mode === 'vggt'   && `VGGT ${settings.vggtMode} pose estimation`}
+          {mode === 'rs'      && `RealityScan alignment${settings.exportXmp?' + XMP rig priors':''}`}
+          {mode === 'colmap'  && `COLMAP ${settings.colmapMode} (${settings.colmapMatcher} matcher)`}
+          {mode === 'vggt'    && `VGGT ${settings.vggtMode} pose estimation`}
+          {mode === 'gluemap' && `GlueMap (${settings.glueMapBackbone} backbone, ${settings.glueMapNeighbors} neighbours${settings.glueMapSkipDg?', skip-dg':''})`}
           {'\n'}
           {[runPostshot&&'→ Postshot training', runBrush&&'→ Brush training'].filter(Boolean).join('\n') || (mode==='vggt'?'':'→ Alignment only (no training selected)')}
         </div>
@@ -1472,6 +1537,10 @@ function PostshotTab({ settings, setSettings }) {
   const S = k => ({ value:settings[k], onChange:v=>setSettings(s=>({...s,[k]:v})) });
   return (
     <div style={{ overflowY:"auto", height:"100%" }}>
+      <div style={{ background:'rgba(196,98,45,0.12)', border:'1px solid rgba(196,98,45,0.4)', borderRadius:8, padding:'10px 12px', marginBottom:12 }}>
+        <span style={{ color:T.clay, fontWeight:700, fontSize:12 }}>⚠ Studio License Required</span>
+        <p style={{ color:T.fog, fontSize:11, margin:'4px 0 0' }}>The PostShot CLI requires a PostShot Studio subscription. Hobby accounts cannot run PostShot from the command line — use Brush training instead.</p>
+      </div>
       <FieldRow label="Profile">
         <Select {...S("postshotProfile")} options={["Splat MCMC","Splat3","Splat ADC"]} />
       </FieldRow>
@@ -1491,7 +1560,7 @@ function PostshotTab({ settings, setSettings }) {
             ["postshotContext","Store Context"],["postshotPly","Export PLY"],
             ["postshotAlpha","Zero Alpha Mask"],["postshotSky","Sky Model"]]
             .map(([k,l])=>(
-            <Toggle key={k} checked={settings[k]} label={l}
+            <Toggle key={k} checked={!!settings[k]} label={l}
               onChange={v=>setSettings(s=>({...s,[k]:v}))} />
           ))}
         </div>
@@ -1515,7 +1584,7 @@ function BrushTab({ settings, setSettings }) {
       <div style={{ marginTop:10 }}>
         <SectionHead>Options</SectionHead>
         <div style={{ display:"flex", gap:20, flexWrap:"wrap" }}>
-          <Toggle checked={settings.brushRerun} label="Rerun.io Logging"
+          <Toggle checked={!!settings.brushRerun} label="Rerun.io Logging"
             onChange={v=>setSettings(s=>({...s,brushRerun:v}))} />
           <Toggle checked={settings.brushViewer} label="Spawn Viewer"
             onChange={v=>setSettings(s=>({...s,brushViewer:v}))} />
@@ -1534,6 +1603,8 @@ function ConfigTab({ settings, setSettings, machineInfo, onSaveConfig }) {
     ["rsSettings","RS Settings Folder"],["vggt","VGGT Project"],
     ["colmapBin","COLMAP Binary (.exe)"],
     ["colmapVocabTree","Vocab Tree (.bin) — loop closure"],
+    ["glueMapWslHome","GlueMap WSL2 Home (e.g. /home/decosson)"],
+    ["glueMapWslDistro","GlueMap WSL2 Distro (e.g. Ubuntu-22.04)"],
   ];
   return (
     <div style={{ overflowY:"auto", height:"100%" }}>
@@ -1634,11 +1705,18 @@ function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected
 // ─── Active Job Tab ───────────────────────────────────────────────────────────
 const _STAGES_VGGT     = { labels:['Frames','Views','Align','COLMAP'],
   keys:['frame_extraction','view_extraction','vggt_alignment','colmap_export'] };
-const _STAGES_RS_BRUSH = { labels:['Frames','Views','Align','Brush'],
+const _STAGES_RS_BRUSH = { labels:['Frames','Views','RS','Brush'],
   keys:['frame_extraction','view_extraction','realityscan','brush_training'] };
+const _STAGES_COLMAP   = { labels:['Frames','Views','COLMAP','Brush'],
+  keys:['frame_extraction','view_extraction','colmap_alignment','brush_training'] };
+const _STAGES_GLUEMAP  = { labels:['Frames','Views','GlueMap','Brush'],
+  keys:['frame_extraction','view_extraction','gluemap_alignment','brush_training'] };
 
 function ActiveJobTab({ currentJob, progress, statusMsg, logs, currentStage, pipelineMode }) {
-  const stageDef = pipelineMode === 'rs_brush' ? _STAGES_RS_BRUSH : _STAGES_VGGT;
+  const stageDef = pipelineMode === 'rs_brush' ? _STAGES_RS_BRUSH
+                 : pipelineMode === 'colmap'   ? _STAGES_COLMAP
+                 : pipelineMode === 'gluemap'  ? _STAGES_GLUEMAP
+                 : _STAGES_VGGT;
   const stageIdx = stageDef.keys.indexOf(currentStage);
   // Fall back to proportional mapping when stage name isn't known yet
   const activeIdx = stageIdx >= 0
@@ -1809,9 +1887,10 @@ function MenuBar({ menus }) {
 const _STAGE_LABELS = {
   import:           { label: "Import",             icon: "📷" },
   view_extraction:  { label: "View Extraction",    icon: "🖼" },
-  realityscan:      { label: "RealityScan",        icon: "📐" },
-  colmap_alignment: { label: "COLMAP Alignment",   icon: "📐" },
-  vggt_alignment:   { label: "VGGT Alignment",     icon: "🔬" },
+  realityscan:        { label: "RealityScan",        icon: "📐" },
+  colmap_alignment:   { label: "COLMAP Alignment",   icon: "📐" },
+  vggt_alignment:     { label: "VGGT Alignment",     icon: "🔬" },
+  gluemap_alignment:  { label: "GlueMap Alignment",  icon: "🗺️" },
   brush_training:   { label: "Brush Training",     icon: "🎨" },
   colmap_export:    { label: "COLMAP Export",      icon: "📦" },
 };
@@ -1926,6 +2005,7 @@ const defaultSettings = {
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
   vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false, gpsTriggersRS:false, gpsPriorsColmap:false,
   runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false, colmapMapper:"incremental", colmapVocabTree:"",
+  runGluemap:false, glueMapBackbone:"pi3", glueMapSkipDg:true, glueMapCoarseOnly:false, glueMapSequential:true, glueMapNeighbors:100, glueMapBatchSize:60, glueMapNumTrack:512, glueMapWslHome:"/home/decosson", glueMapWslDistro:"Ubuntu-22.04",
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,
@@ -2203,7 +2283,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       setCurrentJobId(r.jobId);
       setProgress(0);
       setCurrentStage('');
-      const _mode = settings.runColmap ? 'colmap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+      const _mode = settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
       setPipelineMode(_mode);
       setStatusMsg(`Resuming from ${startFrom || 'beginning'}`);
       addLog(`Pipeline resumed — jobId: ${r.jobId}`);
@@ -2435,7 +2515,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         setCurrentJobId(selected.id);
         setProgress(0);
         setCurrentStage('');
-        const _mode = settings.runColmap ? 'colmap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+        const _mode = settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
         setPipelineMode(_mode);
         setStatusMsg('Pipeline started');
         addLog('Pipeline running');

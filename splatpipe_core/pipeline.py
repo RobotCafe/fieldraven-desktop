@@ -138,9 +138,19 @@ def _run_realityscan(
         "-addFolder", str(views_dir),
         "-align",
         "-save", project_file,
-        "-exportRegistration", colmap_txt, colmap_xml,
-        "-quit",
     ]
+    # RS supports one -exportRegistration at a time — choose based on training target.
+    # Brush needs COLMAP text format; PostShot needs registration.csv + pointcloud.ply.
+    if settings.run_brush:
+        command += ["-exportRegistration", colmap_txt, colmap_xml]
+    if getattr(settings, "run_postshot", False):
+        reg_xml = rs_settings / "360_pipe_reg.xml"
+        ply_xml = rs_settings / "360_pipe_ply.xml"
+        if reg_xml.exists():
+            command += ["-exportRegistration", str(views_dir / "registration.csv"), str(reg_xml)]
+        if ply_xml.exists():
+            command += ["-export", str(views_dir / "pointcloud.ply"), str(ply_xml)]
+    command.append("-quit")
 
     report(PipelineStage.REALITYSCAN, 0,
            f"Starting RealityScan alignment ({views_dir.name})…")
@@ -170,6 +180,122 @@ def _run_realityscan(
     rc = process.wait()
     if rc != 0:
         raise RuntimeError(f"RealityScan exited with code {rc}")
+    return True
+
+
+# ── PostShot training stage ───────────────────────────────────
+
+def _run_postshot_training(
+    ps_input: Path,
+    training_dir: Path,
+    settings: PipelineSettings,
+    report,
+    cancel_event: threading.Event,
+) -> bool:
+    """
+    Launch PostShot Trainer (postshot-cli.exe train).
+
+    ps_input  — directory PostShot reads from:
+                 RS mode:           views_dir  (contains registration.csv + pointcloud.ply)
+                 COLMAP/GlueMap/VGGT: postshot_input/ (COLMAP files + images/)
+    training_dir — where the .psht and .ply output files are written.
+    """
+    import queue as _queue
+
+    if not settings.postshot_path:
+        raise RuntimeError("postshot_path is not configured — set PostShot path in Settings")
+    ps_exe = Path(settings.postshot_path)
+    if not ps_exe.exists():
+        raise FileNotFoundError(f"PostShot not found: {ps_exe}")
+    if not ps_input.exists():
+        raise FileNotFoundError(f"PostShot input directory not found: {ps_input}")
+
+    project_name = training_dir.parent.name
+    output_file  = training_dir / f"{project_name}_postshot.psht"
+
+    command = [
+        str(ps_exe), "train",
+        "--import",            str(ps_input),
+        "--output",            str(output_file),
+        "--gpu",               "0",
+        "--profile",           settings.postshot_profile,
+        "--max-image-size",    str(settings.postshot_max_image_size),
+        "--train-steps-limit", str(settings.postshot_train_steps * 1000),
+        "--max-num-splats",    str(settings.postshot_max_splats * 1000),
+    ]
+    if settings.postshot_anti_aliasing:
+        command.append("--anti-aliasing=true")
+    if settings.postshot_show_train_error:
+        command.append("--show-train-error")
+    if settings.postshot_store_context:
+        command.append("--store-training-context")
+    if settings.postshot_alpha_mask:
+        command.append("--treat-zero-alpha-as-mask=true")
+    if settings.postshot_sky_model:
+        command.append("--create-sky-model")
+    if settings.postshot_export_ply:
+        ply_file = training_dir / f"{project_name}_postshot.ply"
+        command += ["--export-splat", str(ply_file)]   # --export-splat-ply deprecated in v1.0.110+
+
+    report(PipelineStage.POSTSHOT_TRAINING, 0,
+           f"Starting PostShot training (profile={settings.postshot_profile}, input={ps_input.name})…")
+    print(f"  [postshot_training] CMD: {' '.join(command)}")
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        creationflags=_WIN_NO_WINDOW,
+        cwd=str(training_dir),
+    )
+
+    stdout_q = _queue.Queue()
+    license_error = [False]
+
+    def _drain():
+        try:
+            for line in iter(process.stdout.readline, ""):
+                if line.strip():
+                    stdout_q.put(line.strip())
+        finally:
+            stdout_q.put(None)
+
+    threading.Thread(target=_drain, daemon=True).start()
+
+    current_pct = [0]
+
+    while process.poll() is None:
+        if cancel_event.is_set():
+            process.kill()
+            return False
+        try:
+            while True:
+                line = stdout_q.get_nowait()
+                if line is None:
+                    break
+                print(f"  [postshot] {line}")
+                if "license required" in line.lower() or "studio license" in line.lower():
+                    license_error[0] = True
+                m = re.search(r'(\d+)\s*/\s*(\d+)', line)
+                if m:
+                    step, total = int(m.group(1)), int(m.group(2))
+                    if total > 0:
+                        current_pct[0] = min(99, int(step / total * 100))
+                report(PipelineStage.POSTSHOT_TRAINING, current_pct[0], f"PostShot: {line[:200]}")
+        except _queue.Empty:
+            pass
+        time.sleep(0.5)
+
+    rc = process.wait()
+    if license_error[0]:
+        raise RuntimeError(
+            "PostShot Studio license required — the CLI requires a Studio subscription. "
+            "Use Brush training instead, or upgrade your PostShot license."
+        )
+    if rc != 0:
+        raise RuntimeError(f"PostShot exited with code {rc}")
+    report(PipelineStage.POSTSHOT_TRAINING, 100, "PostShot training complete.")
     return True
 
 
@@ -542,13 +668,75 @@ def run_pipeline(
         report(PipelineStage.COLMAP_ALIGNMENT, 100,
                f"COLMAP complete — {len(colmap_files)} file(s) in brush_input/")
 
-        if not settings.run_brush and not skip_colmap:
+        if not settings.run_brush and not settings.run_postshot and not skip_colmap:
             return PipelineResult(
                 success=True, job_id=job_id, output_dir=str(job_dir),
                 stats={"frames_extracted": n_frames, "views_rendered": total_views},
             )
 
-        _run_brush_training(training_dir, settings, report, cancel_event)
+        # COLMAP/GlueMap+PostShot: PostShot reads brush_input/ directly (COLMAP files + images)
+        if settings.run_postshot:
+            _run_postshot_training(brush_input_dir, training_dir, settings, report, cancel_event)
+        if settings.run_brush:
+            _run_brush_training(training_dir, settings, report, cancel_event)
+        return PipelineResult(
+            success=True, job_id=job_id, output_dir=str(job_dir),
+            stats={"frames_extracted": n_frames, "views_rendered": total_views},
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # STAGE 3 — GlueMap alignment  (when run_gluemap=True)
+    # ═══════════════════════════════════════════════════════════
+    if getattr(settings, "run_gluemap", False):
+        if cancel_event.is_set():
+            return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        from .gluemap_runner import run_gluemap_pipeline
+
+        colmap_dir      = job_dir / "03_alignment" / "colmap"
+        brush_input_dir = training_dir / "brush_input"
+
+        skip_gluemap = start_from in ("brush_training",) and brush_input_dir.exists()
+        if skip_gluemap:
+            report(PipelineStage.GLUEMAP_ALIGNMENT, 100,
+                   "GlueMap alignment skipped — resuming from saved brush_input/")
+        else:
+            run_gluemap_pipeline(
+                views_dir=views_dir,
+                colmap_dir=colmap_dir,
+                brush_input_dir=brush_input_dir,
+                settings=settings,
+                report=report,
+                cancel_event=cancel_event,
+                project_dir=job_dir,
+            )
+
+            if cancel_event.is_set():
+                return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        recon_files = (
+            list(brush_input_dir.glob("*.txt")) + list(brush_input_dir.glob("*.bin"))
+        ) if brush_input_dir.exists() else []
+        if not recon_files:
+            return PipelineResult(
+                success=False, job_id=job_id, output_dir=str(job_dir),
+                error="GlueMap produced no reconstruction files in brush_input/. "
+                      "Check the server log for gluemap-demo output.",
+            )
+
+        report(PipelineStage.GLUEMAP_ALIGNMENT, 100,
+               f"GlueMap complete — {len(recon_files)} file(s) in brush_input/")
+
+        if not settings.run_brush and not settings.run_postshot and not skip_gluemap:
+            return PipelineResult(
+                success=True, job_id=job_id, output_dir=str(job_dir),
+                stats={"frames_extracted": n_frames, "views_rendered": total_views},
+            )
+
+        if settings.run_postshot:
+            _run_postshot_training(brush_input_dir, training_dir, settings, report, cancel_event)
+        if settings.run_brush:
+            _run_brush_training(training_dir, settings, report, cancel_event)
         return PipelineResult(
             success=True, job_id=job_id, output_dir=str(job_dir),
             stats={"frames_extracted": n_frames, "views_rendered": total_views},
@@ -558,8 +746,8 @@ def run_pipeline(
     # STAGE 3 — RealityScan alignment  (when run_vggt=False)
     # ═══════════════════════════════════════════════════════════
     if not settings.run_vggt:
-        if not settings.run_brush:
-            # Nothing further to do — caller just wanted views
+        if not settings.run_brush and not settings.run_postshot:
+            # Nothing further to do — caller just wanted views or XMP export
             report(PipelineStage.VGGT_ALIGNMENT, 100, "Alignment skipped — no training selected")
             return PipelineResult(
                 success=True, job_id=job_id, output_dir=str(job_dir),
@@ -595,11 +783,11 @@ def run_pipeline(
             report(PipelineStage.REALITYSCAN, 0, "XMP rig files disabled — proceeding without rig priors")
 
         if skip_rs:
-            # Resume from Brush: verify existing COLMAP export and copy to brush_input
+            # Resume: verify existing COLMAP export and copy to brush_input for Brush
             colmap_files = list(colmap_src.iterdir()) if colmap_src.exists() else []
             print(f"  [resume] COLMAP_for_Brush has {len(colmap_files)} item(s): "
                   f"{[f.name for f in colmap_files[:10]]}")
-            if not colmap_files:
+            if not colmap_files and settings.run_brush:
                 return PipelineResult(
                     success=False, job_id=job_id, output_dir=str(job_dir),
                     error=(
@@ -607,12 +795,15 @@ def run_pipeline(
                         "RealityScan must have completed successfully before resuming from Brush."
                     ),
                 )
-            report(PipelineStage.REALITYSCAN, 100,
-                   f"RealityScan output verified ({len(colmap_files)} items) — resuming from Brush…")
-            if brush_input_dir.exists():
-                shutil.rmtree(str(brush_input_dir))
-            shutil.copytree(str(colmap_src), str(brush_input_dir))
-            print(f"  [resume] Copied {len(colmap_files)} items → {brush_input_dir}")
+            if colmap_files and settings.run_brush:
+                report(PipelineStage.REALITYSCAN, 100,
+                       f"RealityScan output verified ({len(colmap_files)} items) — resuming from Brush…")
+                if brush_input_dir.exists():
+                    shutil.rmtree(str(brush_input_dir))
+                shutil.copytree(str(colmap_src), str(brush_input_dir))
+                print(f"  [resume] Copied {len(colmap_files)} items → {brush_input_dir}")
+            else:
+                report(PipelineStage.REALITYSCAN, 100, "RealityScan skipped — resuming from PostShot…")
         else:
             _run_realityscan(views_dir, alignment_dir, settings, report, cancel_event)
 
@@ -628,12 +819,12 @@ def run_pipeline(
             if len(all_rs_files) > 40:
                 print(f"    … and {len(all_rs_files) - 40} more items")
 
-            # Transfer RS COLMAP output → brush_input
+            # Transfer RS COLMAP output → brush_input (for Brush training)
             colmap_files = list(colmap_src.iterdir()) if colmap_src.exists() else []
             print(f"  [realityscan] COLMAP_for_Brush has {len(colmap_files)} item(s): "
                   f"{[f.name for f in colmap_files[:10]]}")
 
-            if not colmap_files:
+            if not colmap_files and settings.run_brush:
                 candidates = [p for p in alignment_dir.rglob("cameras.txt")]
                 hint = f" (found cameras.txt at {candidates[0].parent})" if candidates else ""
                 return PipelineResult(
@@ -644,17 +835,26 @@ def run_pipeline(
                     ),
                 )
 
-            report(PipelineStage.REALITYSCAN, 100, "RealityScan complete — preparing Brush input…")
-            if brush_input_dir.exists():
-                shutil.rmtree(str(brush_input_dir))
-            shutil.copytree(str(colmap_src), str(brush_input_dir))
-            print(f"  [realityscan] Copied {len(colmap_files)} items → {brush_input_dir}")
+            if colmap_files and settings.run_brush:
+                report(PipelineStage.REALITYSCAN, 100, "RealityScan complete — preparing Brush input…")
+                if brush_input_dir.exists():
+                    shutil.rmtree(str(brush_input_dir))
+                shutil.copytree(str(colmap_src), str(brush_input_dir))
+                print(f"  [realityscan] Copied {len(colmap_files)} items → {brush_input_dir}")
+            else:
+                report(PipelineStage.REALITYSCAN, 100, "RealityScan alignment complete.")
 
         # ═══════════════════════════════════════════════════════
-        # STAGE 4 — Brush training
+        # STAGE 4 — Training (PostShot and/or Brush)
+        # RS+PostShot: PostShot reads views_dir (registration.csv + pointcloud.ply from RS export)
+        # RS+Brush:    Brush reads brush_input/ (COLMAP files copied from COLMAP_for_Brush/)
         # ═══════════════════════════════════════════════════════
-        print(f"  [pipeline] Calling Brush training in {training_dir}")
-        _run_brush_training(training_dir, settings, report, cancel_event)
+        if settings.run_postshot:
+            print(f"  [pipeline] Calling PostShot training on {views_dir}")
+            _run_postshot_training(views_dir, training_dir, settings, report, cancel_event)
+        if settings.run_brush:
+            print(f"  [pipeline] Calling Brush training in {training_dir}")
+            _run_brush_training(training_dir, settings, report, cancel_event)
 
         if cancel_event.is_set():
             return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
@@ -783,6 +983,18 @@ def run_pipeline(
 
     report(PipelineStage.COLMAP_EXPORT, 100,
            f"COLMAP export complete — {n_points:,} 3D points")
+
+    if cancel_event.is_set():
+        return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+    # ═══════════════════════════════════════════════════════════
+    # STAGE 5 — Training (PostShot or Brush, if selected)
+    # VGGT writes COLMAP output to postshot_input/ or brush_input/ above.
+    # ═══════════════════════════════════════════════════════════
+    if settings.run_postshot:
+        _run_postshot_training(vggt_out, training_dir, settings, report, cancel_event)
+    if settings.run_brush:
+        _run_brush_training(training_dir, settings, report, cancel_event)
 
     return PipelineResult(
         success=True,

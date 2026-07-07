@@ -112,6 +112,42 @@ def upload_rad(local_path: str | Path, job_id: str) -> str:
     return public_url
 
 
+def upload_cameras_json(local_path: str | Path, job_id: str) -> str:
+    """
+    Upload cameras.json to R2 under {job_id}/cameras.json.
+    Returns the public HTTPS URL.
+    """
+    import boto3
+    from botocore.config import Config
+
+    cfg = _load_config()
+    local_path = Path(local_path)
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=cfg["endpoint"],
+        aws_access_key_id=cfg["access_key_id"],
+        aws_secret_access_key=cfg["secret_access_key"],
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+
+    key = f"{job_id}/cameras.json"
+    s3.upload_file(
+        str(local_path),
+        cfg["bucket"],
+        key,
+        ExtraArgs={
+            "ContentType": "application/json",
+            "CacheControl": "public, max-age=31536000, immutable",
+        },
+    )
+
+    public_url = f"{cfg['public_base_url'].rstrip('/')}/{key}"
+    print(f"  [r2] cameras.json → {public_url}")
+    return public_url
+
+
 def upload_thumbnail(local_path: str | Path, job_id: str) -> str:
     """
     Upload a JPEG thumbnail to R2 under {job_id}/thumbnail.jpg.

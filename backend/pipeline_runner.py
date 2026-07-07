@@ -48,6 +48,18 @@ _STAGE_RANGE_RS_BRUSH_POST_STITCH = {
     "realityscan":      (70, 85),
     "brush_training":   (85, 97),
 }
+_STAGE_RANGE_RS_POSTSHOT = {
+    "frame_extraction":   (5,  20),
+    "view_extraction":    (20, 45),
+    "realityscan":        (45, 65),
+    "postshot_training":  (65, 97),
+}
+_STAGE_RANGE_RS_POSTSHOT_POST_STITCH = {
+    "frame_extraction":   (47, 57),
+    "view_extraction":    (57, 70),
+    "realityscan":        (70, 82),
+    "postshot_training":  (82, 97),
+}
 _STAGE_RANGE_COLMAP = {
     "frame_extraction":  (5,  20),
     "view_extraction":   (20, 45),
@@ -59,6 +71,18 @@ _STAGE_RANGE_COLMAP_POST_STITCH = {
     "view_extraction":   (57, 72),
     "colmap_alignment":  (72, 88),
     "brush_training":    (88, 97),
+}
+_STAGE_RANGE_GLUEMAP = {
+    "frame_extraction":   (5,  20),
+    "view_extraction":    (20, 45),
+    "gluemap_alignment":  (45, 82),
+    "brush_training":     (82, 97),
+}
+_STAGE_RANGE_GLUEMAP_POST_STITCH = {
+    "frame_extraction":   (47, 57),
+    "view_extraction":    (57, 72),
+    "gluemap_alignment":  (72, 88),
+    "brush_training":     (88, 97),
 }
 
 _cancel_events: dict[str, threading.Event] = {}
@@ -280,6 +304,7 @@ def _build_settings(job_data: dict):
         if "run_colmap" in ui:        s.run_colmap        = _to_bool(ui["run_colmap"])
         if "colmap_mode" in ui:       s.colmap_mode       = ui["colmap_mode"]
         if "colmap_matcher" in ui:    s.colmap_matcher    = ui["colmap_matcher"]
+        if "brush_rerun_logging" in ui: s.brush_rerun_logging = _to_bool(ui["brush_rerun_logging"])
         if "colmap_visualize" in ui:    s.colmap_visualize    = _to_bool(ui["colmap_visualize"])
         if "colmap_correct_pitch" in ui:       s.colmap_correct_pitch       = _to_bool(ui["colmap_correct_pitch"])
         if "colmap_orientation_align" in ui:   s.colmap_orientation_align   = _to_bool(ui["colmap_orientation_align"])
@@ -446,9 +471,11 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         settings.project_dir = str(proj_root)
 
         print(f"⚙️  Pipeline settings: run_vggt={settings.run_vggt} run_brush={settings.run_brush} "
+              f"run_postshot={settings.run_postshot} "
               f"yaw_steps={settings.yaw_steps} pitch_angles={settings.pitch_angles}")
         queue_manager.update_job_progress(job_id, 2,
             f"Settings: vggt={settings.run_vggt} brush={settings.run_brush} "
+            f"postshot={settings.run_postshot} "
             f"yaw={settings.yaw_steps} pitch={settings.pitch_angles}")
 
         # ── Stale output check ────────────────────────────────────
@@ -475,14 +502,22 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     if d.exists():
                         shutil.rmtree(str(d))
 
-        use_colmap   = getattr(settings, "run_colmap", False)
-        use_rs_brush = not settings.run_vggt and not use_colmap and settings.run_brush
+        use_colmap      = getattr(settings, "run_colmap",   False)
+        use_gluemap     = getattr(settings, "run_gluemap",  False)
+        use_rs_brush    = not settings.run_vggt and not use_colmap and not use_gluemap and settings.run_brush and not settings.run_postshot
+        use_rs_postshot = not settings.run_vggt and not use_colmap and not use_gluemap and settings.run_postshot and not settings.run_brush
         if use_rs_brush:
             stage_map = _STAGE_RANGE_RS_BRUSH_POST_STITCH if insp_count else _STAGE_RANGE_RS_BRUSH
             print(f"  → Stage map: RS+Brush {'(post-stitch)' if insp_count else '(direct)'}")
+        elif use_rs_postshot:
+            stage_map = _STAGE_RANGE_RS_POSTSHOT_POST_STITCH if insp_count else _STAGE_RANGE_RS_POSTSHOT
+            print(f"  → Stage map: RS+PostShot {'(post-stitch)' if insp_count else '(direct)'}")
         elif use_colmap:
             stage_map = _STAGE_RANGE_COLMAP_POST_STITCH if insp_count else _STAGE_RANGE_COLMAP
             print(f"  → Stage map: COLMAP {'(post-stitch)' if insp_count else '(direct)'}")
+        elif use_gluemap:
+            stage_map = _STAGE_RANGE_GLUEMAP_POST_STITCH if insp_count else _STAGE_RANGE_GLUEMAP
+            print(f"  → Stage map: GlueMap {'(post-stitch)' if insp_count else '(direct)'}")
         else:
             stage_map = _STAGE_RANGE_POST_STITCH if insp_count else _STAGE_RANGE
             print(f"  → Stage map: VGGT {'(post-stitch)' if insp_count else '(direct)'}")
@@ -491,7 +526,11 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             lo, hi = stage_map.get(sp.stage.value, (0, 97))
             overall = int(lo + (sp.progress / 100) * (hi - lo))
             print(f"  → {sp.stage.value} {sp.progress}% → overall {overall}% [{lo}–{hi}]")
-            _mode = "rs_brush" if use_rs_brush else ("colmap" if use_colmap else "vggt")
+            _mode = ("rs_brush"    if use_rs_brush
+                     else "rs_brush" if use_rs_postshot   # reuse rs_brush mode tag for now
+                     else "colmap"   if use_colmap
+                     else "gluemap"  if use_gluemap
+                     else "vggt")
             extra = {
                 "currentStage": sp.stage.value,
                 "pipelineMode": _mode,
@@ -555,8 +594,17 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     # Pick middle stitched JPEG as thumbnail
                     thumbnail_url = _upload_thumbnail(job_id, proj_root)
 
+                    # Upload camera frustum data (works for all pipeline paths)
+                    try:
+                        _build_and_upload_cameras_json(proj_root, job_id)
+                    except Exception as _cam_exc:
+                        print(f"  [cameras] Non-fatal: {_cam_exc}")
+
                     # Publish to the public gallery Firestore collection
-                    _pipeline_mode = "colmap" if use_colmap else ("rs_brush" if use_rs_brush else "vggt")
+                    _pipeline_mode = ("rs_brush" if use_rs_brush
+                              else "colmap"   if use_colmap
+                              else "gluemap"  if use_gluemap
+                              else "vggt")
                     _publish_to_gallery(job_id, job_data, r2_url, gaussian_count, thumbnail_url,
                                         pipeline_mode=_pipeline_mode)
                 elif ply_file and not r2_client.is_configured():
@@ -700,3 +748,156 @@ def _publish_to_gallery(
         print(f"  [gallery] Published to Firestore gallery/{job_id}")
     except Exception as e:
         print(f"  [gallery] Could not publish gallery doc: {e}")
+
+
+# ── Camera JSON export (all pipeline paths) ───────────────────────────────────
+
+def _quat_to_mat(qw: float, qx: float, qy: float, qz: float):
+    """COLMAP quaternion [qw,qx,qy,qz] → 3×3 rotation matrix (world→camera)."""
+    import numpy as np
+    n = (qw*qw + qx*qx + qy*qy + qz*qz) ** 0.5
+    if n < 1e-10:
+        return np.eye(3)
+    qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
+    return np.array([
+        [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)  ],
+        [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)  ],
+        [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)],
+    ])
+
+
+def _mat_to_quat(R):
+    """3×3 rotation matrix → quaternion [qw,qx,qy,qz]."""
+    import numpy as np
+    trace = R[0,0] + R[1,1] + R[2,2]
+    if trace > 0:
+        s = 0.5 / (trace + 1.0) ** 0.5
+        w = 0.25 / s
+        x = (R[2,1] - R[1,2]) * s
+        y = (R[0,2] - R[2,0]) * s
+        z = (R[1,0] - R[0,1]) * s
+    elif R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+        s = 2.0 * (1.0 + R[0,0] - R[1,1] - R[2,2]) ** 0.5
+        w = (R[2,1] - R[1,2]) / s; x = 0.25 * s
+        y = (R[0,1] + R[1,0]) / s; z = (R[0,2] + R[2,0]) / s
+    elif R[1,1] > R[2,2]:
+        s = 2.0 * (1.0 + R[1,1] - R[0,0] - R[2,2]) ** 0.5
+        w = (R[0,2] - R[2,0]) / s; x = (R[0,1] + R[1,0]) / s
+        y = 0.25 * s;               z = (R[1,2] + R[2,1]) / s
+    else:
+        s = 2.0 * (1.0 + R[2,2] - R[0,0] - R[1,1]) ** 0.5
+        w = (R[1,0] - R[0,1]) / s; x = (R[0,2] + R[2,0]) / s
+        y = (R[1,2] + R[2,1]) / s; z = 0.25 * s
+    return float(w), float(x), float(y), float(z)
+
+
+def _parse_images_txt(images_txt: Path) -> list:
+    """
+    Parse COLMAP images.txt → list of (qw,qx,qy,qz,tx,ty,tz) tuples.
+    Every other data line is POINTS2D — those are skipped.
+    """
+    entries = []
+    with images_txt.open(encoding="utf-8", errors="replace") as f:
+        skip_next = False
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if skip_next:
+                skip_next = False
+                continue
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            try:
+                qw  = float(parts[1]); qx = float(parts[2])
+                qy  = float(parts[3]); qz = float(parts[4])
+                tx  = float(parts[5]); ty = float(parts[6]); tz = float(parts[7])
+                entries.append((qw, qx, qy, qz, tx, ty, tz))
+                skip_next = True
+            except (ValueError, IndexError):
+                continue
+    return entries
+
+
+def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
+    """
+    Find images.txt anywhere under the project, convert camera poses to
+    Three.js viewer space, and upload cameras.json to R2.
+
+    Works for all pipeline paths (RS, COLMAP, GlueMap, VGGT) because
+    they all produce COLMAP-format images.txt before training.
+
+    Three.js viewer applies mesh.rotation.x = π so the Y-flip needed is:
+        viewer_pos = (x_colmap, -y_colmap, -z_colmap)
+
+    Camera quaternion is rotated by the same π-around-X flip:
+        R_viewer = Rx(π) @ R_cam_to_world
+    """
+    import json, tempfile, numpy as np
+    from . import r2_client
+
+    if not r2_client.is_configured():
+        return
+
+    # Search order: brush_input → postshot_input → COLMAP_for_Brush → anywhere in 03_/04_
+    candidates = []
+    for subdir in ("04_training/brush_input", "04_training/postshot_input",
+                   "03_alignment/COLMAP_for_Brush"):
+        p = proj_root / subdir / "images.txt"
+        if p.exists():
+            candidates.append(p)
+    if not candidates:
+        for p in proj_root.rglob("images.txt"):
+            candidates.append(p)
+    if not candidates:
+        print("  [cameras] images.txt not found — skipping cameras.json")
+        return
+
+    images_txt = candidates[0]
+    print(f"  [cameras] Reading poses from {images_txt.relative_to(proj_root)}")
+
+    raw = _parse_images_txt(images_txt)
+    if not raw:
+        print("  [cameras] No camera poses parsed — skipping")
+        return
+
+    # Subsample: prefer anchor cameras (name contains 'camera0'), else every N-th
+    # For simple subsampling just take every step-th entry (max ~150 frustums)
+    step = max(1, len(raw) // 150)
+    sampled = raw[::step]
+    print(f"  [cameras] {len(raw)} total poses → {len(sampled)} sampled (step={step})")
+
+    Rx = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=float)
+
+    out = []
+    for (qw, qx, qy, qz, tx, ty, tz) in sampled:
+        R_cw = _quat_to_mat(qw, qx, qy, qz)  # world→camera
+        t    = np.array([tx, ty, tz])
+        C    = -R_cw.T @ t                    # camera centre in COLMAP world space
+
+        # Apply Y-flip to position
+        px = float(C[0])
+        py = float(-C[1])
+        pz = float(-C[2])
+
+        # Apply Y-flip to orientation (camera-to-world in viewer space)
+        R_viewer = Rx @ R_cw.T
+        vqw, vqx, vqy, vqz = _mat_to_quat(R_viewer)
+
+        out.append({
+            "px": round(px, 4), "py": round(py, 4), "pz": round(pz, 4),
+            "qw": round(vqw, 5), "qx": round(vqx, 5),
+            "qy": round(vqy, 5), "qz": round(vqz, 5),
+        })
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
+                                     encoding="utf-8") as tmp:
+        json.dump(out, tmp, separators=(",", ":"))
+        tmp_path = Path(tmp.name)
+
+    try:
+        r2_client.upload_cameras_json(tmp_path, job_id)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+

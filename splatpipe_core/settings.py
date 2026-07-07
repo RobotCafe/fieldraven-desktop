@@ -81,6 +81,18 @@ class PipelineSettings:
     brush_rerun_logging: bool = False
     brush_spawn_viewer: bool = False
 
+    # ── GlueMap ──────────────────────────────────────────────────
+    run_gluemap: bool = False
+    gluemap_backbone: str = "pi3"           # pi3 | pi3x | vggt | map_anything
+    gluemap_skip_doppelgangers: bool = True  # skip two-view covisibility stage (faster)
+    gluemap_coarse_only: bool = False        # stop after global BA, skip SIFT refinement
+    gluemap_is_sequential: bool = True       # sequential/video mode (temporal pairing)
+    gluemap_num_neighbors: int = 100         # SALAD retrieval neighbours per image
+    gluemap_batch_size: int = 60             # two-view inference batch size (16GB VRAM; use 30 for <12GB)
+    gluemap_num_track_per_img: int = 512     # VGGSfM tracks per image (512 halves tracking time, same quality as 1024)
+    gluemap_wsl_home: str = "/home/decosson" # WSL2 home directory
+    gluemap_wsl_distro: str = "Ubuntu-22.04" # WSL2 distribution name
+
     # ── Paths ────────────────────────────────────────────────────
     jobs_base_dir: str = r"C:\FieldRaven\Jobs"
     # Path to the SplatPipe App directory containing video_extraction.py,
