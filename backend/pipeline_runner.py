@@ -600,43 +600,43 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     except Exception as _cam_exc:
                         print(f"  [cameras] Non-fatal: {_cam_exc}")
 
+                    # Determine the actual field-session date (not the upload date)
+                    _db = firebase_client.get_db()
+                    _session_date = None
+                    try:
+                        _session_date = _determine_session_date(job_id, job_data, proj_root, _db)
+                    except Exception as _sd_exc:
+                        print(f"  [session] Non-fatal: {_sd_exc}")
+
                     # Publish to the public gallery Firestore collection
                     _pipeline_mode = ("rs_brush" if use_rs_brush
                               else "colmap"   if use_colmap
                               else "gluemap"  if use_gluemap
                               else "vggt")
                     _publish_to_gallery(job_id, job_data, r2_url, gaussian_count, thumbnail_url,
-                                        pipeline_mode=_pipeline_mode)
+                                        pipeline_mode=_pipeline_mode,
+                                        session_date=_session_date)
 
                     # Write GPS capture location from mobile job doc
                     try:
-                        _db = firebase_client.get_db()
                         _write_capture_location(job_id, job_data, _db)
                     except Exception as _loc_exc:
                         print(f"  [location] Non-fatal: {_loc_exc}")
 
-                    # Auto-fetch Garmin activity, matched by session time overlap
+                    # Auto-fetch Garmin activity using the actual session date
                     try:
                         from splatpipe_core import garmin_fetcher
-                        from datetime import date as _date_cls, datetime as _dt
-                        if '_db' not in dir():
-                            _db = firebase_client.get_db()
-                        # Prefer exact session times from mobile job doc
                         _session_start, _session_end = _get_session_times(job_id, job_data, _db)
-                        if _session_start and _session_end:
+                        _garmin_date = (
+                            _session_start.date() if _session_start
+                            else _session_date
+                        )
+                        if _garmin_date:
                             garmin_fetcher.fetch_and_store(
-                                job_id, _session_start.date(), _db,
+                                job_id, _garmin_date, _db,
                                 session_start=_session_start,
                                 session_end=_session_end,
                             )
-                        else:
-                            # Fall back to project folder date
-                            _proj_dir = job_data.get("projectDir")
-                            _fallback_date = (
-                                _date_cls.fromtimestamp(Path(_proj_dir).stat().st_mtime)
-                                if _proj_dir else _date_cls.today()
-                            )
-                            garmin_fetcher.fetch_and_store(job_id, _fallback_date, _db)
                     except Exception as _g_exc:
                         print(f"  [garmin] Non-fatal: {_g_exc}")
                 elif ply_file and not r2_client.is_configured():
@@ -753,6 +753,7 @@ def _publish_to_gallery(
     gaussian_count: int,
     thumbnail_url: "str | None" = None,
     pipeline_mode: "str | None" = None,
+    session_date: "object | None" = None,
 ) -> None:
     """Write a public gallery document to Firestore for this completed splat."""
     from google.cloud.firestore import SERVER_TIMESTAMP
@@ -776,6 +777,8 @@ def _publish_to_gallery(
         }
         if thumbnail_url:
             doc["thumbnailUrl"] = thumbnail_url
+        if session_date:
+            doc["sessionDate"] = str(session_date)   # ISO "YYYY-MM-DD"
         db.collection("gallery").document(job_id).set(doc)
         print(f"  [gallery] Published to Firestore gallery/{job_id}")
     except Exception as e:
@@ -783,6 +786,87 @@ def _publish_to_gallery(
 
 
 # ── Mobile job helpers ────────────────────────────────────────────────────────
+
+def _determine_session_date(job_id: str, job_data: dict, proj_root: "Path", db) -> "Optional[object]":
+    """
+    Return the actual field-session date (a datetime.date) in priority order:
+      1. Mobile app job startTime (Firestore users/{uid}/jobs/{jobId})
+      2. EXIF DateTimeOriginal from extracted frames / views
+      3. Project folder mtime (last resort — reflects upload day, not capture day)
+
+    This is stored as sessionDate on the gallery doc so Garmin matching
+    and display always use the capture date, not the upload/publish date.
+    """
+    from datetime import date as _date, datetime as _dt
+
+    # 1. Mobile job startTime
+    doc = _get_mobile_job_doc(job_id, job_data, db)
+    if doc:
+        start_ms = doc.get("startTime")
+        if start_ms:
+            d = _dt.fromtimestamp(start_ms / 1000).date()
+            print(f"  [session] Date from mobile job: {d}")
+            return d
+
+    # 2. EXIF DateTimeOriginal from the first JPEG in frames/views
+    exif_date = _exif_date_from_project(proj_root)
+    if exif_date:
+        print(f"  [session] Date from EXIF: {exif_date}")
+        return exif_date
+
+    # 3. Folder mtime (fallback — note: this may be the upload day, not capture day)
+    try:
+        d = _date.fromtimestamp(proj_root.stat().st_mtime)
+        print(f"  [session] Date from folder mtime (fallback): {d}")
+        return d
+    except Exception:
+        pass
+
+    return None
+
+
+def _exif_date_from_project(proj_root: "Path") -> "Optional[object]":
+    """Read DateTimeOriginal EXIF from the first JPEG found in frames/views directories."""
+    from datetime import datetime as _dt
+    from pathlib import Path as _P
+
+    for subdir in ("01_frames", "02_views"):
+        d = proj_root / subdir
+        if not d.exists():
+            continue
+        jpegs = sorted(d.rglob("*.jpg"))
+        if not jpegs:
+            jpegs = sorted(d.rglob("*.jpeg"))
+        for jpg in jpegs[:5]:
+            try:
+                # Try PIL/Pillow first (most reliable)
+                from PIL import Image
+                from PIL.ExifTags import TAGS
+                img = Image.open(jpg)
+                exif_data = img._getexif()
+                if exif_data:
+                    for tag_id, val in exif_data.items():
+                        if TAGS.get(tag_id) == "DateTimeOriginal":
+                            return _dt.strptime(val, "%Y:%m:%d %H:%M:%S").date()
+            except Exception:
+                pass
+            try:
+                # Fallback: read raw EXIF bytes
+                with open(jpg, "rb") as f:
+                    raw = f.read(65536)
+                import re as _re
+                m = _re.search(rb"DateTimeOriginal\x00(\d{4}:\d{2}:\d{2})", raw)
+                if not m:
+                    m = _re.search(rb"(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})", raw)
+                if m:
+                    date_str = m.group(1).decode()[:10].replace(":", "-")
+                    from datetime import date as _date
+                    parts = date_str.split("-")
+                    return _date(int(parts[0]), int(parts[1]), int(parts[2]))
+            except Exception:
+                pass
+    return None
+
 
 def _get_mobile_job_doc(job_id: str, job_data: dict, db) -> "Optional[dict]":
     """Fetch the mobile app job document from Firestore users/{uid}/jobs/{job_id}."""
