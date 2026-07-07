@@ -179,8 +179,17 @@ def main():
         _prog(28, "Feature extraction complete.")
 
         # ── 2. Build rig config ────────────────────────────────────────────────
+        # pycolmap 4.x renamed the kwarg from model_id= to model=.
+        # Try the new signature first, fall back to old for older installs.
         try:
-            # pycolmap ≥ 3.11: create_from_model_id replaces deprecated create()
+            camera = pycolmap.Camera.create_from_model_id(
+                camera_id=0,
+                model=pycolmap.CameraModelId.SIMPLE_PINHOLE,
+                focal_length=focal,
+                width=image_size,
+                height=image_size,
+            )
+        except TypeError:
             camera = pycolmap.Camera.create_from_model_id(
                 camera_id=0,
                 model_id=pycolmap.CameraModelId.SIMPLE_PINHOLE,
