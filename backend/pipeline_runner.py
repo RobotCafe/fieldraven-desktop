@@ -869,14 +869,31 @@ def _exif_date_from_project(proj_root: "Path") -> "Optional[object]":
 
 
 def _get_mobile_job_doc(job_id: str, job_data: dict, db) -> "Optional[dict]":
-    """Fetch the mobile app job document from Firestore users/{uid}/jobs/{job_id}."""
+    """Fetch the mobile app job document from Firestore users/{uid}/jobs/{userJobId}.
+
+    The processing_queue doc ID (job_id) differs from the mobile app's job ID
+    (stored as userJobId on the processing_queue doc). Try userJobId first,
+    then fall back to job_id for legacy queue docs that pre-date this field.
+    """
     from typing import Optional
     uid = job_data.get("userId")
     if not uid:
         return None
+    # Prefer the actual mobile job ID (userJobId on the processing_queue doc)
+    user_job_id = job_data.get("userJobId") or job_id
     try:
-        snap = db.collection("users").document(uid).collection("jobs").document(job_id).get()
-        return snap.to_dict() if snap.exists else None
+        snap = db.collection("users").document(uid).collection("jobs").document(user_job_id).get()
+        if snap.exists:
+            print(f"  [mobile] Found mobile job doc: users/{uid}/jobs/{user_job_id}")
+            return snap.to_dict()
+        # Fallback: try the queue doc ID itself (legacy)
+        if user_job_id != job_id:
+            snap2 = db.collection("users").document(uid).collection("jobs").document(job_id).get()
+            if snap2.exists:
+                print(f"  [mobile] Found mobile job doc (fallback): users/{uid}/jobs/{job_id}")
+                return snap2.to_dict()
+        print(f"  [mobile] No mobile job doc at users/{uid}/jobs/{user_job_id}")
+        return None
     except Exception as e:
         print(f"  [mobile] Could not read job doc: {e}")
         return None
