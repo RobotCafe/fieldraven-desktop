@@ -103,6 +103,12 @@ def authenticate(cfg: dict):
     tok_file.write_text(client.client.dumps(), encoding="utf-8")
     print(f"\n✓  Logged in as: {client.full_name or email}")
     print(f"✓  Token cached → {tok_file.relative_to(_ROOT)}")
+
+    # Scrub password from config immediately — token is sufficient going forward
+    safe = {k: v for k, v in cfg.items() if k != "password"}
+    _CONFIG.write_text(json.dumps(safe, indent=2), encoding="utf-8")
+    print(f"✓  Password removed from {_CONFIG.name} (token handles auth from here)")
+
     return client
 
 

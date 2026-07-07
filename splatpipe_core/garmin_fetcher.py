@@ -28,10 +28,18 @@ _GPX_NS = {"gpx": "http://www.topografix.com/GPX/1/1"}
 # ── Config helpers ────────────────────────────────────────────────────────────
 
 def is_configured() -> bool:
-    """Return True if garmin_config.json exists with credentials."""
+    """Return True if Garmin is usable: config has email AND either
+    a cached token exists or a password is present for initial auth."""
     try:
         cfg = _load_config()
-        return bool(cfg.get("email")) and bool(cfg.get("password"))
+        email = cfg.get("email")
+        if not email:
+            return False
+        # Token cached → ready without password
+        if _token_file_for(email).exists():
+            return True
+        # No token yet → need password for first-time login
+        return bool(cfg.get("password"))
     except Exception:
         return False
 
@@ -92,8 +100,30 @@ def _get_client(prompt_mfa=None):
     client = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
     client.login()
     token_file.write_text(client.client.dumps(), encoding="utf-8")
+
+    # Remove the password from config — it's no longer needed now that
+    # the OAuth token is cached. The token refreshes automatically.
+    _scrub_password_from_config(email)
+
     print(f"  [garmin] Authenticated as {client.full_name or email}, token cached")
     return client
+
+
+def _scrub_password_from_config(email: str) -> None:
+    """Overwrite garmin_config.json removing the password field.
+    The OAuth token is sufficient for all subsequent runs."""
+    try:
+        cfg = _load_config()
+        if "password" not in cfg:
+            return
+        safe_cfg = {k: v for k, v in cfg.items() if k != "password"}
+        _CONFIG_PATH.write_text(
+            json.dumps(safe_cfg, indent=2), encoding="utf-8"
+        )
+        print(f"  [garmin] Password removed from {_CONFIG_PATH.name} "
+              "(token is now the only credential on disk)")
+    except Exception as e:
+        print(f"  [garmin] Note: could not scrub password from config: {e}")
 
 
 # ── Activity search ───────────────────────────────────────────────────────────
