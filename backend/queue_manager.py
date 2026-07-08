@@ -163,11 +163,18 @@ def update_job_progress(
     if extra:
         update.update(extra)
 
-    # Always update the in-memory cache (serves the local status endpoint)
-    if job_id in _status_cache:
-        _status_cache[job_id].update(update)
-    else:
-        _status_cache[job_id] = dict(update)
+    # Always update the in-memory cache (serves the local status endpoint).
+    # If the job isn't cached yet (manually-started jobs bypass accept_job),
+    # seed from Firestore first so we preserve userId/userJobId/etc.
+    if job_id not in _status_cache:
+        try:
+            snap = firebase_client.get_processing_queue().document(job_id).get()
+            if snap.exists:
+                _status_cache[job_id] = _sanitise(snap.to_dict())
+                _status_cache[job_id]['docId'] = job_id
+        except Exception:
+            _status_cache[job_id] = {}
+    _status_cache[job_id].update(update)
 
     # Only touch Firestore at stage milestones — not on every progress tick
     if milestone:

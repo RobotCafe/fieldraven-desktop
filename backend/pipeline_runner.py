@@ -885,8 +885,12 @@ def _get_mobile_job_doc(job_id: str, job_data: dict, db) -> "Optional[dict]":
     then fall back to job_id for legacy queue docs that pre-date this field.
     """
     from typing import Optional
-    uid = job_data.get("userId")
+    uid          = job_data.get("userId")
+    user_job_id_ = job_data.get("userJobId")
+    print(f"  [mobile] job_data keys: {list(job_data.keys())}")
+    print(f"  [mobile] userId={uid!r}  userJobId={user_job_id_!r}")
     if not uid:
+        print(f"  [mobile] No userId in job_data — cannot look up mobile job")
         return None
     # Prefer the actual mobile job ID (userJobId on the processing_queue doc)
     user_job_id = job_data.get("userJobId") or job_id
