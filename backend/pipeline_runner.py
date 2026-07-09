@@ -1068,20 +1068,8 @@ def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
         print("  [cameras] No camera poses parsed — skipping")
         return
 
-    # Prefer sensor-0 (anchor) cameras so all frustums point in the same
-    # general direction of travel — mixing all rig sensors gives frustums
-    # pointing in 13 different directions per frame, which looks chaotic.
-    # Fall back to every-N-th if no sensor naming convention is present.
-    anchor = [e for e in raw if "camera0" in e[7]]
-    if anchor:
-        step = max(1, len(anchor) // 150)
-        sampled = anchor[::step]
-        print(f"  [cameras] {len(raw)} total poses → {len(sampled)} sampled "
-              f"(anchor-only, step={step})")
-    else:
-        step = max(1, len(raw) // 150)
-        sampled = raw[::step]
-        print(f"  [cameras] {len(raw)} total poses → {len(sampled)} sampled (step={step})")
+    sampled = raw
+    print(f"  [cameras] {len(raw)} poses → uploading all")
 
     Rx = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=float)
 
