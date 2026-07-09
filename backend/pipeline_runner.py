@@ -1034,11 +1034,13 @@ def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
     Works for all pipeline paths (RS, COLMAP, GlueMap, VGGT) because
     they all produce COLMAP-format images.txt before training.
 
-    Three.js viewer applies mesh.rotation.x = π so the Y-flip needed is:
+    Three.js viewer applies mesh.rotation.x = π so position transform is:
         viewer_pos = (x_colmap, -y_colmap, -z_colmap)
 
-    Camera quaternion is rotated by the same π-around-X flip:
-        R_viewer = Rx(π) @ R_cam_to_world
+    The frustum mesh points in its local -Z direction. R_viewer must satisfy:
+        R_viewer @ [0,0,-1] = fwd_viewer  →  R_viewer[:,2] = -fwd_viewer
+    This requires an extra Rx on the right:
+        R_viewer = Rx(π) @ R_cam_to_world @ Rx(π)
     """
     import json, tempfile, numpy as np
     from . import r2_client
@@ -1084,8 +1086,12 @@ def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
         py = float(-C[1])
         pz = float(-C[2])
 
-        # Apply Y-flip to orientation (camera-to-world in viewer space)
-        R_viewer = Rx @ R_cw.T
+        # R_viewer maps from frustum local space to viewer world space.
+        # The frustum mesh points in its local -Z direction. For it to point
+        # along fwd_viewer, we need R_viewer[:,2] = -fwd_viewer.
+        # Rx @ R_cw.T has [:,2] = +fwd_viewer (180° wrong).
+        # Rx @ R_cw.T @ Rx negates columns 1&2 → [:,2] = -fwd_viewer ✓
+        R_viewer = Rx @ R_cw.T @ Rx
         vqw, vqx, vqy, vqz = _mat_to_quat(R_viewer)
 
         out.append({
