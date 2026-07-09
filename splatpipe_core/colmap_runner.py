@@ -272,7 +272,11 @@ def _mat_to_quat(R: np.ndarray) -> tuple:
     return float(qw), float(qx), float(qy), float(qz)
 
 
-def _apply_global_level_correction(sparse_txt_dir: Path, cam_from_rig: list) -> tuple:
+def _apply_global_level_correction(
+    sparse_txt_dir: Path,
+    cam_from_rig: list,
+    anchor_diag_pitch: float = 0.0,
+) -> tuple:
     """
     Level the whole reconstruction with ONE rotation applied identically to
     every rig frame and every 3D point -- not a per-frame override.
@@ -372,15 +376,17 @@ def _apply_global_level_correction(sparse_txt_dir: Path, cam_from_rig: list) -> 
         U[:, -1] *= -1
         R_mean = U @ Vt
 
-    # The single correction rotation: same mean yaw, zero pitch, zero roll.
-    # Same right/down/fwd construction used elsewhere in this file, just
-    # with target pitch/roll fixed at zero instead of per-frame yaw-coupled.
+    # Target rotation: same mean yaw, fixed pitch=anchor_diag_pitch, zero roll.
+    # anchor_diag_pitch=0 when horizon_ref is in use (sensor 0 is the 0° view);
+    # anchor_diag_pitch=-pitch_angles[0] when no horizon_ref (sensor 0 is the
+    # first sibling, e.g. +10° DIAG for pitch_angles=[-10]).
     fwd_mean = R_mean.T[:, 2]
     yaw = np.arctan2(fwd_mean[0], fwd_mean[2])
     cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-    right = np.array([cos_y, 0.0, -sin_y])
-    down  = np.array([0.0,   1.0,  0.0])
-    fwd   = np.array([sin_y, 0.0,  cos_y])
+    p   = np.radians(anchor_diag_pitch)
+    right = np.array([cos_y,              0.0,        -sin_y            ])
+    down  = np.array([sin_y * np.sin(p),  np.cos(p),   cos_y * np.sin(p)])
+    fwd   = np.array([sin_y * np.cos(p),  np.sin(p),   cos_y * np.cos(p)])
     R_target_mean = np.column_stack([right, down, fwd]).T
 
     # R_g rotates the WORLD frame: positions transform as R_g @ position, but
@@ -514,12 +520,15 @@ def _patch_frames_rig_from_world(sparse_txt_dir: Path, frame_rig_poses: dict) ->
 
 
 def _measure_anchor_pitch(sparse_txt_dir: Path) -> float:
-    """Measure the mean DIAG pitch of all pano_camera0 images in images.txt.
+    """Measure the mean DIAG pitch of all sensor-0 (pano_camera0) images in images.txt.
+
+    Works whether or not horizon_ref is set — always reads the sensor whose
+    index in the rig is 0 (whatever pitch that sensor was extracted at).
 
     DIAG pitch = arcsin(Y_world) where Y_world is the Y component of the camera
     forward axis in COLMAP world coordinates (Y-down convention).
     Positive = camera pointing down, negative = pointing up.
-    Returns 0.0 if no anchor images found.
+    Returns 0.0 if no sensor-0 images found.
     """
     images_txt = sparse_txt_dir / "images.txt"
     if not images_txt.exists():
@@ -800,19 +809,34 @@ def _run_perspective_rig(
     # every point -- not a per-frame override (see Problem 14 in the brief
     # for why per-frame forcing was wrong and is no longer done).
     if getattr(settings, "colmap_correct_pitch", True):
-        anchor_pitch_before = _measure_anchor_pitch(sparse_txt)
+        # When horizon_ref is used, sensor 0 is the 0° ceremonial anchor so
+        # the target is 0° DIAG. Without it, sensor 0 is the first sibling
+        # whose expected DIAG pitch is the negation of the extraction pitch
+        # (e.g. pitch_angles[0]=-10 → DIAG +10°). The correction targets that
+        # pitch so the scene is leveled correctly regardless of whether the
+        # 0° anchor view is included.
+        _has_horizon_ref = getattr(settings, "horizon_ref", False)
+        if _has_horizon_ref:
+            _anchor_diag_pitch = 0.0
+        else:
+            _first_pitch = settings.pitch_angles[0] if settings.pitch_angles else 0.0
+            _anchor_diag_pitch = -float(_first_pitch)  # extraction→DIAG sign flip
 
+        anchor_pitch_before = _measure_anchor_pitch(sparse_txt)
         report(PipelineStage.COLMAP_ALIGNMENT, 91,
                f"Leveling reconstruction as a single rigid rotation "
-               f"(mean anchor tilt ~{anchor_pitch_before:.2f}° from horizontal)…")
+               f"(mean sensor-0 tilt ~{anchor_pitch_before:.2f}°, "
+               f"target {_anchor_diag_pitch:.1f}° DIAG)…")
         n_cams, n_pts_corrected = _apply_global_level_correction(
-            sparse_txt, cam_from_rig=rig_params["rotations"],
+            sparse_txt,
+            cam_from_rig=rig_params["rotations"],
+            anchor_diag_pitch=_anchor_diag_pitch,
         )
 
         post_pitch = _measure_anchor_pitch(sparse_txt)
         report(PipelineStage.COLMAP_ALIGNMENT, 91,
                f"Leveling applied to {n_cams} cameras, {n_pts_corrected} points — "
-               f"mean anchor tilt now {post_pitch:.3f}° (expected ~0°)")
+               f"mean sensor-0 tilt now {post_pitch:.3f}° (expected ~{_anchor_diag_pitch:.1f}°)")
     else:
         report(PipelineStage.COLMAP_ALIGNMENT, 91, "Leveling skipped — using raw COLMAP poses.")
 
