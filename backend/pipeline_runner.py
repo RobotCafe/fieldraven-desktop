@@ -997,8 +997,9 @@ def _mat_to_quat(R):
 
 def _parse_images_txt(images_txt: Path) -> list:
     """
-    Parse COLMAP images.txt → list of (qw,qx,qy,qz,tx,ty,tz) tuples.
+    Parse COLMAP images.txt → list of (qw,qx,qy,qz,tx,ty,tz,name) tuples.
     Every other data line is POINTS2D — those are skipped.
+    'name' is the full image path string (e.g. 'pano_camera0/frame_000001.jpg').
     """
     entries = []
     with images_txt.open(encoding="utf-8", errors="replace") as f:
@@ -1011,13 +1012,14 @@ def _parse_images_txt(images_txt: Path) -> list:
                 skip_next = False
                 continue
             parts = line.split()
-            if len(parts) < 8:
+            if len(parts) < 10:
                 continue
             try:
                 qw  = float(parts[1]); qx = float(parts[2])
                 qy  = float(parts[3]); qz = float(parts[4])
                 tx  = float(parts[5]); ty = float(parts[6]); tz = float(parts[7])
-                entries.append((qw, qx, qy, qz, tx, ty, tz))
+                name = parts[9]
+                entries.append((qw, qx, qy, qz, tx, ty, tz, name))
                 skip_next = True
             except (ValueError, IndexError):
                 continue
@@ -1066,16 +1068,25 @@ def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
         print("  [cameras] No camera poses parsed — skipping")
         return
 
-    # Subsample: prefer anchor cameras (name contains 'camera0'), else every N-th
-    # For simple subsampling just take every step-th entry (max ~150 frustums)
-    step = max(1, len(raw) // 150)
-    sampled = raw[::step]
-    print(f"  [cameras] {len(raw)} total poses → {len(sampled)} sampled (step={step})")
+    # Prefer sensor-0 (anchor) cameras so all frustums point in the same
+    # general direction of travel — mixing all rig sensors gives frustums
+    # pointing in 13 different directions per frame, which looks chaotic.
+    # Fall back to every-N-th if no sensor naming convention is present.
+    anchor = [e for e in raw if "camera0" in e[7]]
+    if anchor:
+        step = max(1, len(anchor) // 150)
+        sampled = anchor[::step]
+        print(f"  [cameras] {len(raw)} total poses → {len(sampled)} sampled "
+              f"(anchor-only, step={step})")
+    else:
+        step = max(1, len(raw) // 150)
+        sampled = raw[::step]
+        print(f"  [cameras] {len(raw)} total poses → {len(sampled)} sampled (step={step})")
 
     Rx = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=float)
 
     out = []
-    for (qw, qx, qy, qz, tx, ty, tz) in sampled:
+    for (qw, qx, qy, qz, tx, ty, tz, _name) in sampled:
         R_cw = _quat_to_mat(qw, qx, qy, qz)  # world→camera
         t    = np.array([tx, ty, tz])
         C    = -R_cw.T @ t                    # camera centre in COLMAP world space
