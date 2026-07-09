@@ -632,20 +632,23 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     except Exception as _loc_exc:
                         print(f"  [location] Non-fatal: {_loc_exc}")
 
-                    # Auto-fetch Garmin activity using the actual session date
+                    # Auto-fetch Garmin activity — ONLY when the mobile app
+                    # provided confirmed session times. Without start+end we
+                    # cannot reliably match a Garmin activity: the date-only
+                    # fallback searches by today's folder mtime and will
+                    # incorrectly attach unrelated activities to old jobs.
                     try:
                         from splatpipe_core import garmin_fetcher
                         _session_start, _session_end = _get_session_times(job_id, job_data, _db)
-                        _garmin_date = (
-                            _session_start.date() if _session_start
-                            else _session_date
-                        )
-                        if _garmin_date:
+                        if _session_start and _session_end:
                             garmin_fetcher.fetch_and_store(
-                                job_id, _garmin_date, _db,
+                                job_id, _session_start.date(), _db,
                                 session_start=_session_start,
                                 session_end=_session_end,
                             )
+                        else:
+                            print("  [garmin] Skipping — no mobile session times "
+                                  "(job predates mobile app or mobile job not found)")
                     except Exception as _g_exc:
                         print(f"  [garmin] Non-fatal: {_g_exc}")
                 elif ply_file and not r2_client.is_configured():
