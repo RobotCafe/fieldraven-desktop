@@ -139,7 +139,10 @@ def upload_cameras_json(local_path: str | Path, job_id: str) -> str:
         key,
         ExtraArgs={
             "ContentType": "application/json",
-            "CacheControl": "public, max-age=31536000, immutable",
+            # Not immutable — cameras.json may be regenerated after upload
+            # (e.g. coordinate fix, re-processing). Short TTL so CDN picks
+            # up the new version quickly.
+            "CacheControl": "public, max-age=60",
         },
     )
 
