@@ -295,70 +295,97 @@ def main():
             _prog(58, f"Purged {n_purged} same-rig-frame sibling pairs (zero-baseline, non-triangulable).")
 
         # ── 5. Mapping ─────────────────────────────────────────────────────────
+        import shutil, sqlite3
+
         sparse_path.mkdir(parents=True, exist_ok=True)
         sparse_txt.mkdir(parents=True, exist_ok=True)
 
-        if colmap_mapper == "global" and colmap_bin:
-            # GLOMAP global SfM — integrated into COLMAP as --Mapper.mapper_type GLOBAL.
-            # Solves all cameras simultaneously rather than incrementally, giving better
-            # global consistency for large sequential captures (long walks, drone surveys).
-            # Does NOT respect rig constraints (apply_rig_config tables are ignored),
-            # so each sensor is reconstructed independently. This is a valid tradeoff
-            # for large-scale captures where global drift matters more than local rig accuracy.
-            _prog(60, "Running GLOMAP global SfM (--Mapper.mapper_type GLOBAL)…")
-            _run_cli([
-                "mapper",
-                "--database_path", str(db_path),
-                "--image_path",    str(image_path),
-                "--output_path",   str(sparse_path),
-                "--Mapper.mapper_type", "GLOBAL",
-            ], pct=80)
+        def _run_mapper(label: str) -> dict:
+            """Run the selected mapper, return recs dict."""
+            if colmap_mapper == "global":
+                # pycolmap.global_mapping() is available directly in pycolmap 4.0.4
+                # (no CLI required). Solves all cameras simultaneously — drift-free
+                # global rotations + positions. Does NOT enforce rig zero-baseline
+                # constraints (each sensor reconstructed independently), which is a
+                # valid tradeoff for large captures where global consistency matters.
+                _prog(60, f"Running GLOMAP global SfM via pycolmap ({label})…")
+                recs = pycolmap.global_mapping(
+                    str(db_path), str(image_path), str(sparse_path)
+                )
+                if not recs:
+                    raise RuntimeError("GLOMAP global mapping produced no reconstructions.")
+            else:
+                _prog(60, f"Running incremental mapping, fixed rig ({label})…")
+                map_opts = pycolmap.IncrementalPipelineOptions(
+                    ba_refine_sensor_from_rig=False,
+                    ba_refine_focal_length=False,
+                    ba_refine_principal_point=False,
+                    ba_refine_extra_params=False,
+                )
+                recs = pycolmap.incremental_mapping(
+                    str(db_path), str(image_path), str(sparse_path), map_opts
+                )
+                if not recs:
+                    raise RuntimeError("COLMAP incremental mapping produced no reconstructions.")
+            return recs
 
-            # Global mapper writes binary to sparse_path/0/ — find the best sub-model
-            sub_dirs = sorted(sparse_path.iterdir(), key=lambda p: p.name)
-            best_dir = None
-            best_count = -1
-            for sd in sub_dirs:
-                cam_bin = sd / "cameras.bin"
-                img_bin = sd / "images.bin"
-                if cam_bin.exists() and img_bin.exists():
-                    rec_tmp = pycolmap.Reconstruction()
-                    rec_tmp.read(str(sd))
-                    if len(rec_tmp.images) > best_count:
-                        best_count = len(rec_tmp.images)
-                        best_dir = sd
+        recs = _run_mapper("pass 1")
 
-            if best_dir is None:
-                raise RuntimeError("GLOMAP global mapper produced no reconstructions.")
+        # ── Split-reconstruction detection + exhaustive retry ──────────────────
+        # COLMAP / GLOMAP both produce one dict entry per connected component.
+        # More than one means the match graph had a gap and the scene split into
+        # disconnected fragments — the largest fragment is used, the rest dropped.
+        # Auto-retry with exhaustive matching when the image count is manageable.
+        if len(recs) > 1:
+            frag_sizes  = sorted((len(r.images) for r in recs.values()), reverse=True)
+            total_imgs  = sum(frag_sizes)
+            frag_report = ", ".join(str(s) for s in frag_sizes)
+            _prog(86, f"WARNING: split reconstruction — {len(recs)} fragments "
+                      f"({frag_report} images). Largest keeps {frag_sizes[0]}/{total_imgs}.")
 
-            best = pycolmap.Reconstruction()
-            best.read(str(best_dir))
-            n_imgs = len(best.images)
-            n_pts  = len(best.points3D)
-            _prog(86, f"GLOMAP complete — {n_imgs} images, {n_pts} 3D points.")
+            if matcher == "sequential" and total_imgs <= 400:
+                _prog(60, f"Auto-retry: clearing matches → exhaustive re-match "
+                          f"({total_imgs} images)…")
 
-        else:
-            # Incremental mapping (pycolmap, rig-constrained).
-            # Seed world frame from anchor (pano_camera0) image pair so COLMAP
-            # initialises with a horizontal baseline.
-            _prog(60, "Running incremental mapping (fixed rig)…")
-            map_opts = pycolmap.IncrementalPipelineOptions(
-                ba_refine_sensor_from_rig=False,
-                ba_refine_focal_length=False,
-                ba_refine_principal_point=False,
-                ba_refine_extra_params=False,
-            )
-            recs = pycolmap.incremental_mapping(
-                str(db_path), str(image_path), str(sparse_path), map_opts
-            )
+                # Clear matches but keep feature extraction (expensive to redo).
+                with sqlite3.connect(str(db_path)) as _conn:
+                    _conn.execute("DELETE FROM matches")
+                    _conn.execute("DELETE FROM two_view_geometries")
 
-            if not recs:
-                raise RuntimeError("COLMAP incremental mapping produced no reconstructions.")
+                # Re-run exhaustive matching
+                if colmap_bin:
+                    _run_cli(["exhaustive_matcher",
+                              "--database_path", str(db_path)], pct=65)
+                else:
+                    _mo2 = pycolmap.FeatureMatchingOptions()
+                    _mo2.rig_verification            = True
+                    _mo2.skip_image_pairs_in_same_frame = True
+                    _match("exhaustive", str(db_path), _mo2)
 
-            best   = max(recs.values(), key=lambda r: len(r.images))
-            n_imgs = len(best.images)
-            n_pts  = len(best.points3D)
-            _prog(86, f"Mapping complete — {n_imgs} images, {n_pts} 3D points.")
+                n2 = _purge_same_frame_pairs(db_path)
+                if n2:
+                    _prog(70, f"Re-purged {n2} same-rig-frame pairs.")
+
+                shutil.rmtree(str(sparse_path))
+                sparse_path.mkdir()
+
+                recs2 = _run_mapper("pass 2 — exhaustive retry")
+                if len(recs2) < len(recs):
+                    _prog(86, f"Retry unified reconstruction to {len(recs2)} fragment(s).")
+                else:
+                    frag_sizes2 = sorted((len(r.images) for r in recs2.values()), reverse=True)
+                    _prog(86, f"Retry: still {len(recs2)} fragments "
+                              f"({', '.join(str(s) for s in frag_sizes2)} images). "
+                              f"Proceeding with largest.")
+                recs = recs2
+            else:
+                _prog(86, f"Scene has {total_imgs} images — exhaustive retry skipped "
+                          f"(threshold 400). Use exhaustive or vocabtree matcher in settings.")
+
+        best   = max(recs.values(), key=lambda r: len(r.images))
+        n_imgs = len(best.images)
+        n_pts  = len(best.points3D)
+        _prog(86, f"Mapping complete — {n_imgs} images, {n_pts} 3D points.")
 
         # ── 6. Write sparse_txt ────────────────────────────────────────────────
         _prog(88, "Writing sparse_txt output…")

@@ -43,6 +43,12 @@ _poll_thread: Optional[threading.Thread] = None
 _poll_stop    = threading.Event()
 _on_new_job:  Optional[Callable] = None
 
+# ── Queue cache (written by background thread, read by API handlers) ──────────
+# Avoids blocking the asyncio event loop with synchronous Firestore reads on
+# every /api/jobs/queue request from the frontend (polled every 8 s).
+_queue_cache: dict = {"jobs": [], "local_jobs": []}
+_queue_cache_lock = threading.Lock()
+
 # Currently running job
 _current_job_id: Optional[str] = None
 
@@ -65,6 +71,30 @@ def _sanitise(d: dict) -> dict:
     for k, v in d.items():
         out[k] = v.isoformat() if hasattr(v, 'isoformat') else v
     return out
+
+
+# ── Startup reset ─────────────────────────────────────────────
+
+def clear_local_jobs_on_startup() -> None:
+    """Reset any local-folder/video jobs left queued/processing from a previous session.
+    The queue is session-only — users reload work by opening a save file."""
+    machine_id = get_machine_id()
+    try:
+        docs = (
+            firebase_client.get_processing_queue()
+            .where('assignedMachine', '==', machine_id)
+            .limit(50)
+            .get()
+        )
+        for doc in docs:
+            data = doc.to_dict()
+            jtype  = data.get('jobType', '')
+            status = data.get('status', '')
+            if jtype in ('local_folder', 'local_video') and status in ('queued', 'processing'):
+                doc.reference.update({'status': 'idle'})
+                print(f"  ↩ Reset stale local job {doc.id} ({data.get('name', '?')}) → idle")
+    except Exception as e:
+        print(f"⚠️ Could not clear local jobs on startup: {e}")
 
 
 # ── Queue polling ─────────────────────────────────────────────
@@ -331,12 +361,21 @@ def get_completed_jobs(limit: int = 20) -> list[dict]:
 
 # ── Polling loop ──────────────────────────────────────────────
 
+def get_queue_cache() -> dict:
+    """Return the last known queue state without hitting Firestore."""
+    with _queue_cache_lock:
+        return dict(_queue_cache)
+
+
 def _poll_loop():
     while not _poll_stop.is_set():
-        if not is_busy():
-            jobs = poll_for_jobs()
-            if jobs and _on_new_job:
-                _on_new_job(jobs[0])
+        jobs       = poll_for_jobs()
+        local_jobs = get_local_folder_jobs()
+        with _queue_cache_lock:
+            _queue_cache["jobs"]       = jobs
+            _queue_cache["local_jobs"] = local_jobs
+        if not is_busy() and jobs and _on_new_job:
+            _on_new_job(jobs[0])
         _poll_stop.wait(_poll_interval)
 
 
@@ -345,6 +384,7 @@ def start_polling(on_new_job: Optional[Callable] = None) -> None:
     _on_new_job = on_new_job
     if _poll_thread is None or not _poll_thread.is_alive():
         _poll_stop.clear()
+        # Warm the cache immediately so the first /api/jobs/queue response isn't empty
         _poll_thread = threading.Thread(target=_poll_loop, daemon=True)
         _poll_thread.start()
         print(f"🔄 Queue polling started (every {_poll_interval}s)")

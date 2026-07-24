@@ -26,6 +26,59 @@ import webbrowser
 import argparse
 import time
 import threading
+import logging
+from datetime import datetime
+from pathlib import Path
+
+
+class _Tee:
+    """Write to multiple streams simultaneously (e.g. console + log file)."""
+    def __init__(self, *streams):
+        self._streams = list(streams)
+
+    def add_stream(self, stream):
+        if stream not in self._streams:
+            self._streams.append(stream)
+
+    def remove_stream(self, stream):
+        try:
+            self._streams.remove(stream)
+        except ValueError:
+            pass
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+    def fileno(self):
+        return self._streams[0].fileno()
+
+    def isatty(self):
+        return False
+
+
+def _setup_file_logging() -> Path:
+    log_dir = Path(__file__).parent / "server_logs"
+    log_dir.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = log_dir / f"{stamp}.log"
+
+    log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
+
+    # Capture uvicorn / FastAPI log records too
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s — %(message)s"))
+    logging.getLogger().addHandler(fh)
+
+    return log_path
+
 
 # Add the project root to the Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +103,8 @@ def main():
     parser.add_argument("--no-browser", action="store_true", help="Don't open browser automatically")
     args = parser.parse_args()
 
+    log_path = _setup_file_logging()
+
     print()
     print("╔══════════════════════════════════════════════════╗")
     print("║         🦅  FieldRaven Desktop                  ║")
@@ -62,6 +117,7 @@ def main():
     print(f"   Server:    http://{args.host}:{args.port}")
     print(f"   API docs:  http://{args.host}:{args.port}/docs")
     print(f"   Jobs dir:  C:\\FieldRaven\\Jobs")
+    print(f"   Log file:  {log_path}")
     print()
 
     if not args.no_browser:

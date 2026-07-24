@@ -43,18 +43,24 @@ def _load_splatpipe(vggt_app_path: str):
 def _make_reporter(on_progress: Optional[Callable[[StageProgress], None]]):
     """Return a callable that fires on_progress and logs to stdout.
 
-    Firebase writes are deduplicated: only pushes when (stage, pct) changes.
-    Without this, every COLMAP log line triggers a synchronous Firebase write,
-    filling the stdout pipe buffer and stalling the COLMAP subprocess.
+    Print is deduplicated on (stage, pct, message) to suppress back-to-back
+    identical calls (e.g. per-frame completion pings in view_extraction).
+    Firebase writes are deduplicated on (stage, pct) — only pushes when the
+    stage/progress key changes, to avoid filling the stdout pipe buffer with
+    synchronous Firebase writes during tight loops like COLMAP matching.
     """
-    _last: list = [None]  # (stage, pct) of last Firebase push
+    _last_print: list = [None]  # (stage, pct, message) of last printed line
+    _last_fb:    list = [None]  # (stage, pct) of last Firebase push
 
     def report(stage: PipelineStage, pct: int, message: str, detail: str = None):
-        print(f"  [{stage.value}] {pct}% — {message}")
+        print_key = (stage, pct, message)
+        if print_key != _last_print[0]:
+            print(f"  [{stage.value}] {pct}% — {message}")
+            _last_print[0] = print_key
         if on_progress:
-            key = (stage, pct)
-            if key != _last[0]:
-                _last[0] = key
+            fb_key = (stage, pct)
+            if fb_key != _last_fb[0]:
+                _last_fb[0] = fb_key
                 on_progress(StageProgress(stage=stage, progress=pct, message=message, detail=detail))
     return report
 
@@ -510,12 +516,12 @@ def run_pipeline(
 
     # Determine which stages to skip when resuming from a saved state.
     # Each key implies all earlier stages are also skipped.
-    _SKIP_STAGE1 = {'view_extraction', 'realityscan', 'brush_training', 'vggt_alignment', 'colmap_export', 'colmap_alignment'}
-    _SKIP_STAGE2 = {'realityscan', 'brush_training', 'vggt_alignment', 'colmap_export', 'colmap_alignment'}
+    _SKIP_STAGE1 = {'view_extraction', 'realityscan', 'brush_training', 'vggt_alignment', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment', 'colmap_export', 'colmap_alignment'}
+    _SKIP_STAGE2 = {'realityscan', 'brush_training', 'vggt_alignment', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment', 'colmap_export', 'colmap_alignment'}
     skip_stage1  = start_from in _SKIP_STAGE1
     skip_stage2  = start_from in _SKIP_STAGE2
-    skip_colmap  = start_from == 'brush_training'
-    skip_rs      = start_from == 'brush_training'
+    skip_colmap  = start_from in ('brush_training', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment')
+    skip_rs      = start_from in ('brush_training', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment')
 
     # ═══════════════════════════════════════════════════════════
     # STAGE 1 — Frame Extraction
@@ -599,8 +605,9 @@ def run_pipeline(
                 return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
 
             def _view_cb(current_view, total_per_frame, _fi=fi):
-                if current_view < total_per_frame:  # skip the per-frame completion ping
-                    view_counter[0] += 1
+                if current_view >= total_per_frame:  # skip the per-frame completion ping
+                    return
+                view_counter[0] += 1
                 pct = min(int(view_counter[0] / total_views * 100), 100)
                 display = min(current_view + 1, total_per_frame)
                 report(
@@ -698,8 +705,29 @@ def run_pipeline(
 
         skip_gluemap = start_from in ("brush_training",) and brush_input_dir.exists()
         if skip_gluemap:
-            report(PipelineStage.GLUEMAP_ALIGNMENT, 100,
-                   "GlueMap alignment skipped — resuming from saved brush_input/")
+            # If brush_input only has .bin files (no .txt), color sampling never ran.
+            # Run it now against the saved GluMap reconstruction before Brush starts.
+            has_txt = any(brush_input_dir.glob("*.txt"))
+            if not has_txt:
+                recon_dir = job_dir / "03_alignment" / "gluemap" / "output" / "gluemap_aba"
+                if not recon_dir.exists():
+                    recon_dir = job_dir / "03_alignment" / "gluemap" / "output" / "coarse"
+                if recon_dir.exists():
+                    report(PipelineStage.GLUEMAP_ALIGNMENT, 97,
+                           "GlueMap: sampling point colors from images (deferred)…")
+                    from .gluemap_runner import _sample_and_write_colored_recon, _generate_viewer
+                    _sample_and_write_colored_recon(recon_dir, brush_input_dir, report,
+                                                    PipelineStage.GLUEMAP_ALIGNMENT)
+                    pitch = settings.pitch_angles[0] if getattr(settings, "pitch_angles", None) else 0.0
+                    _generate_viewer(brush_input_dir, job_dir, pitch_deg=pitch)
+                    report(PipelineStage.GLUEMAP_ALIGNMENT, 100,
+                           "GlueMap alignment resumed — colored point cloud written")
+                else:
+                    report(PipelineStage.GLUEMAP_ALIGNMENT, 100,
+                           "GlueMap alignment skipped — resuming from saved brush_input/")
+            else:
+                report(PipelineStage.GLUEMAP_ALIGNMENT, 100,
+                       "GlueMap alignment skipped — resuming from saved brush_input/")
         else:
             run_gluemap_pipeline(
                 views_dir=views_dir,
@@ -728,6 +756,123 @@ def run_pipeline(
                f"GlueMap complete — {len(recon_files)} file(s) in brush_input/")
 
         if not settings.run_brush and not settings.run_postshot and not skip_gluemap:
+            return PipelineResult(
+                success=True, job_id=job_id, output_dir=str(job_dir),
+                stats={"frames_extracted": n_frames, "views_rendered": total_views},
+            )
+
+        if settings.run_postshot:
+            _run_postshot_training(brush_input_dir, training_dir, settings, report, cancel_event)
+        if settings.run_brush:
+            _run_brush_training(training_dir, settings, report, cancel_event)
+        return PipelineResult(
+            success=True, job_id=job_id, output_dir=str(job_dir),
+            stats={"frames_extracted": n_frames, "views_rendered": total_views},
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # STAGE 3 — RigSfM alignment  (when run_rigsfm=True)
+    # ═══════════════════════════════════════════════════════════
+    if getattr(settings, "run_rigsfm", False):
+        if cancel_event.is_set():
+            return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        from .rigsfm_runner import run_rigsfm_pipeline
+
+        colmap_dir      = job_dir / "03_alignment" / "colmap"
+        brush_input_dir = training_dir / "brush_input"
+
+        skip_rigsfm = start_from in ("brush_training",) and brush_input_dir.exists()
+        if skip_rigsfm:
+            report(PipelineStage.RIGSFM_ALIGNMENT, 100,
+                   "RigSfM alignment skipped — resuming from saved brush_input/")
+        else:
+            run_rigsfm_pipeline(
+                views_dir=views_dir,
+                colmap_dir=colmap_dir,
+                brush_input_dir=brush_input_dir,
+                settings=settings,
+                report=report,
+                cancel_event=cancel_event,
+                project_dir=job_dir,
+                source_dir=Path(source_dir),
+            )
+
+            if cancel_event.is_set():
+                return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        recon_files = (
+            list(brush_input_dir.glob("*.txt")) + list(brush_input_dir.glob("*.bin"))
+        ) if brush_input_dir.exists() else []
+        if not recon_files:
+            return PipelineResult(
+                success=False, job_id=job_id, output_dir=str(job_dir),
+                error="RigSfM produced no reconstruction files in brush_input/. "
+                      "Check the server log for worker output.",
+            )
+
+        report(PipelineStage.RIGSFM_ALIGNMENT, 100,
+               f"RigSfM complete — {len(recon_files)} file(s) in brush_input/")
+
+        if not settings.run_brush and not settings.run_postshot and not skip_rigsfm:
+            return PipelineResult(
+                success=True, job_id=job_id, output_dir=str(job_dir),
+                stats={"frames_extracted": n_frames, "views_rendered": total_views},
+            )
+
+        if settings.run_postshot:
+            _run_postshot_training(brush_input_dir, training_dir, settings, report, cancel_event)
+        if settings.run_brush:
+            _run_brush_training(training_dir, settings, report, cancel_event)
+        return PipelineResult(
+            success=True, job_id=job_id, output_dir=str(job_dir),
+            stats={"frames_extracted": n_frames, "views_rendered": total_views},
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # STAGE 3 — EquiSfM alignment  (when run_equisfm=True)
+    # ═══════════════════════════════════════════════════════════
+    if getattr(settings, "run_equisfm", False):
+        if cancel_event.is_set():
+            return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        from .equi_sfm_runner import run_equisfm_pipeline
+
+        colmap_dir      = job_dir / "03_alignment" / "colmap"
+        brush_input_dir = training_dir / "brush_input"
+
+        skip_equisfm = start_from in ("brush_training",) and brush_input_dir.exists()
+        if skip_equisfm:
+            report(PipelineStage.EQUISFM_ALIGNMENT, 100,
+                   "EquiSfM alignment skipped — resuming from saved brush_input/")
+        else:
+            run_equisfm_pipeline(
+                source_dir=Path(source_dir),
+                views_dir=views_dir,
+                colmap_dir=colmap_dir,
+                brush_input_dir=brush_input_dir,
+                settings=settings,
+                report=report,
+                cancel_event=cancel_event,
+            )
+
+            if cancel_event.is_set():
+                return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        recon_files = (
+            list(brush_input_dir.glob("*.txt")) + list(brush_input_dir.glob("*.bin"))
+        ) if brush_input_dir.exists() else []
+        if not recon_files:
+            return PipelineResult(
+                success=False, job_id=job_id, output_dir=str(job_dir),
+                error="EquiSfM produced no reconstruction files in brush_input/. "
+                      "Check the server log for worker output.",
+            )
+
+        report(PipelineStage.EQUISFM_ALIGNMENT, 100,
+               f"EquiSfM complete — {len(recon_files)} file(s) in brush_input/")
+
+        if not settings.run_brush and not settings.run_postshot and not skip_equisfm:
             return PipelineResult(
                 success=True, job_id=job_id, output_dir=str(job_dir),
                 stats={"frames_extracted": n_frames, "views_rendered": total_views},

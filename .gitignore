@@ -19,6 +19,13 @@ venv/
 tools/*.exe
 tools/*.obj
 tools/*.pdb
+tools/*.bin
+
+# Runtime logs and build artefacts
+server_logs/
+logs/
+log.md
+frontend-react/release/
 
 # IDE
 .vscode/

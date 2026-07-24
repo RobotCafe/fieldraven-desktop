@@ -4,6 +4,7 @@ Pipeline runner: manages one SplatPipe background thread per accepted job.
 import json
 import os
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -84,6 +85,30 @@ _STAGE_RANGE_GLUEMAP_POST_STITCH = {
     "gluemap_alignment":  (72, 88),
     "brush_training":     (88, 97),
 }
+_STAGE_RANGE_RIGSFM = {
+    "frame_extraction":   (5,  20),
+    "view_extraction":    (20, 45),
+    "rigsfm_alignment":   (45, 82),
+    "brush_training":     (82, 97),
+}
+_STAGE_RANGE_RIGSFM_POST_STITCH = {
+    "frame_extraction":   (47, 57),
+    "view_extraction":    (57, 72),
+    "rigsfm_alignment":   (72, 88),
+    "brush_training":     (88, 97),
+}
+_STAGE_RANGE_EQUISFM = {
+    "frame_extraction":   (5,  20),
+    "view_extraction":    (20, 45),
+    "equisfm_alignment":  (45, 82),
+    "brush_training":     (82, 97),
+}
+_STAGE_RANGE_EQUISFM_POST_STITCH = {
+    "frame_extraction":   (47, 57),
+    "view_extraction":    (57, 72),
+    "equisfm_alignment":  (72, 88),
+    "brush_training":     (88, 97),
+}
 
 _cancel_events: dict[str, threading.Event] = {}
 _threads:       dict[str, threading.Thread] = {}
@@ -94,8 +119,20 @@ _threads:       dict[str, threading.Thread] = {}
 def start(job_id: str, job_data: dict) -> bool:
     """Spawn a pipeline thread for job_id. Returns False if already running."""
     if job_id in _threads and _threads[job_id].is_alive():
-        print(f"⚠️  Pipeline already running for {job_id}")
-        return False
+        # If a cancel is in-flight, wait briefly for the thread to finish cleanup
+        # before allowing a re-run.  This lets the user cancel and immediately
+        # re-run without getting a 409 "already running" error.
+        cancel_ev = _cancel_events.get(job_id)
+        if cancel_ev and cancel_ev.is_set():
+            print(f"⏳ Cancel in-flight for {job_id} — waiting for thread to finish…")
+            _threads[job_id].join(timeout=15.0)
+            if _threads[job_id].is_alive():
+                print(f"⚠️  Pipeline still cleaning up for {job_id}, try again shortly")
+                return False
+            print(f"✅ Previous thread cleaned up — starting fresh for {job_id}")
+        else:
+            print(f"⚠️  Pipeline already running for {job_id}")
+            return False
     cancel = threading.Event()
     _cancel_events[job_id] = cancel
     t = threading.Thread(
@@ -205,6 +242,20 @@ def _build_settings(job_data: dict):
     cfg = dict(splat_config.load())
     s = PipelineSettings()
 
+    # Merge fieldraven.json["settings"] from the project directory into cfg so
+    # project-level settings (e.g. rigsfm_quad_anchors) are picked up.
+    _proj_dir = job_data.get("projectDir")
+    if _proj_dir:
+        _fj_path = Path(_proj_dir) / "fieldraven.json"
+        if _fj_path.exists():
+            try:
+                _fj = json.loads(_fj_path.read_text(encoding="utf-8"))
+                _fj_settings = _fj.get("settings") or {}
+                cfg.update({k: str(v) for k, v in _fj_settings.items()
+                            if isinstance(v, (str, bool, int, float))})
+            except Exception as _fj_err:
+                print(f"⚠️  Could not read fieldraven.json settings: {_fj_err}")
+
     # ── Extraction ────────────────────────────────────────────────
     s.extraction_method = cfg.get("extraction_method", s.extraction_method)
     s.interval_value    = float(cfg.get("interval_value", s.interval_value))
@@ -273,7 +324,14 @@ def _build_settings(job_data: dict):
     s.brush_path       = cfg.get("brush_path") or s.brush_path
     s.rs_path          = cfg.get("rs_path") or s.rs_path
     s.rs_settings_path = cfg.get("rs_settings_path") or s.rs_settings_path
-    s.colmap_bin       = cfg.get("colmap_bin") or s.colmap_bin
+    s.colmap_bin            = cfg.get("colmap_bin") or s.colmap_bin
+    s.rigsfm_quad_anchors   = _to_bool(cfg.get("rigsfm_quad_anchors", s.rigsfm_quad_anchors))
+    s.colmap_vocab_tree     = cfg.get("colmap_vocab_tree", s.colmap_vocab_tree) or s.colmap_vocab_tree
+    if cfg.get("colmap_image_width"):
+        try:
+            s.colmap_image_width = int(float(cfg["colmap_image_width"]))
+        except (ValueError, TypeError):
+            pass
 
     # ── Per-job Firestore overrides (from processing_queue.settings) ─
     js = job_data.get("settings") or {}
@@ -301,6 +359,7 @@ def _build_settings(job_data: dict):
         if "export_xmp" in ui:        s.use_rig_xmp        = _to_bool(ui["export_xmp"])
         if "gps_priors_rs" in ui:     s.gps_priors_rs      = _to_bool(ui["gps_priors_rs"])
         if "gps_priors_colmap" in ui: s.gps_priors_colmap  = _to_bool(ui["gps_priors_colmap"])
+        if "skip_realityscan" in ui:  s.skip_realityscan  = _to_bool(ui["skip_realityscan"])
         if "run_colmap" in ui:        s.run_colmap        = _to_bool(ui["run_colmap"])
         if "colmap_mode" in ui:       s.colmap_mode       = ui["colmap_mode"]
         if "colmap_matcher" in ui:    s.colmap_matcher    = ui["colmap_matcher"]
@@ -310,6 +369,23 @@ def _build_settings(job_data: dict):
         if "colmap_orientation_align" in ui:   s.colmap_orientation_align   = _to_bool(ui["colmap_orientation_align"])
         if "colmap_mapper" in ui:              s.colmap_mapper              = ui["colmap_mapper"]
         if "colmap_vocab_tree" in ui:          s.colmap_vocab_tree          = ui["colmap_vocab_tree"]
+        if "run_gluemap" in ui:                s.run_gluemap                = _to_bool(ui["run_gluemap"])
+        if "gluemap_backbone" in ui:           s.gluemap_backbone           = ui["gluemap_backbone"]
+        if "gluemap_skip_doppelgangers" in ui: s.gluemap_skip_doppelgangers = _to_bool(ui["gluemap_skip_doppelgangers"])
+        if "gluemap_coarse_only" in ui:        s.gluemap_coarse_only        = _to_bool(ui["gluemap_coarse_only"])
+        if "gluemap_is_sequential" in ui:      s.gluemap_is_sequential      = _to_bool(ui["gluemap_is_sequential"])
+        if "gluemap_num_neighbors" in ui:      s.gluemap_num_neighbors      = int(float(ui["gluemap_num_neighbors"]))
+        if "gluemap_batch_size" in ui:         s.gluemap_batch_size         = int(float(ui["gluemap_batch_size"]))
+        if "gluemap_num_track_per_img" in ui:  s.gluemap_num_track_per_img  = int(float(ui["gluemap_num_track_per_img"]))
+        if "gluemap_wsl_home" in ui:           s.gluemap_wsl_home           = ui["gluemap_wsl_home"]
+        if "gluemap_wsl_distro" in ui:         s.gluemap_wsl_distro         = ui["gluemap_wsl_distro"]
+        if "run_rigsfm" in ui:                 s.run_rigsfm                 = _to_bool(ui["run_rigsfm"])
+        if "rigsfm_anchor_sensor" in ui:       s.rigsfm_anchor_sensor       = int(float(ui["rigsfm_anchor_sensor"]))
+        if "rigsfm_matcher" in ui:             s.rigsfm_matcher             = ui["rigsfm_matcher"]
+        if "rigsfm_quad_anchors" in ui:        s.rigsfm_quad_anchors        = _to_bool(ui["rigsfm_quad_anchors"])
+        if "run_equisfm" in ui:                s.run_equisfm                = _to_bool(ui["run_equisfm"])
+        if "equisfm_matcher" in ui:            s.equisfm_matcher            = ui["equisfm_matcher"]
+        if "colmap_image_width" in ui:         s.colmap_image_width         = int(float(ui["colmap_image_width"]))
         if "yaw_steps" in ui:         s.yaw_steps         = int(ui["yaw_steps"])
         if "fov" in ui:               s.fov               = float(ui["fov"])
         if "horizon_ref" in ui:       s.horizon_ref       = _to_bool(ui["horizon_ref"])
@@ -411,14 +487,96 @@ def _stitch_insp_files(job_id: str, cancel_event: threading.Event, job_data: Opt
                 job_id, pct, f"Stitched {done[0]}/{total}: {insp.name}"
             )
 
+    # ── Validate outputs: a valid equirectangular is always several MB; <50 KB
+    #    means the stitch process produced a truncated or empty file.
+    #    Check input_dir directly — the .thumbs/ sub-folder is never consulted.
+    _MIN_JPG = 50_000
+    bad = [
+        f for f in insp_files
+        if not (input_dir / (f.stem + ".jpg")).exists()
+        or (input_dir / (f.stem + ".jpg")).stat().st_size < _MIN_JPG
+    ]
+    if bad and not cancel_event.is_set():
+        print(f"🔄 {len(bad)} file(s) have missing/truncated output — retrying…")
+        queue_manager.update_job_progress(job_id, 46, f"Retrying {len(bad)} failed conversion(s)…")
+        for f in bad:
+            bad_out = input_dir / (f.stem + ".jpg")
+            if bad_out.exists():
+                bad_out.unlink()
+            # Also drop any stale thumbnail so it gets rebuilt from the fresh JPEG
+            stale_thumb = input_dir / ".thumbs" / (f.stem + ".jpg")
+            if stale_thumb.exists():
+                stale_thumb.unlink()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures2 = {pool.submit(_stitch_one, insp): insp for insp in bad}
+            for future in _as_completed(futures2):
+                if cancel_event.is_set():
+                    break
+                insp = futures2[future]
+                success = future.result()
+                with lock:
+                    if success:
+                        ok[0] += 1
+        still_bad = [
+            f for f in bad
+            if not (input_dir / (f.stem + ".jpg")).exists()
+            or (input_dir / (f.stem + ".jpg")).stat().st_size < _MIN_JPG
+        ]
+        if still_bad:
+            print(f"❌ {len(still_bad)} file(s) could not be stitched after retry: "
+                  + ", ".join(f.name for f in still_bad))
+        else:
+            print(f"✅ All retry conversions succeeded")
+
     return ok[0]
 
 
 # ── Worker thread ─────────────────────────────────────────────
 
 def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
+    # Open a fresh log file for this run and splice into the global stdout tee.
+    _log_dir = Path(__file__).parent.parent / "server_logs"
+    _log_dir.mkdir(exist_ok=True)
+    _run_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    _run_log_path = _log_dir / f"pipeline_{_run_stamp}_{job_id[:8]}.log"
+    _run_log = open(str(_run_log_path), "w", encoding="utf-8", buffering=1)
+    if hasattr(sys.stdout, "add_stream"):
+        sys.stdout.add_stream(_run_log)
+    if hasattr(sys.stderr, "add_stream"):
+        sys.stderr.add_stream(_run_log)
+
+    _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n{'═'*52}\n PIPELINE START  job={job_id}  {_ts}\n{'═'*52}")
     try:
         queue_manager.update_job_progress(job_id, 1, "Initialising pipeline…", milestone=True)
+
+        # Persist mobile job metadata into fieldraven.json so the resume path
+        # always has userId, userJobId, and exact session times without Firestore.
+        _uid  = job_data.get("userId")  or job_data.get("user_id")
+        _ujid = job_data.get("userJobId") or job_data.get("user_job_id")
+        if _uid or _ujid:
+            try:
+                _write_stage_progress(_job_root(job_id, job_data), "mobile_ids", {
+                    "userId": _uid, "userJobId": _ujid,
+                })
+            except Exception:
+                pass
+        if _uid and _ujid:
+            try:
+                _db_early = firebase_client.get_db()
+                _snap = (_db_early.collection("users")
+                         .document(_uid).collection("jobs").document(_ujid).get())
+                if _snap.exists:
+                    _md   = _snap.to_dict() or {}
+                    _s_ms = _md.get("startTime")
+                    _e_ms = _md.get("endTime")
+                    if _s_ms and _e_ms:
+                        _write_stage_progress(_job_root(job_id, job_data), "session_times", {
+                            "startMs": int(_s_ms), "endMs": int(_e_ms),
+                        })
+                        print("  [mobile] Session times persisted to fieldraven.json")
+            except Exception as _e_persist:
+                print(f"  [mobile] Could not persist session times: {_e_persist}")
 
         # Stitch any .insp files to equirectangular JPEGs before the pipeline runs
         input_dir = _input_dir(_job_root(job_id, job_data))
@@ -504,9 +662,18 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
 
         use_colmap      = getattr(settings, "run_colmap",   False)
         use_gluemap     = getattr(settings, "run_gluemap",  False)
-        use_rs_brush    = not settings.run_vggt and not use_colmap and not use_gluemap and settings.run_brush and not settings.run_postshot
-        use_rs_postshot = not settings.run_vggt and not use_colmap and not use_gluemap and settings.run_postshot and not settings.run_brush
-        if use_rs_brush:
+        use_rigsfm      = getattr(settings, "run_rigsfm",   False)
+        use_equisfm     = getattr(settings, "run_equisfm",  False)
+        _no_sfm         = not settings.run_vggt and not use_colmap and not use_gluemap and not use_rigsfm and not use_equisfm
+        use_rs_brush    = _no_sfm and settings.run_brush and not settings.run_postshot
+        use_rs_postshot = _no_sfm and settings.run_postshot and not settings.run_brush
+        if use_equisfm:
+            stage_map = _STAGE_RANGE_EQUISFM_POST_STITCH if insp_count else _STAGE_RANGE_EQUISFM
+            print(f"  → Stage map: EquiSfM {'(post-stitch)' if insp_count else '(direct)'}")
+        elif use_rigsfm:
+            stage_map = _STAGE_RANGE_RIGSFM_POST_STITCH if insp_count else _STAGE_RANGE_RIGSFM
+            print(f"  → Stage map: RigSfM {'(post-stitch)' if insp_count else '(direct)'}")
+        elif use_rs_brush:
             stage_map = _STAGE_RANGE_RS_BRUSH_POST_STITCH if insp_count else _STAGE_RANGE_RS_BRUSH
             print(f"  → Stage map: RS+Brush {'(post-stitch)' if insp_count else '(direct)'}")
         elif use_rs_postshot:
@@ -527,9 +694,14 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         def on_progress(sp):
             lo, hi = stage_map.get(sp.stage.value, (0, 97))
             overall = int(lo + (sp.progress / 100) * (hi - lo))
-            print(f"  [{sp.stage.value}] {sp.progress}% — {sp.message[:120]}")
+            if sp.stage.value != _last_stage[0]:
+                _last_stage[0] = sp.stage.value
+                _sep = f"── {sp.stage.value} " + "─" * max(1, 44 - len(sp.stage.value))
+                print(f"\n{_sep}")
             print(f"  → {sp.stage.value} {sp.progress}% → overall {overall}% [{lo}–{hi}]")
-            _mode = ("rs_brush"    if use_rs_brush
+            _mode = ("equisfm"  if use_equisfm
+                     else "rigsfm"   if use_rigsfm
+                     else "rs_brush" if use_rs_brush
                      else "rs_brush" if use_rs_postshot
                      else "colmap"   if use_colmap
                      else "gluemap"  if use_gluemap
@@ -632,23 +804,19 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     except Exception as _loc_exc:
                         print(f"  [location] Non-fatal: {_loc_exc}")
 
-                    # Auto-fetch Garmin activity — ONLY when the mobile app
-                    # provided confirmed session times. Without start+end we
-                    # cannot reliably match a Garmin activity: the date-only
-                    # fallback searches by today's folder mtime and will
-                    # incorrectly attach unrelated activities to old jobs.
+                    # Auto-fetch Garmin activity using exact session times.
+                    # Requires mobile job start/end — no date-only guessing.
                     try:
                         from splatpipe_core import garmin_fetcher
                         _session_start, _session_end = _get_session_times(job_id, job_data, _db)
                         if _session_start and _session_end:
                             garmin_fetcher.fetch_and_store(
-                                job_id, _session_start.date(), _db,
+                                job_id, _session_start.astimezone().date(), _db,
                                 session_start=_session_start,
                                 session_end=_session_end,
                             )
                         else:
-                            print("  [garmin] Skipping — no mobile session times "
-                                  "(job predates mobile app or mobile job not found)")
+                            print("  [garmin] Skipping — no session times (not a mobile job or times not saved)")
                     except Exception as _g_exc:
                         print(f"  [garmin] Non-fatal: {_g_exc}")
                 elif ply_file and not r2_client.is_configured():
@@ -670,9 +838,21 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         import traceback
         traceback.print_exc()
         queue_manager.fail_job(job_id, f"Unexpected error: {exc}")
+        _ts2 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n{'═'*52}\n PIPELINE FAILED  job={job_id}  {_ts2}\n{'═'*52}\n")
+    else:
+        _ts2 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n{'═'*52}\n PIPELINE COMPLETE  job={job_id}  {_ts2}\n{'═'*52}\n")
     finally:
         _cancel_events.pop(job_id, None)
         _threads.pop(job_id, None)
+        if hasattr(sys.stdout, "remove_stream"):
+            sys.stdout.remove_stream(_run_log)
+        if hasattr(sys.stderr, "remove_stream"):
+            sys.stderr.remove_stream(_run_log)
+        _run_log.flush()
+        _run_log.close()
+        print(f"  [run-log] {_run_log_path.name}")
 
 
 _SPZ_SCRIPT = Path(__file__).parent.parent / "scripts" / "spz" / "convert.mjs"
@@ -917,19 +1097,46 @@ def _get_mobile_job_doc(job_id: str, job_data: dict, db) -> "Optional[dict]":
 
 def _get_session_times(job_id: str, job_data: dict, db):
     """
-    Return (start_datetime, end_datetime) from the mobile app job doc.
-    Both values are naive local datetimes, or (None, None) if unavailable.
+    Return (start, end) as UTC-aware datetimes, or (None, None) if unavailable.
+
+    Priority:
+      1. fieldraven.json session_times (persisted at job start — survives resume)
+      2. Mobile job doc startTime/endTime from Firestore
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
+    import json as _json
+
+    def _ms_to_utc(ms):
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+    # 1. fieldraven.json — always preferred on resume
+    try:
+        fj_path = _job_root(job_id, job_data) / "fieldraven.json"
+        if fj_path.exists():
+            fj = _json.loads(fj_path.read_text(encoding="utf-8"))
+            st = fj.get("session_times", {})
+            s_ms, e_ms = st.get("startMs"), st.get("endMs")
+            if s_ms and e_ms:
+                start, end = _ms_to_utc(s_ms), _ms_to_utc(e_ms)
+                print(f"  [mobile] Session from fieldraven.json: "
+                      f"{start.astimezone().strftime('%Y-%m-%d %H:%M')} → "
+                      f"{end.astimezone().strftime('%H:%M %Z')}")
+                return start, end
+    except Exception:
+        pass
+
+    # 2. Firestore mobile job doc
     doc = _get_mobile_job_doc(job_id, job_data, db)
     if not doc:
         return None, None
-    start_ms = doc.get("startTime")
-    end_ms   = doc.get("endTime")
-    start = datetime.fromtimestamp(start_ms / 1000) if start_ms else None
-    end   = datetime.fromtimestamp(end_ms   / 1000) if end_ms   else None
-    if start and end:
-        print(f"  [mobile] Session: {start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%H:%M')}")
+    s_ms = doc.get("startTime")
+    e_ms = doc.get("endTime")
+    if not (s_ms and e_ms):
+        return None, None
+    start, end = _ms_to_utc(s_ms), _ms_to_utc(e_ms)
+    print(f"  [mobile] Session: "
+          f"{start.astimezone().strftime('%Y-%m-%d %H:%M')} → "
+          f"{end.astimezone().strftime('%H:%M %Z')}")
     return start, end
 
 
@@ -1042,8 +1249,32 @@ def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
     This requires an extra Rx on the right:
         R_viewer = Rx(π) @ R_cam_to_world @ Rx(π)
     """
-    import json, tempfile, numpy as np
+    import json, re, tempfile, numpy as np
+    from pathlib import PurePosixPath
     from . import r2_client
+
+    def _sensor_frame(image_name: str) -> tuple[str, str]:
+        """Return (sensor, frame_key) from COLMAP image path."""
+        p = PurePosixPath(image_name)
+        if len(p.parts) >= 2:
+            return p.parts[0], p.stem          # "pano_camera5", "IMG_1234"
+        m = re.match(r'^(pano_camera\d+)_(.+)$', p.stem)
+        return (m.group(1), m.group(2)) if m else ('', p.stem)
+
+    def _thumb_b64(img_path: Path, max_px: int = 96) -> str | None:
+        """Return a base64 JPEG thumbnail, or None if PIL unavailable / image missing."""
+        if not img_path.exists():
+            return None
+        try:
+            import io, base64
+            from PIL import Image
+            with Image.open(img_path) as im:
+                im.thumbnail((max_px, max_px))
+                buf = io.BytesIO()
+                im.convert("RGB").save(buf, format="JPEG", quality=60)
+                return base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            return None
 
     if not r2_client.is_configured():
         return
@@ -1064,6 +1295,14 @@ def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
 
     images_txt = candidates[0]
     print(f"  [cameras] Reading poses from {images_txt.relative_to(proj_root)}")
+
+    # Images live in an "images/" sibling directory next to images.txt
+    images_dir = images_txt.parent / "images"
+    has_images = images_dir.is_dir()
+    if has_images:
+        print(f"  [cameras] Thumbnails: {images_dir.relative_to(proj_root)}")
+    else:
+        print("  [cameras] No images/ directory found — thumbnails skipped")
 
     raw = _parse_images_txt(images_txt)
     if not raw:
@@ -1094,11 +1333,20 @@ def _build_and_upload_cameras_json(proj_root: Path, job_id: str) -> None:
         R_viewer = Rx @ R_cw.T @ Rx
         vqw, vqx, vqy, vqz = _mat_to_quat(R_viewer)
 
-        out.append({
+        sensor, frame_key = _sensor_frame(_name)
+        thumb = _thumb_b64(images_dir / _name) if has_images else None
+
+        entry: dict = {
             "px": round(px, 4), "py": round(py, 4), "pz": round(pz, 4),
             "qw": round(vqw, 5), "qx": round(vqx, 5),
             "qy": round(vqy, 5), "qz": round(vqz, 5),
-        })
+            "name": _name,
+            "sensor": sensor,
+            "frame_key": frame_key,
+        }
+        if thumb:
+            entry["thumb"] = thumb
+        out.append(entry)
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:

@@ -11,6 +11,7 @@ import sys
 import json
 import base64
 import io
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -84,7 +85,7 @@ def _parse_images_txt(rec_dir: Path) -> dict:
     return result
 
 
-def extract(rec_dir: Path):
+def extract(rec_dir: Path, images_path: Path = None):
     import pycolmap
 
     rec = pycolmap.Reconstruction()
@@ -105,11 +106,15 @@ def extract(rec_dir: Path):
             print(f"DIAG anchor cam pitch (direct parse): {pitch:.3f}°", flush=True)
             break
 
-    images_root = rec_dir / "images"
-    if not images_root.exists():
-        images_root = rec_dir.parent / "images"
-    if not images_root.exists():
-        images_root = rec_dir.parent.parent / "images"
+    if images_path and Path(images_path).exists():
+        images_root = Path(images_path)
+    else:
+        images_root = rec_dir / "images"
+        if not images_root.exists():
+            images_root = rec_dir.parent / "images"
+        if not images_root.exists():
+            images_root = rec_dir.parent.parent / "images"
+    print(f"  [visualizer] images_root: {images_root} (exists={images_root.exists()})", flush=True)
 
     cameras_data = []
     for img_id, (R, t, cam_id, name) in sorted(img_poses.items()):
@@ -146,14 +151,73 @@ def extract(rec_dir: Path):
             "rgb": [int(c) for c in pt.color],
         })
 
-    return cameras_data, pts_data
+    # Per-frame rig optical-center spread
+    _frame_groups = defaultdict(list)
+    for c in cameras_data:
+        _frame_groups[c["frame_key"]].append(c)
+
+    spread_data = {}
+    for fk, cams in _frame_groups.items():
+        _ctrs = np.array([c["center"] for c in cams])
+        _cen  = _ctrs.mean(axis=0)
+        _dsts = np.linalg.norm(_ctrs - _cen, axis=1)
+        spread_data[fk] = {
+            "centroid": _cen.tolist(),
+            "sensors":  {c["sensor"]: float(d) for c, d in zip(cams, _dsts)},
+            "mean":     float(_dsts.mean()),
+            "max":      float(_dsts.max()),
+        }
+
+    # Load Pi3 quad crop poses if present (quad_anchors mode)
+    quad_poses = []
+    quad_json = rec_dir.parent / "pi3_quad_poses.json"
+    if quad_json.exists():
+        raw_qp = json.loads(quad_json.read_text(encoding="utf-8"))
+        for r in raw_qp:
+            quad_poses.append({
+                "station":  r["station"],
+                "h_idx":    r["h_idx"],
+                "yaw_deg":  r["yaw_deg"],
+                "center":   _c(r["center"]),
+                "forward":  _c(r["forward"]),
+            })
+        print(f"  [visualizer] Loaded {len(quad_poses)} Pi3 quad crop poses", flush=True)
+
+    return cameras_data, pts_data, spread_data, quad_poses
 
 
-def build_html(cameras: list, points: list, pitch_deg: float = -10.0, correction_deg: float = 0.0) -> str:
-    depth      = _scene_scale(cameras)
-    n          = len(cameras)
-    cams_json  = json.dumps(cameras)
-    pts_json   = json.dumps(points)
+def build_html(cameras: list, points: list, pitch_deg: float = -10.0, correction_deg: float = 0.0, anchor_sensor: str = "pano_camera7", spread: dict = None, quad_poses: list = None) -> str:
+    depth          = _scene_scale(cameras)
+    n              = len(cameras)
+    cams_json      = json.dumps(cameras)
+    pts_json       = json.dumps(points)
+    quad_poses_json = json.dumps(quad_poses or [])
+
+    # Anchor mode — sensor picker options
+    sensors = sorted(
+        set(c["sensor"] for c in cameras),
+        key=lambda s: int(''.join(ch for ch in s if ch.isdigit()) or 0),
+    )
+    anchor_opts = "\n".join(
+        f'<option value="{s}"{" selected" if s == anchor_sensor else ""}>{s}</option>'
+        for s in sensors
+    )
+    # Number of non-anchor sibling sensors (reveal slider max)
+    n_non_anchor_sensors = len(set(c["sensor"] for c in cameras if c["sensor"] != anchor_sensor)) or 1
+
+    # Spread stats
+    spread_json = json.dumps(spread or {})
+    if spread:
+        _all_maxes = [v["max"] for v in spread.values()]
+        _all_means = [v["mean"] for v in spread.values()]
+        _omax  = max(_all_maxes)
+        _omean = sum(_all_means) / len(_all_means)
+        spread_stats_html = (
+            f'<div class="dim" style="margin-top:3px" title="optical-center spread from rig centroid (scene units)">'
+            f'spread &nbsp;μ {_omean:.5f} &nbsp;·&nbsp; max {_omax:.5f}</div>'
+        )
+    else:
+        spread_stats_html = ''
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -228,7 +292,7 @@ input[type=range]    {{ flex: 1; accent-color: #6e82ff; cursor: pointer; height:
   font: 12px/1.5 'SF Mono', 'Fira Code', ui-monospace, monospace;
   color: #c4c4cc;
   padding: 12px;
-  width: 320px;
+  width: 340px;
   display: none;
   flex-direction: column;
   gap: 10px;
@@ -261,6 +325,12 @@ input[type=range]    {{ flex: 1; accent-color: #6e82ff; cursor: pointer; height:
   display:flex; align-items:center; justify-content:center;
   color:#333; font-size:9px;
 }}
+
+/* ── target map ──────────────────────────────────────────────────────────── */
+#target-section {{ margin-top: 0; }}
+#target-canvas  {{ display:block; border-radius:6px; border:1px solid rgba(255,255,255,.07);
+                   margin:0 auto; cursor:default; }}
+#target-legend  {{ display:flex; flex-wrap:wrap; gap:1px; margin-top:6px; justify-content:center; }}
 </style>
 </head>
 <body>
@@ -273,6 +343,8 @@ input[type=range]    {{ flex: 1; accent-color: #6e82ff; cursor: pointer; height:
     <div class="row"><label><input type="checkbox" id="chkFrustums" checked> Frustums</label></div>
     <div class="row"><label><input type="checkbox" id="chkPoints"   checked> Point cloud</label></div>
     <div class="row"><label><input type="checkbox" id="chkRays"> Fwd rays</label></div>
+    <div class="row"><label><input type="checkbox" id="chkPath" checked> Pi3 path</label></div>
+    <div class="row"><label><input type="checkbox" id="chkCrops" checked> Pi3 crops</label></div>
     <div class="row">
       <label><input type="checkbox" id="chkSphere" checked> Ref sphere</label>
       <span class="val" id="sphere-pitch" style="font-size:10px">…</span>
@@ -282,11 +354,30 @@ input[type=range]    {{ flex: 1; accent-color: #6e82ff; cursor: pointer; height:
     <div class="sep"></div>
     <div class="row">
       <span style="flex:0 0 auto">Image size</span>
-      <input type="range" id="depth-slider" min="0.15" max="4" step="0.05" value="1">
-      <span class="val" id="depth-label">1.00x</span>
+      <input type="range" id="depth-slider" min="0.05" max="0.6" step="0.01" value="0.15">
+      <span class="val" id="depth-label">0.15x</span>
+    </div>
+    <div class="sep"></div>
+    <div class="row" style="gap:6px">
+      <label style="flex:0 0 auto"><input type="checkbox" id="chkAnchor"> Anchor</label>
+      <select id="anchor-select" style="flex:1;background:#1a1a22;border:1px solid #2a2a3a;color:#aaa;border-radius:4px;font-size:10px;padding:2px 4px">{anchor_opts}</select>
+    </div>
+    <div id="anchor-panel" style="display:none;margin-top:4px">
+      <div class="row">
+        <span style="flex:0 0 auto;font-size:10px">Fade</span>
+        <input type="range" id="fade-slider" min="0" max="1" step="0.05" value="1">
+        <span class="val" id="fade-val">100%</span>
+      </div>
+      <div class="row">
+        <span style="flex:0 0 auto;font-size:10px">Reveal</span>
+        <input type="range" id="reveal-slider" min="0" max="{n_non_anchor_sensors}" step="1" value="0">
+        <span class="val" id="reveal-val">0/{n_non_anchor_sensors}</span>
+      </div>
     </div>
     <div class="sep"></div>
     <div class="dim" id="stats">cameras: {n} &nbsp;·&nbsp; points: {len(points)}</div>
+    {spread_stats_html}
+    {'<canvas id="spread-chart" width="162" height="56" style="width:100%;height:56px;border-radius:3px;margin-top:5px;cursor:crosshair;display:block"></canvas><div id="spread-tooltip" style="font-size:9px;color:#5a5a6a;margin-top:2px;min-height:1.4em;line-height:1.4"></div>' if spread else ''}
     <div class="dim" style="margin-top:3px">drag·scroll·shift+drag &nbsp;·&nbsp; ← →</div>
   </div>
 
@@ -301,6 +392,7 @@ input[type=range]    {{ flex: 1; accent-color: #6e82ff; cursor: pointer; height:
     </div>
     <div class="cam-name" id="cam-name">&nbsp;</div>
     <div class="cam-meta" id="cam-angles" style="display:none;color:#6e82ff">&nbsp;</div>
+    <div class="cam-meta" id="spread-info" style="display:none;color:#666;font-size:10px;line-height:1.6">&nbsp;</div>
     <div class="nav-row">
       <button id="prev-btn">&#9664;</button>
       <input type="range" id="cam-slider" min="0" max="{n-1}" step="1" value="0">
@@ -313,6 +405,12 @@ input[type=range]    {{ flex: 1; accent-color: #6e82ff; cursor: pointer; height:
     <div class="gallery-header">Rig sensors</div>
     <div class="gallery-frame-id" id="gallery-frame-id">&nbsp;</div>
     <div class="gallery-grid" id="gallery-grid"></div>
+    <div class="sep" id="target-sep" style="display:none;margin-top:8px"></div>
+    <div id="target-section" style="display:none">
+      <div class="gallery-header" style="margin-bottom:5px">Nodal spread</div>
+      <canvas id="target-canvas" width="260" height="200"></canvas>
+      <div id="target-legend"></div>
+    </div>
   </div>
 
 </div>
@@ -333,6 +431,10 @@ const POINTS         = {pts_json};
 const DEPTH_BASE     = {depth:.6f};
 const KNOWN_PITCH_DEG = {pitch_deg:.1f}; // rig pitch from pipeline settings
 const CORRECTION_DEG  = {correction_deg:.1f}; // post-hoc gravity correction applied to sparse_txt
+const SPREAD          = {spread_json};
+const SPREAD_SCALE    = Object.values(SPREAD).reduce((m, f) => Math.max(m, f.max), 1e-9);
+const ANCHOR_SENSOR   = '{anchor_sensor}';
+const QUAD_POSES      = {quad_poses_json};
 
 // ── renderer ─────────────────────────────────────────────────────────────────
 const renderer = new THREE.WebGLRenderer({{ antialias: true }});
@@ -459,7 +561,7 @@ function updateGeometries(depth) {{
 }}
 
 // Initial build
-let currentDepth = DEPTH_BASE;
+let currentDepth = DEPTH_BASE * 0.15;
 updateGeometries(currentDepth);
 
 // ── auto-fit ──────────────────────────────────────────────────────────────────
@@ -490,7 +592,76 @@ CAMERAS.forEach((c, i) => {{
 // it is never occluded by the 360° photo planes surrounding the camera cluster.
 const raysGroup      = new THREE.Group(); raysGroup.visible      = false; scene.add(raysGroup);
 const rigSphereGroup = new THREE.Group(); rigSphereGroup.visible = true;  scene.add(rigSphereGroup);
+const anchorPathGroup = new THREE.Group(); scene.add(anchorPathGroup);
 const frameData      = new Map(); // frameKey → {{ centroid, avgUp, sR }}
+
+// ── per-sensor colour palette (13 distinct vivid colours on dark bg) ──────────
+const _PALETTE = [
+  0xff6b6b, 0xffa94d, 0xffe066, 0xa9e34b, 0x40c057,
+  0x20c997, 0x15aabf, 0x4dabf7, 0x748ffc, 0xda77f2,
+  0xf783ac, 0xe87c1e, 0xb5cf6b,
+];
+const _sensorList = [...new Set(CAMERAS.map(c => c.sensor))]
+  .sort((a,b) => (parseInt(a.replace(/\\D+/g,''))||0) - (parseInt(b.replace(/\\D+/g,''))||0));
+const sensorHex = Object.fromEntries(_sensorList.map((s,i) => [s, _PALETTE[i % _PALETTE.length]]));
+const sensorCSS = Object.fromEntries(Object.entries(sensorHex).map(([s,h]) =>
+  [s, '#' + h.toString(16).padStart(6,'0')]));
+
+// Colour frustum lines by sensor immediately (anchor mode overrides later)
+camObjects.forEach(obj => {{
+  obj.lineMat.color.setHex(sensorHex[obj.c.sensor] || 0xffffff);
+  obj.lineMat.opacity = 0.5;
+}});
+
+// ── Pi3 anchor traversal path ─────────────────────────────────────────────────
+// Sorted by frame_key so the line follows station order, not DB insertion order
+{{
+  const _acs = CAMERAS
+    .map((c, i) => ({{ ...c, _i: i }}))
+    .filter(c => c.sensor === ANCHOR_SENSOR)
+    .sort((a, b) => (a.frame_key < b.frame_key ? -1 : 1));
+
+  if (_acs.length > 1) {{
+    const _pts = _acs.map(c => new THREE.Vector3(...c.center));
+
+    // Traversal line — orange to match anchor frustum colour
+    anchorPathGroup.add(new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(_pts),
+      new THREE.LineBasicMaterial({{ color: 0xffaa22, transparent: true, opacity: 0.80 }})));
+
+    // Station dot at each anchor position
+    const _pa = new Float32Array(_pts.flatMap(p => [p.x, p.y, p.z]));
+    const _pg = new THREE.BufferGeometry();
+    _pg.setAttribute('position', new THREE.BufferAttribute(_pa, 3));
+    anchorPathGroup.add(new THREE.Points(_pg,
+      new THREE.PointsMaterial({{ color: 0xffcc44, size: DEPTH_BASE * 0.20, sizeAttenuation: true }})));
+  }}
+}}
+
+// ── Pi3 quad-anchor crop direction rays ──────────────────────────────────────
+const quadCropGroup = new THREE.Group(); scene.add(quadCropGroup);
+if (QUAD_POSES.length) {{
+  const _yawColors = [0xff4444, 0x44cc44, 0x4488ff, 0xff44ff]; // N/E/S/W
+  const _rayLen = DEPTH_BASE * 2.5;
+  const _qsort = [...QUAD_POSES].sort((a, b) =>
+    a.station < b.station ? -1 : a.station > b.station ? 1 : a.h_idx - b.h_idx);
+  // Per-crop direction ray
+  _qsort.forEach(p => {{
+    const ori = new THREE.Vector3(...p.center);
+    const fwd = new THREE.Vector3(...p.forward).normalize();
+    const tip = ori.clone().addScaledVector(fwd, _rayLen);
+    quadCropGroup.add(new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([ori, tip]),
+      new THREE.LineBasicMaterial({{ color: _yawColors[p.h_idx] ?? 0xffffff, transparent: true, opacity: 0.75 }})));
+  }});
+  // Traversal path: h0→h1→h2→h3→next_station_h0→...
+  const _tpts = _qsort.map(p => new THREE.Vector3(...p.center));
+  if (_tpts.length > 1) {{
+    quadCropGroup.add(new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(_tpts),
+      new THREE.LineBasicMaterial({{ color: 0xffd700, transparent: true, opacity: 0.30 }})));
+  }}
+}}
 
 frameIndex.forEach((indices, frameKey) => {{
   const centroid = new THREE.Vector3();
@@ -566,6 +737,104 @@ function _buildSphere(frameKey) {{
 }}
 
 document.getElementById('sphere-pitch').textContent = KNOWN_PITCH_DEG.toFixed(1) + '°';
+
+// ── target map ────────────────────────────────────────────────────────────────
+const _tCanvas = document.getElementById('target-canvas');
+const _tCtx    = _tCanvas ? _tCanvas.getContext('2d') : null;
+
+function _drawTarget(frameKey) {{
+  if (!_tCtx || !_tCanvas) return;
+  const W = _tCanvas.width, H = _tCanvas.height;
+  const ctx = _tCtx;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d0d0f';
+  ctx.fillRect(0, 0, W, H);
+
+  const fd  = frameData.get(frameKey);
+  const fs  = SPREAD[frameKey];
+  if (!fd || !fs) return;
+
+  const idxs = frameIndex.get(frameKey) || [];
+  if (!idxs.length) return;
+
+  // Project 3D optical-centre offsets onto the plane perpendicular to avgUp
+  const {{ centroid, avgUp }} = fd;
+  const {{ right: lr, fwd: lf }} = _horizontalBasis(avgUp);
+  const pts = idxs.map(i => {{
+    const c  = CAMERAS[i];
+    const ox = c.center[0] - centroid.x;
+    const oy = c.center[1] - centroid.y;
+    const oz = c.center[2] - centroid.z;
+    return {{ sensor: c.sensor, u: ox*lr.x+oy*lr.y+oz*lr.z, v: ox*lf.x+oy*lf.y+oz*lf.z }};
+  }});
+
+  // Scale: fit to SPREAD_SCALE with a little padding so the outermost ring = max known spread
+  const pad  = 26;
+  const maxR = Math.max(SPREAD_SCALE * 1.3, 1e-12);
+  const R0   = Math.min(W * 0.82, H) / 2 - pad;
+  const scl  = R0 / maxR;
+  const cx   = W * 0.42, cy = H / 2;  // shift left to leave room for labels
+
+  // Target rings
+  [0.25, 0.5, 0.75, 1.0].forEach(f => {{
+    ctx.beginPath();
+    ctx.arc(cx, cy, f * R0, 0, Math.PI * 2);
+    ctx.strokeStyle = f === 1.0 ? 'rgba(100,100,130,.95)' : 'rgba(55,55,80,.75)';
+    ctx.lineWidth   = f === 1.0 ? 1.5 : 0.8;
+    ctx.stroke();
+    // Scale label inside each ring (at the right edge)
+    ctx.fillStyle = 'rgba(90,90,115,.9)';
+    ctx.font      = '7px monospace';
+    const label   = (maxR * f).toExponential(1);
+    ctx.fillText(label, cx + f * R0 + 2, cy - 2);
+  }});
+
+  // Crosshair at centre
+  ctx.strokeStyle = 'rgba(90,90,120,.8)';
+  ctx.lineWidth   = 0.8;
+  ctx.beginPath(); ctx.moveTo(cx - 8, cy); ctx.lineTo(cx + 8, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, cy - 8); ctx.lineTo(cx, cy + 8); ctx.stroke();
+
+  // Sensor dots + number labels
+  pts.forEach(p => {{
+    const col = sensorCSS[p.sensor] || '#fff';
+    const px  = cx + p.u * scl;
+    const py  = cy - p.v * scl;
+    ctx.beginPath();
+    ctx.arc(px, py, 5.5, 0, Math.PI * 2);
+    ctx.fillStyle   = col;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.6)';
+    ctx.lineWidth   = 1;
+    ctx.stroke();
+    // Tiny number offset from dot
+    ctx.fillStyle = 'rgba(255,255,255,.9)';
+    ctx.font      = 'bold 8px monospace';
+    ctx.fillText(p.sensor.replace(/\\D+/g, ''), px + 7, py + 3);
+  }});
+
+  // Show section
+  const sec = document.getElementById('target-section');
+  const sep = document.getElementById('target-sep');
+  if (sec) sec.style.display = 'block';
+  if (sep) sep.style.display = 'block';
+}}
+
+function _buildTargetLegend(frameKey) {{
+  const el   = document.getElementById('target-legend');
+  if (!el) return;
+  const idxs = frameIndex.get(frameKey) || [];
+  const sens = [...new Set(idxs.map(i => CAMERAS[i].sensor))]
+    .sort((a,b) => (parseInt(a.replace(/\\D+/g,''))||0) - (parseInt(b.replace(/\\D+/g,''))||0));
+  el.innerHTML = sens.map(s => {{
+    const col = sensorCSS[s] || '#fff';
+    const n   = s.replace(/\\D+/g, '');
+    return `<span style="display:inline-flex;align-items:center;gap:2px;margin:1px 3px">` +
+      `<span style="width:8px;height:8px;border-radius:50%;background:${{col}};` +
+      `display:inline-block;flex-shrink:0;border:1px solid rgba(0,0,0,.4)"></span>` +
+      `<span style="font-size:8px;color:#888">c${{n}}</span></span>`;
+  }}).join('');
+}}
 // Sphere is rebuilt whenever a camera is selected (see selectCamera below)
 
 const galleryPanel   = document.getElementById('gallery');
@@ -573,8 +842,11 @@ const galleryGrid    = document.getElementById('gallery-grid');
 const galleryFrameId = document.getElementById('gallery-frame-id');
 
 function updateGallery(frameKey, activeCamIdx) {{
-  const indices = frameIndex.get(frameKey) || [];
-  if (indices.length < 2) {{ galleryPanel.style.display = 'none'; return; }}
+  const rawIndices = frameIndex.get(frameKey) || [];
+  if (rawIndices.length < 2) {{ galleryPanel.style.display = 'none'; return; }}
+  // Sort numerically by sensor name so pano_camera2 comes before pano_camera10
+  const sensorNum = ci => parseInt((CAMERAS[ci].sensor || '').replace(/\\D/g, '')) || 0;
+  const indices = [...rawIndices].sort((a, b) => sensorNum(a) - sensorNum(b));
   galleryPanel.style.display = 'flex';
   galleryFrameId.textContent = frameKey;
   galleryGrid.innerHTML = '';
@@ -599,6 +871,29 @@ function updateGallery(frameKey, activeCamIdx) {{
     label.className = 'thumb-label';
     label.textContent = c.sensor || c.name;
     thumb.appendChild(label);
+
+    // Pi3 anchor badge (top-left corner)
+    if (c.sensor === ANCHOR_SENSOR) {{
+      const _ab = document.createElement('div');
+      _ab.style.cssText = 'position:absolute;top:3px;left:3px;background:#ff8822;color:#000;' +
+        'font-size:6px;font-weight:bold;padding:1px 3px;border-radius:2px;' +
+        'letter-spacing:.04em;pointer-events:none;line-height:1.2';
+      _ab.textContent = 'Pi3';
+      thumb.appendChild(_ab);
+    }}
+
+    // Spread dot — color encodes how far this sensor's optical center is from rig centroid
+    const _gfs = SPREAD[frameKey];
+    if (_gfs && _gfs.sensors[c.sensor] !== undefined) {{
+      const _d = _gfs.sensors[c.sensor];
+      const _norm = Math.min(1, _d / SPREAD_SCALE);
+      const _r = Math.round(_norm * 220);
+      const _g = Math.round((1 - _norm) * 160);
+      const _dot = document.createElement('div');
+      _dot.title = 'Δ ' + _d.toExponential(3);
+      _dot.style.cssText = `position:absolute;top:3px;right:3px;width:7px;height:7px;border-radius:50%;background:rgb(${{_r}},${{_g}},30);border:1px solid rgba(255,255,255,.25)`;
+      thumb.appendChild(_dot);
+    }}
 
     thumb.addEventListener('click', () => selectCamera(ci));
     galleryGrid.appendChild(thumb);
@@ -665,11 +960,34 @@ function selectCamera(idx) {{
   }}
   angEl.style.display = document.getElementById('chkAngles').checked ? 'block' : 'none';
 
+  // Spread info
+  const _spreadEl = document.getElementById('spread-info');
+  const _fs = SPREAD[c.frame_key];
+  if (_spreadEl) {{
+    if (_fs) {{
+      const _sn = s => parseInt((s || '').replace(/\\D+/g, '')) || 0;
+      const _parts = Object.entries(_fs.sensors)
+        .sort(([a], [b]) => _sn(a) - _sn(b))
+        .map(([s, d]) => `${{s.replace('pano_camera', 'c')}}:${{d.toExponential(2)}}`);
+      _spreadEl.textContent = 'Δ ' + _parts.join(' · ');
+      _spreadEl.style.display = 'block';
+    }} else {{
+      _spreadEl.style.display = 'none';
+    }}
+  }}
+
   // Rebuild sphere for this frame
   _buildSphere(c.frame_key);
 
   // Update rig gallery
   updateGallery(c.frame_key, idx);
+
+  // Target map
+  _drawTarget(c.frame_key);
+  _buildTargetLegend(c.frame_key);
+
+  // Re-apply anchor mode coloring (if active)
+  if (window._applyAnchorMode) window._applyAnchorMode();
 }}
 
 // ── click detection ───────────────────────────────────────────────────────────
@@ -701,10 +1019,12 @@ renderer.domElement.addEventListener('mouseup', e => {{
 
 // ── UI controls ───────────────────────────────────────────────────────────────
 // Layer toggles
-document.getElementById('chkPhotos')  .addEventListener('change', e => photoGroup     .visible = e.target.checked);
-document.getElementById('chkFrustums').addEventListener('change', e => frustumGroup   .visible = e.target.checked);
+document.getElementById('chkPhotos')  .addEventListener('change', e => {{ photoGroup  .visible = e.target.checked; if (window._applyAnchorMode) window._applyAnchorMode(); }});
+document.getElementById('chkFrustums').addEventListener('change', e => {{ frustumGroup.visible = e.target.checked; if (window._applyAnchorMode) window._applyAnchorMode(); }});
 document.getElementById('chkPoints')  .addEventListener('change', e => ptGroup        .visible = e.target.checked);
 document.getElementById('chkRays')    .addEventListener('change', e => raysGroup      .visible = e.target.checked);
+document.getElementById('chkPath')    .addEventListener('change', e => anchorPathGroup.visible = e.target.checked);
+document.getElementById('chkCrops')   .addEventListener('change', e => quadCropGroup.visible = e.target.checked);
 document.getElementById('chkSphere')  .addEventListener('change', e => {{
   rigSphereGroup.visible = e.target.checked;
   if (selectedIdx >= 0) _buildSphere(CAMERAS[selectedIdx].frame_key);
@@ -715,7 +1035,7 @@ document.getElementById('chkAngles')  .addEventListener('change', e => {{
 }});
 
 // Pre/post correction toggle — rotates all scene groups by R_X(-CORRECTION_DEG) to undo alignment
-const _sceneGroups = [frustumGroup, photoGroup, ptGroup, raysGroup, rigSphereGroup];
+const _sceneGroups = [frustumGroup, photoGroup, ptGroup, raysGroup, rigSphereGroup, anchorPathGroup, quadCropGroup];
 function _setPosthocMode(showCorrected) {{
   const theta = showCorrected ? 0 : -THREE.MathUtils.degToRad(CORRECTION_DEG);
   const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), theta);
@@ -750,11 +1070,186 @@ document.getElementById('prev-btn').addEventListener('click', () =>
 document.getElementById('next-btn').addEventListener('click', () =>
   selectCamera((selectedIdx + 1) % CAMERAS.length));
 
-// Keyboard: ← → to step
+// ── Anchor mode ──────────────────────────────────────────────────────────────
+(function () {{
+  const chkAnchor    = document.getElementById('chkAnchor');
+  const anchorSelect = document.getElementById('anchor-select');
+  const anchorPanel  = document.getElementById('anchor-panel');
+  const fadeSlider   = document.getElementById('fade-slider');
+  const revealSlider = document.getElementById('reveal-slider');
+  const fadeValEl    = document.getElementById('fade-val');
+  const revealValEl  = document.getElementById('reveal-val');
+
+  // Non-anchor sibling sensors in sorted order — reveal one sensor at a time across all frames
+  let orderedSensors = [];   // ['pano_camera0', 'pano_camera1', ...]
+
+  function rebuildIndex() {{
+    const sensor = anchorSelect.value;
+    orderedSensors = [...new Set(CAMERAS.filter(c => c.sensor !== sensor).map(c => c.sensor))]
+      .sort((a, b) => (parseInt(a.replace(/\\D+/g,'')) || 0) - (parseInt(b.replace(/\\D+/g,'')) || 0));
+    revealSlider.max = orderedSensors.length;
+    syncRevealLabel();
+  }}
+
+  function syncRevealLabel() {{
+    const r = parseInt(revealSlider.value);
+    const name = r > 0 ? (orderedSensors[r - 1] || '') : '';
+    revealValEl.textContent = r + '/' + orderedSensors.length + (name ? ' — ' + name : '');
+  }}
+
+  function apply() {{
+    const enabled = chkAnchor.checked;
+    const sensor  = anchorSelect.value;
+    const reveal  = parseInt(revealSlider.value);
+    const fade    = parseFloat(fadeSlider.value);
+
+    if (!enabled) {{
+      // Restore every camera to sensor-coloured default
+      camObjects.forEach((obj, i) => {{
+        obj.lines.visible = true;
+        if (obj.photo) {{ obj.photo.visible = true; obj.photo.material.opacity = 1; obj.photo.material.transparent = false; }}
+        if (i !== selectedIdx) {{
+          obj.lineMat.color.setHex(sensorHex[obj.c.sensor] || 0xffffff);
+          obj.lineMat.opacity = 0.5;
+        }}
+      }});
+      return;
+    }}
+
+    // Build set of revealed camera indices — one sibling sensor at a time, all frames
+    const revealedSet = new Set();
+    for (let s = 0; s < reveal; s++) {{
+      const sName = orderedSensors[s];
+      if (sName) CAMERAS.forEach((c, i) => {{ if (c.sensor === sName) revealedSet.add(i); }});
+    }}
+
+    camObjects.forEach((obj, i) => {{
+      const isAnchor   = CAMERAS[i].sensor === sensor;
+      const isRevealed = revealedSet.has(i);
+      const isSel      = i === selectedIdx;
+
+      if (isAnchor) {{
+        // Always visible — orange tint
+        obj.lines.visible = true;
+        if (obj.photo) {{ obj.photo.visible = true; obj.photo.material.opacity = 1; obj.photo.material.transparent = false; }}
+        obj.lineMat.color.setHex(isSel ? 0xffcc33 : 0xff8822);
+        obj.lineMat.opacity = isSel ? 1.0 : 0.9;
+      }} else if (isRevealed) {{
+        // Revealed — blue, faded by slider
+        obj.lines.visible = true;
+        if (obj.photo) {{ obj.photo.visible = true; obj.photo.material.opacity = fade; obj.photo.material.transparent = fade < 0.99; }}
+        obj.lineMat.color.setHex(isSel ? 0x88ddff : 0x44aaff);
+        obj.lineMat.opacity = isSel ? 1.0 : Math.max(0.06, fade * 0.7);
+      }} else {{
+        // Not yet revealed — hidden
+        obj.lines.visible = false;
+        if (obj.photo) obj.photo.visible = false;
+      }}
+    }});
+  }}
+
+  chkAnchor.addEventListener('change', () => {{
+    anchorPanel.style.display = chkAnchor.checked ? 'block' : 'none';
+    if (chkAnchor.checked) rebuildIndex();
+    apply();
+  }});
+  anchorSelect.addEventListener('change', () => {{ rebuildIndex(); apply(); }});
+  fadeSlider.addEventListener('input', () => {{
+    fadeValEl.textContent = Math.round(parseFloat(fadeSlider.value) * 100) + '%';
+    apply();
+  }});
+  revealSlider.addEventListener('input', () => {{ syncRevealLabel(); apply(); }});
+
+  rebuildIndex();
+  window._applyAnchorMode = apply;
+}})();
+
+// ── deselect ──────────────────────────────────────────────────────────────────
+function deselectCamera() {{
+  if (selectedIdx >= 0) {{
+    const prev = camObjects[selectedIdx];
+    prev.lineMat.color.setHex(sensorHex[prev.c.sensor] || 0xffffff);
+    prev.lineMat.opacity = 0.5;
+    prev.borderMat.opacity = 0;
+  }}
+  selectedIdx = -1;
+  viewerPanel.style.display  = 'none';
+  galleryPanel.style.display = 'none';
+  const sec = document.getElementById('target-section');
+  const sep = document.getElementById('target-sep');
+  if (sec) sec.style.display = 'none';
+  if (sep) sep.style.display = 'none';
+  if (window._applyAnchorMode) window._applyAnchorMode();
+}}
+
+// Keyboard: ← → to step, Escape to deselect
 window.addEventListener('keydown', e => {{
+  if (e.key === 'Escape')     deselectCamera();
   if (e.key === 'ArrowLeft')  selectCamera((selectedIdx - 1 + CAMERAS.length) % CAMERAS.length);
   if (e.key === 'ArrowRight') selectCamera((selectedIdx + 1) % CAMERAS.length);
 }});
+
+// ── Spread per-station bar chart ──────────────────────────────────────────────
+(function () {{
+  const canvas = document.getElementById('spread-chart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  const stations = Object.keys(SPREAD).sort();
+  if (!stations.length) return;
+  const maxVal = stations.reduce((m, k) => Math.max(m, SPREAD[k].max), 1e-12);
+  const barW = W / stations.length;
+
+  // Use an absolute reference scale for the y-axis so the chart reflects
+  // true deviation magnitude, not just relative differences.
+  // Reference: 1e-3 scene units ≈ sub-mm; values below this are rig noise.
+  const absRef = Math.max(maxVal * 1.2, 1e-3);
+
+  function draw(hoverIdx) {{
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#0d0d12';
+    ctx.fillRect(0, 0, W, H);
+    stations.forEach((k, i) => {{
+      const norm = Math.min(1, SPREAD[k].max / absRef);
+      const bh = Math.max(1, Math.round(norm * (H - 12)));
+      const x = Math.round(i * barW);
+      const bw = Math.max(1, Math.round((i + 1) * barW) - x - 1);
+      if (i === hoverIdx) {{
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      }} else {{
+        const r = Math.round(Math.min(255, norm * 2 * 255));
+        const g = Math.round(Math.min(255, (1 - norm) * 2 * 255));
+        ctx.fillStyle = `rgb(${{r}},${{g}},40)`;
+      }}
+      ctx.fillRect(x, H - bh - 1, bw, bh);
+    }});
+    // baseline and max-value label
+    ctx.fillStyle = 'rgba(255,255,255,0.07)';
+    ctx.fillRect(0, H - 1, W, 1);
+    ctx.fillStyle = '#3a3a4a';
+    ctx.font = '8px monospace';
+    ctx.fillText(`max ${{maxVal.toExponential(2)}}`, 2, 9);
+  }}
+
+  draw(-1);
+
+  const tip = document.getElementById('spread-tooltip');
+  canvas.addEventListener('mousemove', e => {{
+    const i = Math.floor((e.offsetX / canvas.offsetWidth) * stations.length);
+    if (i < 0 || i >= stations.length) return;
+    draw(i);
+    const f = SPREAD[stations[i]];
+    if (tip) tip.textContent = `${{stations[i]}}  max ${{f.max.toExponential(2)}}  μ ${{f.mean.toExponential(2)}}`;
+  }});
+  canvas.addEventListener('mouseleave', () => {{ draw(-1); if (tip) tip.textContent = ''; }});
+  canvas.addEventListener('click', e => {{
+    const i = Math.floor((e.offsetX / canvas.offsetWidth) * stations.length);
+    if (i < 0 || i >= stations.length) return;
+    const idxs = frameIndex.get(stations[i]);
+    if (idxs && idxs.length) selectCamera(idxs[0]);
+  }});
+}})();
 
 // ── render loop ───────────────────────────────────────────────────────────────
 window.addEventListener('resize', () => {{
@@ -782,12 +1277,14 @@ def main():
     out            = Path(sys.argv[2]) if len(sys.argv) > 2 else rec_dir.parent / "cameras.html"
     pitch_deg      = float(sys.argv[3]) if len(sys.argv) > 3 else -10.0
     correction_deg = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+    anchor_sensor  = sys.argv[5]        if len(sys.argv) > 5 else "pano_camera7"
+    images_path    = Path(sys.argv[6])  if len(sys.argv) > 6 else None
 
     print(f"Reading reconstruction from {rec_dir} ...")
-    cameras, points = extract(rec_dir)
+    cameras, points, spread, quad_poses = extract(rec_dir, images_path=images_path)
     print(f"  {len(cameras)} cameras, {len(points)} 3D points")
 
-    html = build_html(cameras, points, pitch_deg=pitch_deg, correction_deg=correction_deg)
+    html = build_html(cameras, points, pitch_deg=pitch_deg, correction_deg=correction_deg, anchor_sensor=anchor_sensor, spread=spread, quad_poses=quad_poses)
     out.write_text(html, encoding="utf-8")
     print(f"Written: {out}")
 

@@ -3,18 +3,39 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "electron": "electron .",
+    "start": "npm run build && electron .",
+    "dist": "electron-builder --win dir"
+  },
+  "build": {
+    "appId": "ca.fieldraven.desktop",
+    "productName": "FieldRaven Desktop",
+    "files": [
+      "electron/**/*"
+    ],
+    "win": {
+      "target": "dir"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "asar": false
   },
   "dependencies": {
     "firebase": "^12.15.0",
+    "leaflet": "^1.9.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
+    "electron": "^33.0.0",
+    "electron-builder": "^26.15.3",
     "vite": "^5.4.0"
   }
 }

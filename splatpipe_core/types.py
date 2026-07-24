@@ -15,6 +15,8 @@ class PipelineStage(str, Enum):
     COLMAP_ALIGNMENT = "colmap_alignment"
     COLMAP_EXPORT = "colmap_export"
     GLUEMAP_ALIGNMENT = "gluemap_alignment"
+    RIGSFM_ALIGNMENT = "rigsfm_alignment"
+    EQUISFM_ALIGNMENT = "equisfm_alignment"
     BRUSH_TRAINING = "brush_training"
     POSTSHOT_TRAINING = "postshot_training"
     TRAINING = "training"

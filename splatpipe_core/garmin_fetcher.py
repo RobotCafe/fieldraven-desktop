@@ -138,6 +138,17 @@ def _parse_garmin_time(s: str) -> Optional[datetime]:
     return None
 
 
+def _parse_garmin_utc(s: str) -> Optional[datetime]:
+    """Parse a Garmin startTimeGMT string to a UTC-aware datetime."""
+    from datetime import timezone as _tz
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=_tz.utc)
+        except ValueError:
+            continue
+    return None
+
+
 def _find_activity_by_overlap(
     client,
     session_start: datetime,
@@ -145,20 +156,32 @@ def _find_activity_by_overlap(
     search_days: int,
 ) -> Optional[dict]:
     """
-    Find the Garmin activity whose recording window overlaps most with the
-    field session [session_start, session_end].
+    Find the Garmin activity that overlaps with the field session window.
 
-    Falls back to elevation-gain scoring when no temporal overlap found.
+    Searches only the local date of session_start (no ±day window).
+    Compares using UTC times (startTimeGMT) with a ±10 minute buffer so
+    timezone differences between device and Garmin clock don't cause misses.
+    Returns None if nothing overlaps — no scoring fallback.
     """
-    search_from = (session_start.date() - timedelta(days=search_days)).isoformat()
-    search_to   = (session_end.date()   + timedelta(days=search_days)).isoformat()
+    from datetime import timezone as _tz
+    BUFFER = timedelta(minutes=10)
 
-    print(f"  [garmin] Searching activities {search_from} → {search_to} "
-          f"(session {session_start.strftime('%H:%M')}–{session_end.strftime('%H:%M')})")
+    # Local date is what the user experienced and what Garmin's API expects
+    local_date = session_start.astimezone().date()
+    window_start = session_start - BUFFER
+    window_end   = session_end   + BUFFER
 
-    activities = client.get_activities_by_date(search_from, search_to, activitytype=None)
+    print(
+        f"  [garmin] Searching {local_date} "
+        f"({window_start.astimezone().strftime('%H:%M')}–"
+        f"{window_end.astimezone().strftime('%H:%M')} local ±10min)"
+    )
+
+    activities = client.get_activities_by_date(
+        local_date.isoformat(), local_date.isoformat(), activitytype=None
+    )
     if not activities:
-        print("  [garmin] No activities found")
+        print(f"  [garmin] No activities on {local_date}")
         return None
 
     session_dur = (session_end - session_start).total_seconds()
@@ -166,14 +189,20 @@ def _find_activity_by_overlap(
     best_overlap = 0.0
 
     for act in activities:
-        act_start = _parse_garmin_time(act.get("startTimeLocal", ""))
+        # UTC comparison eliminates timezone ambiguity
+        act_start = _parse_garmin_utc(act.get("startTimeGMT", ""))
         if act_start is None:
-            continue
+            # startTimeGMT missing — fall back to local time treated as UTC
+            act_start_naive = _parse_garmin_time(act.get("startTimeLocal", ""))
+            if act_start_naive is None:
+                continue
+            act_start = act_start_naive.replace(tzinfo=_tz.utc)
+
         act_dur = float(act.get("duration") or act.get("elapsedDuration") or 0)
         act_end = act_start + timedelta(seconds=act_dur)
 
-        overlap_start = max(session_start, act_start)
-        overlap_end   = min(session_end,   act_end)
+        overlap_start = max(window_start, act_start)
+        overlap_end   = min(window_end,   act_end)
         overlap_sec   = max(0.0, (overlap_end - overlap_start).total_seconds())
 
         if overlap_sec > best_overlap:
@@ -188,28 +217,30 @@ def _find_activity_by_overlap(
         )
         return best
 
-    # No temporal overlap found — fall back to elevation-gain heuristic
-    print("  [garmin] No temporal overlap — falling back to elevation-gain score")
-    return _find_best_activity_by_date(client, session_start.date(), search_days)
+    print(f"  [garmin] No activity overlaps the session window — skipping")
+    return None
 
 
 def _find_best_activity_by_date(client, target_date: _date, search_days: int) -> Optional[dict]:
     """
-    Fallback: search ±search_days and pick activity with most elevation gain.
+    Return the best activity recorded on target_date exactly.
+    Never matches activities from other dates — no data is better than wrong data.
+    If multiple activities exist on that date, prefer the longest by duration.
     """
-    start = (target_date - timedelta(days=search_days)).isoformat()
-    end   = (target_date + timedelta(days=search_days)).isoformat()
-
-    activities = client.get_activities_by_date(start, end, activitytype=None)
-    if not activities:
+    activities = client.get_activities_by_date(
+        target_date.isoformat(), target_date.isoformat(), activitytype=None
+    )
+    exact = [
+        a for a in (activities or [])
+        if (a.get("startTimeLocal") or "")[:10] == target_date.isoformat()
+    ]
+    if not exact:
+        print(f"  [garmin] No activity found on {target_date} — skipping")
         return None
 
-    def score(a: dict) -> float:
-        return (a.get("elevationGain") or 0) * 10 + (a.get("duration") or 0)
-
-    best = max(activities, key=score)
+    best = max(exact, key=lambda a: a.get("duration") or 0)
     print(
-        f"  [garmin] Fallback match: '{best.get('activityName')}' "
+        f"  [garmin] Matched: '{best.get('activityName')}' "
         f"on {best.get('startTimeLocal', '?')[:10]} "
         f"— {(best.get('distance') or 0)/1000:.1f} km"
     )

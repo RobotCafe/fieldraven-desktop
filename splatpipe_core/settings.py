@@ -81,6 +81,16 @@ class PipelineSettings:
     brush_rerun_logging: bool = False
     brush_spawn_viewer: bool = False
 
+    # ── RigSfM ───────────────────────────────────────────────────
+    run_rigsfm: bool = False
+    rigsfm_anchor_sensor: int = 0         # pano_cameraX index used as the Pi3 anchor (single mode)
+    rigsfm_quad_anchors: bool = False     # stage 4 horizon crops (yaw 0/90/180/270°) instead of 1 sensor
+    rigsfm_matcher: str = "sequential"    # "sequential" | "exhaustive"
+
+    # ── EquiSfM ──────────────────────────────────────────────────
+    run_equisfm: bool = False
+    equisfm_matcher: str = "sequential"   # "sequential" | "exhaustive"
+
     # ── GlueMap ──────────────────────────────────────────────────
     run_gluemap: bool = False
     gluemap_backbone: str = "pi3"           # pi3 | pi3x | vggt | map_anything

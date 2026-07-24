@@ -83,6 +83,84 @@ def _parse_stage(line: str) -> Optional[tuple[int, str]]:
     return None
 
 
+_VISUALIZER = str(Path(__file__).parent.parent / "tools" / "visualize_cameras.py")
+
+
+def _generate_viewer(brush_input_dir: Path, project_dir: Path, pitch_deg: float = 0.0) -> None:
+    """Run visualize_cameras.py on brush_input/ to produce cameras.html in the gluemap folder."""
+    import sys
+    out_html = project_dir / "03_alignment" / "gluemap" / "cameras.html"
+    if not Path(_VISUALIZER).exists():
+        print("  [gluemap] visualize_cameras.py not found — skipping viewer", flush=True)
+        return
+    try:
+        subprocess.run(
+            [sys.executable, _VISUALIZER, str(brush_input_dir), str(out_html), str(pitch_deg), "0.0"],
+            check=False,
+            timeout=120,
+        )
+        if out_html.exists():
+            print(f"  [gluemap] Camera viewer written: {out_html}", flush=True)
+    except Exception as e:
+        print(f"  [gluemap] Viewer generation failed (non-fatal): {e}", flush=True)
+
+
+def _sample_and_write_colored_recon(recon_dir, brush_input_dir, report, stage):
+    """Read a COLMAP binary reconstruction, sample RGB from images, write .txt files.
+
+    GlueMap writes all point colors as 0,0,0. Brush initializes Gaussian colors
+    from the point cloud, so we project each 3D point back to its first visible
+    image and sample the pixel color before handing off to Brush training.
+    images/ subfolder is expected at brush_input_dir/images/.
+    """
+    from pathlib import Path as _P
+    import shutil as _shutil
+    try:
+        import numpy as np
+        from PIL import Image as PILImage
+        import pycolmap
+
+        recon_dir      = _P(recon_dir)
+        brush_input_dir = _P(brush_input_dir)
+        images_dir     = brush_input_dir / "images"
+
+        recon = pycolmap.Reconstruction()
+        recon.read(str(recon_dir))
+
+        img_cache: dict = {}
+
+        def _get_img(name: str):
+            if name not in img_cache:
+                p = images_dir / name
+                img_cache[name] = np.array(PILImage.open(p).convert("RGB")) if p.exists() else None
+            return img_cache[name]
+
+        colored = 0
+        for pt in recon.points3D.values():
+            for el in pt.track.elements:
+                if el.image_id not in recon.images:
+                    continue
+                img_meta = recon.images[el.image_id]
+                arr = _get_img(img_meta.name)
+                if arr is None:
+                    continue
+                kp = img_meta.points2D[el.point2D_idx]
+                x = int(np.clip(kp.xy[0], 0, arr.shape[1] - 1))
+                y = int(np.clip(kp.xy[1], 0, arr.shape[0] - 1))
+                pt.color = arr[y, x]
+                colored += 1
+                break
+
+        recon.write_text(str(brush_input_dir))
+        print(f"  [gluemap] Colored {colored}/{len(recon.points3D)} points, wrote text COLMAP files", flush=True)
+        report(stage, 98, f"GlueMap: colored {colored:,} points, wrote text COLMAP files")
+
+    except Exception as e:
+        print(f"  [gluemap] Color sampling failed ({e}), copying binary files as fallback", flush=True)
+        for f in _P(recon_dir).iterdir():
+            _shutil.copy2(str(f), str(_P(brush_input_dir) / f.name))
+
+
 def run_gluemap_pipeline(
     views_dir: Path,
     colmap_dir: Path,
@@ -267,55 +345,13 @@ def run_gluemap_pipeline(
         shutil.copytree(str(image_dir), str(images_dst))
 
     # ── 6. Sample point colors and write text-format COLMAP files ─────────────
-    # GlueMap's augmented BA does not assign RGB values to 3D points (all are
-    # written as 0,0,0). Brush initializes Gaussian colors from the point cloud,
-    # so black points cause a completely black viewer until training converges.
-    # We sample pixel colors from the source images here, then write text format
-    # (Brush reads .txt; .bin files from GlueMap can confuse some versions).
     report(stage, 97, "GlueMap: sampling point colors from images…")
-    try:
-        import numpy as np
-        from PIL import Image as PILImage
-        import pycolmap
+    _sample_and_write_colored_recon(recon_dir, brush_input_dir, report, stage)
 
-        recon = pycolmap.Reconstruction()
-        recon.read(str(recon_dir))
-
-        img_cache: dict = {}
-
-        def _get_img(name: str):
-            if name not in img_cache:
-                p = images_dst / name
-                if p.exists():
-                    img_cache[name] = np.array(PILImage.open(p).convert("RGB"))
-                else:
-                    img_cache[name] = None
-            return img_cache[name]
-
-        colored = 0
-        for pt in recon.points3D.values():
-            for el in pt.track.elements:
-                img_meta = recon.images.get(el.image_id)
-                if img_meta is None:
-                    continue
-                arr = _get_img(img_meta.name)
-                if arr is None:
-                    continue
-                kp = img_meta.points2D[el.point2D_idx]
-                x = int(np.clip(kp.xy[0], 0, arr.shape[1] - 1))
-                y = int(np.clip(kp.xy[1], 0, arr.shape[0] - 1))
-                pt.color = arr[y, x]
-                colored += 1
-                break
-
-        recon.write_text(str(brush_input_dir))
-        print(f"  [gluemap] Colored {colored}/{len(recon.points3D)} points, wrote text COLMAP files", flush=True)
-        report(stage, 98, f"GlueMap: colored {colored:,} points, wrote text COLMAP files")
-
-    except Exception as e:
-        print(f"  [gluemap] Color sampling failed ({e}), copying binary files as fallback", flush=True)
-        for f in recon_dir.iterdir():
-            shutil.copy2(str(f), str(brush_input_dir / f.name))
+    # ── 7. Generate Three.js camera viewer HTML ───────────────────────────────
+    report(stage, 99, "GlueMap: generating camera viewer…")
+    pitch = settings.pitch_angles[0] if getattr(settings, "pitch_angles", None) else 0.0
+    _generate_viewer(brush_input_dir, project_dir, pitch_deg=pitch)
 
     n_files = len(list(brush_input_dir.glob("*.txt"))) + len(list(brush_input_dir.glob("*.bin")))
     report(stage, 100,

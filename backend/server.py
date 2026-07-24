@@ -71,7 +71,7 @@ sys.stderr = _LogTee(sys.stderr, _LOG_FILE)
 from fastapi import FastAPI, HTTPException, Depends, status, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from . import firebase_client
@@ -99,6 +99,8 @@ async def lifespan(app: FastAPI):
         firebase_client.initialize()
         _is_initialized = True
         print("✅ Firebase connected")
+        # Queue is session-only — reset any local jobs left over from a previous session
+        queue_manager.clear_local_jobs_on_startup()
     except Exception as e:
         print(f"⚠️ Firebase initialization failed: {e}")
         print("   The app will start but cloud features won't work until Firebase is configured.")
@@ -262,10 +264,11 @@ async def update_machine_settings(
 @app.get("/api/jobs/queue")
 async def get_job_queue(user: CurrentUser = Depends(require_auth)):
     """Get all queued jobs assigned to this machine, plus all local-folder
-    projects (regardless of status — those are persistent user projects that
-    should always appear in the Image Folders panel)."""
-    jobs = queue_manager.poll_for_jobs()
-    local_folder_jobs = queue_manager.get_local_folder_jobs()
+    projects. Served from in-memory cache populated by the background poll
+    thread — no synchronous Firestore call on the event loop."""
+    cache = queue_manager.get_queue_cache()
+    jobs             = list(cache.get("jobs", []))
+    local_folder_jobs = cache.get("local_jobs", [])
     current = queue_manager.get_current_job()
     # Merge: queued jobs first, then any local-folder projects not already listed
     queued_ids = {j.get('docId') or j.get('id') for j in jobs}
@@ -347,6 +350,68 @@ async def queue_for_processing(
     job_dir.mkdir(parents=True, exist_ok=True)
 
     return {"processingJobId": doc_id, "status": "queued", "name": display_name}
+
+
+class CreateFromFilesRequest(BaseModel):
+    filePaths: list[str]
+    projectDir: str
+    name: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    siteDate: Optional[str] = None
+
+@app.post("/api/jobs/create-from-files")
+async def create_from_files(
+    request: CreateFromFilesRequest,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Create a pipeline job from a manually selected list of camera files.
+    Copies the files into <projectDir>/import from camera/ then queues the job."""
+    import datetime, shutil as _shutil
+
+    project_dir = Path(request.projectDir)
+    dest_dir = project_dir / "import from camera"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    imported = skipped = errors = 0
+    for path_str in request.filePaths:
+        src = Path(path_str)
+        dst = dest_dir / src.name
+        if dst.exists():
+            skipped += 1
+            continue
+        try:
+            _shutil.copy2(str(src), str(dst))
+            imported += 1
+        except Exception as e:
+            errors += 1
+            print(f"  Copy failed {src.name}: {e}")
+
+    display_name = request.name or project_dir.name or 'Camera Import'
+
+    db = firebase_client.get_db()
+    new_ref = db.collection('processing_queue').document()
+    new_ref.set({
+        'assignedMachine': machine_module.get_machine_id(),
+        'userId': user.uid,
+        'status': 'queued',
+        'jobType': 'local_folder',
+        'name': display_name,
+        'projectDir': str(project_dir),
+        'createdAt': datetime.datetime.utcnow(),
+        'settings': {},
+        'location': request.location or '',
+        'notes': request.notes or '',
+        'siteDate': request.siteDate or '',
+    })
+
+    return {
+        'processingJobId': new_ref.id,
+        'name': display_name,
+        'imported': imported,
+        'skipped': skipped,
+        'errors': errors,
+    }
 
 
 class CreateLocalJobRequest(BaseModel):
@@ -832,11 +897,13 @@ async def import_from_camera(
 
     queue_manager.update_job_progress(job_id, 1, f"Starting import of {total} files…")
 
+    attempted: list[dict] = []   # files we actually tried to copy this run
     for i, f in enumerate(files_to_copy):
         dst = dest_dir / f["name"]
         if dst.exists():
             skipped += 1
             continue
+        attempted.append(f)
         try:
             _shutil.copy2(f["path"], str(dst))
             imported += 1
@@ -849,9 +916,49 @@ async def import_from_camera(
             errors += 1
             print(f"⚠️ Import error {f['name']}: {exc}")
 
+    # ── Validate transfer: retry any file that is missing or has the wrong size ──
+    import time as _time
+    retry_transfer = [
+        f for f in attempted
+        if not (dest_dir / f["name"]).exists()
+        or (dest_dir / f["name"]).stat().st_size != f["size"]
+    ]
+    if retry_transfer:
+        queue_manager.update_job_progress(
+            job_id, 30, f"Validating — {len(retry_transfer)} file(s) incomplete, retrying…"
+        )
+        print(f"🔄 Retrying {len(retry_transfer)} incomplete transfers")
+        for attempt in range(2):
+            still_bad: list[dict] = []
+            for f in retry_transfer:
+                dst = dest_dir / f["name"]
+                if dst.exists():
+                    dst.unlink()
+                try:
+                    _shutil.copy2(f["path"], str(dst))
+                    if dst.stat().st_size == f["size"]:
+                        imported += 1
+                        errors   -= 1
+                        print(f"  ✅ Retry succeeded: {f['name']}")
+                    else:
+                        dst.unlink()
+                        still_bad.append(f)
+                except Exception as exc2:
+                    print(f"  ⚠️ Retry {attempt+1} failed for {f['name']}: {exc2}")
+                    still_bad.append(f)
+            retry_transfer = still_bad
+            if not retry_transfer:
+                break
+            if attempt < 1:
+                _time.sleep(1)
+        errors = len(retry_transfer)
+        if retry_transfer:
+            print(f"❌ {len(retry_transfer)} file(s) could not be transferred after retries")
+
     queue_manager.update_job_progress(
         job_id, 30,
-        f"Import complete — {imported} files copied, {skipped} skipped"
+        f"Import complete — {imported} copied, {skipped} skipped"
+        + (f", {errors} failed" if errors else "")
     )
 
     # Write GPS sidecars alongside each imported file so the pipeline can use
@@ -1099,10 +1206,17 @@ async def write_project_config(
 
     # Persist projectDir to the processing_queue Firestore doc so the
     # pipeline worker can find the files when it runs.
+    # Use set(merge=True) so the doc is recreated if it was deleted.
     if request.jobId:
         try:
-            firebase_client.get_processing_queue().document(request.jobId).update(
-                {"projectDir": str(project_dir)}
+            firebase_client.get_processing_queue().document(request.jobId).set(
+                {
+                    "projectDir":      str(project_dir),
+                    "jobType":         "local_folder",
+                    "assignedMachine": machine_module.get_machine_id(),
+                    "name":            request.dir.split("\\")[-1].split("/")[-1] or "Project",
+                },
+                merge=True,
             )
         except Exception as e:
             print(f"⚠️ Could not save projectDir to Firestore: {e}")
@@ -1192,14 +1306,22 @@ async def get_project_state(
         return str(v).lower() in ("true", "1", "yes") if v is not None else default
 
     saved_settings = saved.get("settings", {})
-    run_colmap = _b(saved_settings.get("run_colmap"), False)
-    run_vggt   = _b(saved_settings.get("run_vggt"),   False)
-    skip_rs    = _b(saved_settings.get("skip_realityscan"), False)
+    run_colmap  = _b(saved_settings.get("run_colmap"),  False)
+    run_vggt    = _b(saved_settings.get("run_vggt"),    False)
+    run_gluemap = _b(saved_settings.get("run_gluemap"), False)
+    run_rigsfm  = _b(saved_settings.get("run_rigsfm"),  False)
+    run_equisfm = _b(saved_settings.get("run_equisfm"), False)
 
-    if skip_rs and run_colmap:
+    if run_colmap:
         pipeline_mode = "colmap"
-    elif skip_rs and run_vggt:
+    elif run_vggt:
         pipeline_mode = "vggt"
+    elif run_gluemap:
+        pipeline_mode = "gluemap"
+    elif run_rigsfm:
+        pipeline_mode = "rigsfm"
+    elif run_equisfm:
+        pipeline_mode = "equisfm"
     else:
         pipeline_mode = "rs_brush"
 
@@ -1214,6 +1336,30 @@ async def get_project_state(
     vggt_dir  = project_dir / "04_training" / "vggt_output"
     vggt_done = vggt_dir.exists() and _has_images(vggt_dir)
 
+    # GlueMap alignment: GluMap writes .bin files into output/gluemap_aba/ or output/coarse/
+    # and the pipeline copies them to 04_training/brush_input/
+    gluemap_dir     = project_dir / "03_alignment" / "gluemap"
+    gluemap_out     = gluemap_dir / "output"
+    brush_input_dir = project_dir / "04_training" / "brush_input"
+    _gluemap_bin    = ("cameras.bin", "images.bin")
+    gluemap_done = gluemap_out.exists() and (
+        any((gluemap_out / sub / f).exists()
+            for sub in ("gluemap_aba", "coarse") for f in _gluemap_bin)
+        or any((brush_input_dir / f).exists() for f in _gluemap_bin)
+    )
+
+    # RigGluemap alignment: worker writes sparse_txt to 03_alignment/rigsfm/sparse_txt
+    rigsfm_sparse = project_dir / "03_alignment" / "rigsfm" / "sparse_txt"
+    rigsfm_done   = rigsfm_sparse.exists() and any(
+        (rigsfm_sparse / f).exists() for f in ("cameras.txt", "images.txt", "cameras.bin", "images.bin")
+    )
+
+    # EquiSfM alignment: runner writes sensor_sparse_txt to 03_alignment/equisfm/sensor_sparse_txt
+    equisfm_sparse = project_dir / "03_alignment" / "equisfm" / "sensor_sparse_txt"
+    equisfm_done   = equisfm_sparse.exists() and any(
+        (equisfm_sparse / f).exists() for f in ("cameras.txt", "images.txt")
+    )
+
     stages["colmap_alignment"] = {
         "done":        colmap_done,
         "cameras":     colmap_cameras,
@@ -1223,11 +1369,29 @@ async def get_project_state(
         "done":        vggt_done,
         "completedAt": saved_stages.get("vggt_alignment", {}).get("completedAt"),
     }
+    stages["gluemap_alignment"] = {
+        "done":        gluemap_done,
+        "completedAt": saved_stages.get("gluemap_alignment", {}).get("completedAt"),
+    }
+    stages["rigsfm_alignment"] = {
+        "done":        rigsfm_done,
+        "completedAt": saved_stages.get("rigsfm_alignment", {}).get("completedAt"),
+    }
+    stages["equisfm_alignment"] = {
+        "done":        equisfm_done,
+        "completedAt": saved_stages.get("equisfm_alignment", {}).get("completedAt"),
+    }
 
     if pipeline_mode == "colmap":
         stage_order = ["import", "view_extraction", "colmap_alignment", "brush_training"]
     elif pipeline_mode == "vggt":
         stage_order = ["import", "view_extraction", "vggt_alignment", "brush_training"]
+    elif pipeline_mode == "gluemap":
+        stage_order = ["import", "view_extraction", "gluemap_alignment", "brush_training"]
+    elif pipeline_mode == "rigsfm":
+        stage_order = ["import", "view_extraction", "rigsfm_alignment", "brush_training"]
+    elif pipeline_mode == "equisfm":
+        stage_order = ["import", "view_extraction", "equisfm_alignment", "brush_training"]
     else:
         stage_order = ["import", "view_extraction", "realityscan", "brush_training"]
 
@@ -1262,6 +1426,9 @@ _STAGE_DIRS_TO_DELETE: dict[str, list[str]] = {
     "realityscan":       ["03_alignment", "04_training"],
     "colmap_alignment":  ["03_alignment", "04_training"],
     "vggt_alignment":    ["03_alignment", "04_training"],
+    "gluemap_alignment": ["03_alignment", "04_training"],
+    "rigsfm_alignment":  ["03_alignment", "04_training"],
+    "equisfm_alignment": ["03_alignment", "04_training"],
     "brush_training":    ["04_training"],
 }
 
@@ -1335,6 +1502,31 @@ async def resume_project(
     # accept_job also sets queue_manager._current_job_id
     queue_manager.accept_job(job_id)
 
+    # Read userId / userJobId — try Firestore queue doc first, then fieldraven.json fallback.
+    # Mobile-app-created queue docs may not have these fields; fieldraven.json always will
+    # (written at job start by _worker) for any subsequent resume.
+    _user_id     = None
+    _user_job_id = None
+    try:
+        q_snap = firebase_client.get_processing_queue().document(job_id).get()
+        if q_snap.exists:
+            q_data = q_snap.to_dict() or {}
+            _user_id     = q_data.get("userId") or q_data.get("user_id")
+            _user_job_id = q_data.get("userJobId") or q_data.get("user_job_id")
+    except Exception:
+        pass
+    if not _user_id or not _user_job_id:
+        try:
+            import json as _json
+            _fj_path = project_dir / "fieldraven.json"
+            if _fj_path.exists():
+                _fj = _json.loads(_fj_path.read_text(encoding="utf-8"))
+                _ids = _fj.get("mobile_ids", {})
+                _user_id     = _user_id     or _ids.get("userId")
+                _user_job_id = _user_job_id or _ids.get("userJobId")
+        except Exception:
+            pass
+
     # Also persist projectDir on the doc so pipeline_runner can find files
     try:
         firebase_client.get_processing_queue().document(job_id).update(
@@ -1347,6 +1539,8 @@ async def resume_project(
     job_data = {
         "projectDir": str(project_dir),
         "settings":   {},
+        "userId":     _user_id,
+        "userJobId":  _user_job_id,
         "_ui_settings": {
             "run_vggt":          saved_settings.get("run_vggt", False),
             "run_brush":         saved_settings.get("run_brush", True),
@@ -1356,6 +1550,21 @@ async def resume_project(
             "colmap_mode":       saved_settings.get("colmap_mode", "rig"),
             "colmap_matcher":    saved_settings.get("colmap_matcher", "sequential"),
             "colmap_visualize":  saved_settings.get("colmap_visualize", False),
+            "run_gluemap":                saved_settings.get("run_gluemap", False),
+            "gluemap_backbone":           saved_settings.get("gluemap_backbone", "pi3"),
+            "gluemap_skip_doppelgangers": saved_settings.get("gluemap_skip_doppelgangers", True),
+            "gluemap_coarse_only":        saved_settings.get("gluemap_coarse_only", False),
+            "gluemap_is_sequential":      saved_settings.get("gluemap_is_sequential", True),
+            "gluemap_num_neighbors":      saved_settings.get("gluemap_num_neighbors", 100),
+            "gluemap_batch_size":         saved_settings.get("gluemap_batch_size", 60),
+            "gluemap_num_track_per_img":  saved_settings.get("gluemap_num_track_per_img", 512),
+            "gluemap_wsl_home":           saved_settings.get("gluemap_wsl_home", ""),
+            "gluemap_wsl_distro":         saved_settings.get("gluemap_wsl_distro", ""),
+            "run_rigsfm":                 saved_settings.get("run_rigsfm", False),
+            "rigsfm_anchor_sensor":       saved_settings.get("rigsfm_anchor_sensor", 0),
+            "rigsfm_matcher":             saved_settings.get("rigsfm_matcher", "sequential"),
+            "run_equisfm":                saved_settings.get("run_equisfm", False),
+            "equisfm_matcher":            saved_settings.get("equisfm_matcher", "sequential"),
             "export_xmp":          saved_settings.get("export_xmp", False),
             "brush_rerun_logging": saved_settings.get("brush_rerun_logging", False),
             "gps_priors_rs":       saved_settings.get("gps_priors_rs", False),
@@ -1463,14 +1672,16 @@ async def serve_input_file(
     thumb: bool = False,
 ):
     """Serve a file from the job input directory for in-app preview. No auth — localhost only."""
-    try:
-        doc = firebase_client.get_processing_queue().document(job_id).get()
-        job_data = doc.to_dict() if doc.exists else {}
-    except Exception:
-        job_data = {}
-
     if projectDir:
-        job_data = {**job_data, "projectDir": projectDir}
+        # projectDir in the URL is authoritative — skip the Firestore read entirely
+        # (saves a round-trip per image, critical when 25+ thumbnails load in parallel)
+        job_data: dict = {"projectDir": projectDir}
+    else:
+        try:
+            doc = firebase_client.get_processing_queue().document(job_id).get()
+            job_data = doc.to_dict() if doc.exists else {}
+        except Exception:
+            job_data = {}
 
     input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
     file_path = (input_dir / filename).resolve()
@@ -1497,7 +1708,54 @@ async def serve_input_file(
         if thumb_path.exists():
             return FileResponse(str(thumb_path), media_type="image/jpeg")
 
+    # Read into memory before sending — avoids Content-Length mismatch when the
+    # Insta360 stitcher is still writing the JPEG concurrently with this request.
+    ext = file_path.suffix.lower()
+    if ext in ('.jpg', '.jpeg', '.png', '.webp'):
+        try:
+            file_bytes = file_path.read_bytes()
+        except OSError:
+            raise HTTPException(status_code=404, detail="File not found")
+        media_type = 'image/jpeg' if ext in ('.jpg', '.jpeg') else f'image/{ext[1:]}'
+        return Response(content=file_bytes, media_type=media_type)
+
     return FileResponse(str(file_path))
+
+
+# ── Static Maps proxy ────────────────────────────────────────
+
+import urllib.request as _urllib_req
+
+_STATIC_MAPS_KEY = "AIzaSyB9tm8xhFdzLDzCj88-MqQB826h0B-uQfs"
+
+@app.get("/api/static-map")
+async def static_map_proxy(lat: float, lon: float, zoom: int = 12):
+    """Proxy Google Static Maps so the browser key referrer check is bypassed."""
+    from fastapi.concurrency import run_in_threadpool
+    url = (
+        f"https://maps.googleapis.com/maps/api/staticmap"
+        f"?center={lat},{lon}&zoom={zoom}&size=600x160"
+        f"&maptype=terrain&markers=color:green%7C{lat},{lon}"
+        f"&key={_STATIC_MAPS_KEY}"
+    )
+    def _fetch():
+        with _urllib_req.urlopen(url, timeout=10) as r:
+            return r.read(), r.headers.get("Content-Type", "image/png")
+    try:
+        data, ct = await run_in_threadpool(_fetch)
+        return Response(content=data, media_type=ct)
+    except Exception as e:
+        logger.warning(f"Static map fetch failed ({lat},{lon}): {e}")
+        # Return a simple SVG placeholder so the UI doesn't show a broken image
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="600" height="160">'
+            f'<rect width="600" height="160" fill="#1a2235"/>'
+            f'<text x="300" y="72" font-family="sans-serif" font-size="13" fill="#556" text-anchor="middle">Map unavailable</text>'
+            f'<text x="300" y="92" font-family="sans-serif" font-size="11" fill="#445" text-anchor="middle">{lat:.4f}, {lon:.4f}</text>'
+            f'<text x="300" y="112" font-family="sans-serif" font-size="10" fill="#334" text-anchor="middle">Enable Maps Static API in Google Cloud Console</text>'
+            f'</svg>'
+        )
+        return Response(content=svg.encode(), media_type="image/svg+xml")
 
 
 # ── Serve React frontend ─────────────────────────────────────

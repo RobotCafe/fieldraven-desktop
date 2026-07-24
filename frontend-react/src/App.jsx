@@ -1,4 +1,78 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const [name,     setName]     = useState(pending?.defaultName || '');
+  const [location, setLocation] = useState('');
+  const [notes,    setNotes]    = useState('');
+  const [siteDate, setSiteDate] = useState(today);
+  useEffect(() => { setName(pending?.defaultName || ''); }, [pending?.defaultName]);
+  if (!pending) return null;
+  const inp = { background: T.void, border: `1px solid ${T.border}`, borderRadius: 4,
+    color: T.text, padding: '5px 8px', fontSize: 12, width: '100%', boxSizing: 'border-box', outline: 'none' };
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.7)', zIndex:9999,
+      display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ background:T.surface, border:`1px solid ${T.borderHi}`, borderRadius:8,
+        padding:24, width:380, display:'flex', flexDirection:'column', gap:14 }}>
+        <div style={{ fontSize:13, fontWeight:700, color:T.amber }}>Job Details</div>
+        <div style={{ fontSize:11, color:T.textDim }}>{pending.filePaths.length} files · {pending.projectDir}</div>
+
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Job Name *</label>
+          <input style={inp} value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Kings Peak North Face" />
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Location / Site</label>
+          <input style={inp} value={location} onChange={e=>setLocation(e.target.value)} placeholder="e.g. Kings Peak, Strathcona Park" />
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Date Captured</label>
+          <input style={inp} type="date" value={siteDate} onChange={e=>setSiteDate(e.target.value)} />
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Notes</label>
+          <textarea style={{ ...inp, height:60, resize:'vertical', fontFamily:'inherit' }}
+            value={notes} onChange={e=>setNotes(e.target.value)}
+            placeholder="Conditions, route, camera settings…" />
+        </div>
+
+        <div style={{ display:'flex', gap:8, justifyContent:'flex-end', marginTop:4 }}>
+          <button onClick={onCancel}
+            style={{ background:'none', border:`1px solid ${T.border}`, color:T.textDim,
+              borderRadius:4, padding:'6px 14px', cursor:'pointer', fontSize:12 }}>
+            Cancel
+          </button>
+          <button onClick={()=>onConfirm({ name: name.trim() || pending.defaultName, location, notes, siteDate })}
+            disabled={!name.trim()}
+            style={{ background:T.amber, border:'none', color:'#000', borderRadius:4,
+              padding:'6px 14px', cursor:'pointer', fontSize:12, fontWeight:700,
+              opacity: name.trim() ? 1 : 0.4 }}>
+            Copy & Queue
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MiniMap({ lat, lon }) {
+  const divRef = useRef(null);
+  const mapRef = useRef(null);
+  useEffect(() => {
+    if (!divRef.current || mapRef.current) return;
+    const map = L.map(divRef.current, { center: [lat, lon], zoom: 14, zoomControl: true });
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "© OpenStreetMap contributors",
+    }).addTo(map);
+    L.circleMarker([lat, lon], { radius: 8, color: "#39e07a", fillColor: "#39e07a", fillOpacity: 1, weight: 2 }).addTo(map);
+    mapRef.current = map;
+    return () => { map.remove(); mapRef.current = null; };
+  }, [lat, lon]);
+  return <div ref={divRef} style={{ width: "100%", height: 200, borderRadius: 6, zIndex: 0 }} />;
+}
 
 // ─── Design Tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -216,6 +290,8 @@ const API_TO_UI = {
   export_xmp:'exportXmp', gps_priors_rs:'gpsTriggersRS', gps_priors_colmap:'gpsPriorsColmap',
   run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign', colmap_mapper:'colmapMapper', colmap_vocab_tree:'colmapVocabTree',
   run_gluemap:'runGluemap', gluemap_backbone:'glueMapBackbone', gluemap_skip_doppelgangers:'glueMapSkipDg', gluemap_coarse_only:'glueMapCoarseOnly', gluemap_is_sequential:'glueMapSequential', gluemap_num_neighbors:'glueMapNeighbors', gluemap_batch_size:'glueMapBatchSize', gluemap_num_track_per_img:'glueMapNumTrack', gluemap_wsl_home:'glueMapWslHome', gluemap_wsl_distro:'glueMapWslDistro',
+  run_rigsfm:'runRigsfm', rigsfm_anchor_sensor:'rigsfmAnchorSensor', rigsfm_quad_anchors:'rigsfmQuadAnchors', rigsfm_matcher:'rigsfmMatcher',
+  run_equisfm:'runEquisfm', equisfm_matcher:'equisfmMatcher',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -244,7 +320,8 @@ const STRING_SETTINGS = new Set(['pitchAngles', 'vggtMode', 'postshotProfile',
   'brush', 'rsSettings', 'vggt', 'colmapBin', 'inspStitchType', 'inspLensGuard',
   'inspOutputWidth', 'inspWorkers', 'colmapMode', 'colmapMatcher',
   'colmapMapper', 'colmapVocabTree',
-  'glueMapBackbone', 'glueMapWslHome', 'glueMapWslDistro']);
+  'glueMapBackbone', 'glueMapWslHome', 'glueMapWslDistro',
+  'rigsfmMatcher', 'equisfmMatcher']);
 
 function apiConfigToSettings(cfg) {
   const out = {};
@@ -284,7 +361,7 @@ function statusColor(s) {
 }
 
 // ─── Queue Panel ──────────────────────────────────────────────────────────────
-function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq, onDeletePq, onAddImageFolder, onAddVideoFile }) {
+function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq, onDeletePq, onAddImageFolder, onAddCameraFiles, onAddVideoFile }) {
   const queuedOrProcessing = j => j.status === 'queued' || j.status === 'processing';
   const frItems = pqItems
     .filter(j => queuedOrProcessing(j) && j.jobType !== 'local_folder' && j.jobType !== 'local_video')
@@ -333,11 +410,15 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
                       overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1 }}>
                       {it.name}
                     </span>
-                    {it.status && it.status !== 'queued' && (
-                      <span style={{ fontSize:9, color:statusColor(it.status), flexShrink:0 }}>
-                        {it.status}
-                      </span>
-                    )}
+                    {it.status === 'importing'
+                      ? <span style={{ fontSize:14, color:T.amber, flexShrink:0, lineHeight:1,
+                          display:'inline-block', animation:'frSpin 0.9s linear infinite' }}>⟳</span>
+                      : it.status && it.status !== 'queued' && (
+                          <span style={{ fontSize:9, color:statusColor(it.status), flexShrink:0 }}>
+                            {it.status}
+                          </span>
+                        )
+                    }
                   </div>
                 ))}
             </div>
@@ -356,6 +437,13 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
                   onClick={()=> type==='folder' ? onAddImageFolder?.() : onAddVideoFile?.()}>
                   + Add
                 </Btn>
+                {type === 'folder' && (
+                  <Btn small variant="ghost"
+                    style={{ flex:1, fontSize:10, borderColor:`${cfg.color}44`, color:cfg.color }}
+                    onClick={()=> onAddCameraFiles?.()}>
+                    + From Camera
+                  </Btn>
+                )}
                 {items.length > 0 && (
                   <Btn small variant="ghost"
                     onClick={()=>{
@@ -591,6 +679,9 @@ function FieldRavenTab({ fieldJobs, loading, pqItems, machineInfo, cameraStatus,
                 {expanded===job.id && (
                   <div style={{ borderTop:`1px solid ${T.border}`, padding:"10px 12px",
                     background:T.surfaceEl, display:"flex", flexDirection:"column", gap:8 }}>
+                    {job.gpsStart?.lat != null && (
+                      <MiniMap lat={job.gpsStart.lat} lon={job.gpsStart.lon} />
+                    )}
                     <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
                       {gps && (
                         <div>
@@ -638,14 +729,59 @@ function FieldRavenTab({ fieldJobs, loading, pqItems, machineInfo, cameraStatus,
 
 // ─── Frame & View Extraction Tab ──────────────────────────────────────────────
 function ExtractionTab({ selected, settings, setSettings, cameraStatus, importedFiles, projectDirs, onImport,
-  importStep, importPct, stitching, stitchStep, stitchPct }) {
+  importStep, importPct, stitching, stitchStep, stitchPct, canvasH, setCanvasH }) {
   const [frames, setFrames]           = useState([]);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [importing, setImporting]     = useState(false);
   const [importError, setImportError] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
+  const [canvasVersion, setCanvasVersion] = useState(0);
   const canvasRef  = useRef();
   const imgCacheRef = useRef(new Map());
+  const dragRef    = useRef({ active: false, startY: 0, startH: 0 });
+  const leftColRef = useRef();
+
+  // Resize the canvas buffer to match its actual CSS size × DPR so it's
+  // always crisp — no upscaling blur regardless of window size or HiDPI screen
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const observer = new ResizeObserver(() => {
+      const dpr = window.devicePixelRatio || 1;
+      const w   = Math.round(canvas.offsetWidth  * dpr);
+      const h   = Math.round(canvas.offsetHeight * dpr);
+      if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width  = w;
+        canvas.height = h;
+        setCanvasVersion(v => v + 1);
+      }
+    });
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  const onSplitPointerDown = (e) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragRef.current = { active: true, startY: e.clientY, startH: canvasH };
+    document.body.style.userSelect = 'none';
+  };
+  const onSplitPointerMove = (e) => {
+    if (!dragRef.current.active) return;
+    const dy   = e.clientY - dragRef.current.startY;
+    const col  = leftColRef.current;
+    // max from 2:1 ratio — canvas can't be taller than half the column width
+    const maxFromRatio = col ? Math.floor(col.offsetWidth / 2) : 500;
+    // max from available space — keep at least 120px for splitter + gallery row + footer
+    const maxFromSpace = col ? col.offsetHeight - 120 : 500;
+    const maxH = Math.min(maxFromRatio, maxFromSpace);
+    setCanvasH(Math.max(80, Math.min(maxH, dragRef.current.startH + dy)));
+  };
+  const onSplitPointerUp = (e) => {
+    if (!dragRef.current.active) return;
+    dragRef.current.active = false;
+    document.body.style.userSelect = '';
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  };
 
   const isFR     = selected?.type === 'fieldraven';
   const isFolder = selected?.type === 'folder' || isFR;
@@ -700,6 +836,8 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     const W = canvas.width, H = canvas.height;
     ctx.clearRect(0,0,W,H);
 
@@ -782,24 +920,45 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         ctx.globalAlpha = 0.35; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1;
         drawOverlays();
       } else {
+        // cancelled prevents a stale onload (captured at wrong canvas dims before
+        // ResizeObserver fires) from drawing on top of the correct render after
+        // canvasVersion bumps and the effect re-runs with the right W/H.
+        let cancelled = false;
+        let retryCount = 0;
+        let retryTimer;
         const img = new Image();
         img.onload = () => {
+          if (cancelled) return;
           imgCacheRef.current.set(currentPreviewUrl, img);
           ctx.clearRect(0,0,W,H);
           ctx.drawImage(img, 0, 0, W, H);
           ctx.globalAlpha = 0.35; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1;
           drawOverlays();
         };
-        img.onerror = () => { drawGradientBg(); drawOverlays(); };
+        const attemptLoad = () => {
+          img.src = retryCount === 0
+            ? currentPreviewUrl
+            : currentPreviewUrl.replace(/&_r=\d+/, '') + `&_r=${retryCount}`;
+        };
+        img.onerror = () => {
+          if (cancelled) return;
+          if (retryCount < 6) {
+            retryCount++;
+            retryTimer = setTimeout(attemptLoad, 1500 * retryCount);
+          } else {
+            drawGradientBg(); drawOverlays();
+          }
+        };
         drawGradientBg(); drawOverlays(); // draw placeholder immediately while loading
-        img.src = currentPreviewUrl;
+        attemptLoad();
+        return () => { cancelled = true; clearTimeout(retryTimer); };
       }
       return;
     }
 
     drawGradientBg();
     drawOverlays();
-  }, [selected, settings, hasFiles, camConnected, camDrive, isFolder, currentPreviewUrl, canvasFileLabel]);
+  }, [selected, settings, hasFiles, camConnected, camDrive, isFolder, currentPreviewUrl, canvasFileLabel, canvasVersion]);
 
   const doExtract = () => {
     if (!selected) return;
@@ -853,7 +1012,17 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
                   alt={f.name}
                   style={{ width:'100%', height:'100%', objectFit:'cover' }}
                   loading="lazy"
-                  onError={e => { e.currentTarget.style.opacity = '0.2'; }}
+                  onError={e => {
+                    const el = e.currentTarget;
+                    const n = +(el.dataset.retries || 0);
+                    if (n < 6) {
+                      el.dataset.retries = n + 1;
+                      const base = el.src.replace(/&_r=\d+/, '');
+                      setTimeout(() => { el.src = `${base}&_r=${n + 1}`; }, 1500 * (n + 1));
+                    } else {
+                      el.style.opacity = '0.2';
+                    }
+                  }}
                 />
               </div>
             );
@@ -884,14 +1053,24 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
   return (
     <div style={{ display:"grid", gridTemplateColumns:"1fr 252px", gap:10, height:"100%", overflow:"hidden" }}>
-      <div style={{ display:"flex", flexDirection:"column", gap:8, overflow:"hidden" }}>
+      <div ref={leftColRef} style={{ display:"flex", flexDirection:"column", gap:8, overflow:"hidden" }}>
 
         {/* Canvas + text overlays */}
-        <div style={{ position:"relative", flexShrink:0 }}>
-          <canvas ref={canvasRef} width={680} height={340}
-            style={{ width:"100%", height:"auto", borderRadius:4,
+        <div style={{
+          position:"relative",
+          flexShrink:0,
+          height: canvasH,
+          aspectRatio:"2/1",
+          alignSelf:"center",
+          maxWidth:"100%",
+        }}>
+          <canvas ref={canvasRef}
+            style={{
+              display:"block",
+              width:"100%", height:"100%",
+              borderRadius:4,
               border:`1px solid ${isFolder && !hasFiles ? T.amber+'44' : T.border}`,
-              background:T.void, display:"block" }} />
+              background:T.void }} />
 
           {/* "Select item" overlay */}
           {!selected && (
@@ -903,8 +1082,20 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
             </div>
           )}
 
+          {/* Loading spinner while import is in progress */}
+          {selected && isFolder && !hasFiles && selected.status === 'importing' && (
+            <div style={{ position:"absolute", inset:0, display:"flex",
+              flexDirection:"column", alignItems:"center", justifyContent:"center",
+              pointerEvents:"none", gap:10 }}>
+              <div style={{ width:32, height:32, borderRadius:"50%",
+                border:`2px solid ${T.amber}33`, borderTopColor:T.amber,
+                animation:"frSpin 0.9s linear infinite" }} />
+              <span style={{ fontSize:12, color:T.amber }}>Importing photos…</span>
+            </div>
+          )}
+
           {/* "No images imported" overlay */}
-          {selected && isFolder && !hasFiles && (
+          {selected && isFolder && !hasFiles && selected.status !== 'importing' && (
             <div style={{ position:"absolute", inset:0, display:"flex",
               flexDirection:"column", alignItems:"center", justifyContent:"center",
               pointerEvents:"none", gap:6 }}>
@@ -923,6 +1114,15 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
           )}
         </div>
 
+        {/* Drag splitter */}
+        <div
+          onPointerDown={onSplitPointerDown}
+          onPointerMove={onSplitPointerMove}
+          onPointerUp={onSplitPointerUp}
+          style={{ flexShrink:0, height:10, cursor:"row-resize", display:"flex",
+            alignItems:"center", justifyContent:"center", touchAction:"none" }}>
+          <div style={{ width:48, height:3, background:T.border, borderRadius:2, opacity:0.6 }} />
+        </div>
 
         {/* Stitch progress strip */}
         {isFR && stitching && (
@@ -1158,7 +1358,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
             onChange={v=>setSettings(s=>({...s,horizonRef:v}))} />
         </Accordion>
 
-        <Accordion title="Overlay" defaultOpen={false}>
+        <Accordion title="Overlay" defaultOpen={true}>
           <div style={{ display:"flex", alignItems:"center", gap:8 }}>
             <Label style={{ flexShrink:0 }}>Opacity</Label>
             <input type="range" min={0} max={1} step={.05} value={settings.overlayOpacity}
@@ -1171,7 +1371,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         </Accordion>
 
         {!isFolder && (
-          <Accordion title="Frame Navigator" defaultOpen={false}>
+          <Accordion title="Frame Navigator" defaultOpen={true}>
             {frames.length===0
               ? <div style={{ fontSize:11, color:T.textDim }}>Extract frames to enable</div>
               : <>
@@ -1272,31 +1472,153 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
   );
 }
 
+// ─── RigSfM sensor option builder ────────────────────────────────────────────
+// Mirrors _virtual_rotations() in colmap_runner.py: horizon_ref first (idx 0),
+// then pitched sensors in (pitch, yaw) order.
+function buildRigSensorOptions(pitchAnglesStr, yawSteps, horizonRef) {
+  const pitches = (pitchAnglesStr || '-30')
+    .split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
+  const steps   = Math.max(1, parseInt(yawSteps, 10) || 6);
+  const options = [];
+  let idx = 0;
+
+  if (horizonRef) {
+    options.push({ value: String(idx), label: `#${idx} — horizon ref  (pitch 0°, yaw 0°)` });
+    idx++;
+  }
+  for (const p of pitches) {
+    const offset = p > 0 ? (360 / steps / 2) : 0;
+    for (let i = 0; i < steps; i++) {
+      const y = Math.round(i * 360 / steps + offset);
+      const pSign = p > 0 ? '+' : '';
+      options.push({ value: String(idx), label: `#${idx} — pitch ${pSign}${p}°, yaw ${y}°` });
+      idx++;
+    }
+  }
+  return options;
+}
+
 // ─── Alignment Tab ────────────────────────────────────────────────────────────
-function AlignmentTab({ settings, setSettings }) {
+function AlignmentTab({ settings, setSettings, selected, importedFiles, projectDirs }) {
   const { runPostshot, runBrush } = settings;
 
   // Derive a single active mode from the underlying flags
-  const mode = settings.runColmap ? 'colmap'
-             : settings.runGluemap ? 'gluemap'
-             : settings.runVggt    ? 'vggt'
+  const mode = settings.runColmap   ? 'colmap'
+             : settings.runGluemap  ? 'gluemap'
+             : settings.runRigsfm   ? 'rigsfm'
+             : settings.runEquisfm  ? 'equisfm'
+             : settings.runVggt     ? 'vggt'
              : 'rs';
 
   const setMode = (m) => setSettings(s => ({
     ...s,
-    skipRS:     m !== 'rs',
-    runVggt:    m === 'vggt',
-    runColmap:  m === 'colmap',
-    runGluemap: m === 'gluemap',
-    // Brush available after RS, COLMAP, GlueMap; not after VGGT
+    poseSelected: true,
+    skipRS:      m !== 'rs',
+    runVggt:     m === 'vggt',
+    runColmap:   m === 'colmap',
+    runGluemap:  m === 'gluemap',
+    runRigsfm:   m === 'rigsfm',
+    runEquisfm:  m === 'equisfm',
+    // Brush available after RS, COLMAP, GlueMap, RigSfM, EquiSfM; not after VGGT
     runBrush: m === 'vggt' ? false : s.runBrush,
   }));
+
+  // Anchor thumbnail grid for RigGluemap mode.
+  // Quad mode: 4 crops (yaw 0/90/180/270°) from the FIRST source frame only.
+  // Single mode: one crop per frame for the selected anchor sensor.
+  const [anchorThumbs, setAnchorThumbs] = useState([]);
+  const [thumbsLoading, setThumbsLoading] = useState(false);
+  useEffect(() => {
+    if (mode !== 'rigsfm') { setAnchorThumbs([]); return; }
+    const jobId    = selected?.id;
+    const jobFiles = importedFiles?.[jobId];
+    const projDir  = projectDirs?.[jobId];
+    const jpgs = (jobFiles?.files || []).filter(f => f.ext === '.jpg' || f.ext === '.jpeg');
+    if (!jobId || jpgs.length === 0) { setAnchorThumbs([]); return; }
+
+    const SZ  = 72;
+    const fov = parseFloat(settings.fov) || 94.6;
+    setThumbsLoading(true);
+    let cancelled = false;
+
+    function cropCanvas(img, yaw, pitch) {
+      const IW = img.naturalWidth, IH = img.naturalHeight;
+      const cropW = (fov / 360) * IW, cropH = (fov / 180) * IH;
+      const cx = (((yaw + 180) % 360) / 360) * IW;
+      const cy = IH / 2 - (pitch / 90) * (IH / 2);
+      const sx = ((cx - cropW / 2) % IW + IW) % IW;
+      const sy = Math.max(0, Math.min(IH - cropH, cy - cropH / 2));
+      const off = document.createElement('canvas');
+      off.width = SZ; off.height = SZ;
+      const ctx = off.getContext('2d');
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      if (sx + cropW <= IW) {
+        ctx.drawImage(img, sx, sy, cropW, cropH, 0, 0, SZ, SZ);
+      } else {
+        const p1W = IW - sx, px = Math.round(SZ * p1W / cropW);
+        ctx.drawImage(img, sx, sy, p1W, cropH, 0, 0, px, SZ);
+        ctx.drawImage(img, 0, sy, cropW - p1W, cropH, px, 0, SZ - px, SZ);
+      }
+      return off.toDataURL('image/jpeg', 0.8);
+    }
+
+    function loadImg(f) {
+      return new Promise(resolve => {
+        const url = `/api/jobs/${jobId}/input/${encodeURIComponent(f.name)}?projectDir=${encodeURIComponent(projDir || '')}&thumb=true`;
+        const img = new Image();
+        img.onload  = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = url;
+      });
+    }
+
+    if (settings.rigsfmQuadAnchors) {
+      // Quad mode — load only the first frame, show 4 horizon direction crops
+      loadImg(jpgs[0]).then(img => {
+        if (cancelled || !img) { setAnchorThumbs([]); setThumbsLoading(false); return; }
+        const results = [0, 90, 180, 270].map(yaw => ({
+          dataUrl: cropCanvas(img, yaw, 0),
+          label:   `${yaw}°`,
+        }));
+        if (!cancelled) { setAnchorThumbs(results); setThumbsLoading(false); }
+      });
+    } else {
+      // Single-sensor mode — one crop per frame at the selected sensor's pitch/yaw
+      const pitches    = (settings.pitchAngles || '-30').split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
+      const steps      = Math.max(1, parseInt(settings.yawSteps, 10) || 6);
+      const horizonRef = settings.horizonRef !== false;
+      const targetIdx  = settings.rigsfmAnchorSensor ?? 0;
+      let pitch = 0, yaw = 0, found = false, idx = 0;
+      if (horizonRef) { if (idx === targetIdx) found = true; idx++; }
+      if (!found) {
+        outer: for (const p of pitches) {
+          const offset = p > 0 ? (360 / steps / 2) : 0;
+          for (let i = 0; i < steps; i++) {
+            if (idx === targetIdx) { pitch = p; yaw = Math.round(i * 360 / steps + offset); found = true; break outer; }
+            idx++;
+          }
+        }
+      }
+      Promise.all(jpgs.map((f, i) => loadImg(f).then(img => {
+        if (cancelled || !img) return null;
+        return { dataUrl: cropCanvas(img, yaw, pitch), label: String(i + 1) };
+      }))).then(results => {
+        if (!cancelled) { setAnchorThumbs(results.filter(Boolean)); setThumbsLoading(false); }
+      });
+    }
+
+    return () => { cancelled = true; };
+  }, [mode, settings.rigsfmAnchorSensor, settings.rigsfmQuadAnchors,
+      settings.pitchAngles, settings.yawSteps,
+      settings.horizonRef, settings.fov, selected?.id, importedFiles, projectDirs]);
 
   const MODES = [
     { id:'rs',      label:'RealityScan', desc:'Epic photogrammetry — high accuracy, requires RS licence' },
     { id:'colmap',  label:'COLMAP',      desc:'Open-source SfM — no licence required, needs COLMAP binary' },
     { id:'vggt',    label:'VGGT',        desc:'AI pose estimation — GPU-based, fastest for small captures' },
     { id:'gluemap', label:'GlueMap',     desc:'Global SfM + neural backbone (Pi3/VGGT) via WSL2 — best quality' },
+    { id:'rigsfm',  label:'RigGluemap',   desc:'GluMap Pi3 on 1 or 4 horizon anchor sensors per frame → rig expansion to all sensors → SIFT triangulation — fast, rig-consistent from the start' },
+    { id:'equisfm', label:'EquiSfM',      desc:'COLMAP native EQUIRECTANGULAR SfM on raw panos → rig expansion — no Pi3, no anchor staging, native spherical matching' },
   ];
 
   return (
@@ -1409,7 +1731,7 @@ function AlignmentTab({ settings, setSettings }) {
         {/* ── GlueMap options ───────────────────────────────────── */}
         {mode === 'gluemap' && (
           <div>
-            <Accordion title="GlueMap Options" defaultOpen={false}>
+            <Accordion title="GlueMap Options" defaultOpen={true}>
               <FieldRow label="Backbone">
                 <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
                   {['pi3','pi3x','vggt','map_anything'].map(b => (
@@ -1458,10 +1780,127 @@ function AlignmentTab({ settings, setSettings }) {
           </div>
         )}
 
+        {/* ── RigSfM options ───────────────────────────────────── */}
+        {mode === 'rigsfm' && (
+          <div>
+            <Accordion title="RigGluemap Options" defaultOpen={true}>
+              <FieldRow label="Anchor Mode">
+                <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                  <Radio value="single" checked={!settings.rigsfmQuadAnchors}
+                    onChange={() => setSettings(s => ({...s, rigsfmQuadAnchors:false}))}
+                    label="Single sensor" />
+                  <Radio value="quad" checked={!!settings.rigsfmQuadAnchors}
+                    onChange={() => setSettings(s => ({...s, rigsfmQuadAnchors:true}))}
+                    label="4 horizon sensors" />
+                </div>
+                <div style={{ fontSize:9, color:T.textDim, marginTop:3 }}>
+                  {settings.rigsfmQuadAnchors
+                    ? 'Stages yaw 0°/90°/180°/270° horizon crops from each source panorama as a virtual spin sequence. Requires 01_frames/ equirectangular files. After Pi3, 4 observations per station are averaged into one rig pose.'
+                    : 'Pi3 runs on one sensor\'s images only. Its baked-in pitch/yaw is counter-tilted before expanding to all sensors.'}
+                </div>
+              </FieldRow>
+              {!settings.rigsfmQuadAnchors && (
+                <FieldRow label="Anchor Sensor">
+                  {(() => {
+                    const sensorOpts = buildRigSensorOptions(
+                      settings.pitchAngles, settings.yawSteps, settings.horizonRef !== false
+                    );
+                    const curVal = String(settings.rigsfmAnchorSensor ?? 0);
+                    return (
+                      <div>
+                        <Select
+                          value={curVal}
+                          onChange={v => setSettings(s => ({...s, rigsfmAnchorSensor: +v}))}
+                          options={sensorOpts}
+                        />
+                        <div style={{ fontSize:9, color:T.textDim, marginTop:3 }}>
+                          Horizon ref (idx 0) is the most reliable anchor — it always looks straight ahead.
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </FieldRow>
+              )}
+              {thumbsLoading && (
+                <div style={{ fontSize:9, color:T.textDim, marginTop:4, marginLeft:8 }}>Loading anchor preview…</div>
+              )}
+              {anchorThumbs.length > 0 && (
+                <div style={{ marginTop:4, marginLeft:8 }}>
+                  {settings.rigsfmQuadAnchors && (
+                    <div style={{ fontSize:9, color:T.textDim, marginBottom:4 }}>
+                      First station — 4 horizon views sent to Pi3:
+                    </div>
+                  )}
+                  <div style={{ display:'flex', flexWrap:'wrap', gap:3 }}>
+                    {anchorThumbs.map((t, i) => (
+                      <div key={i} style={{ position:'relative', width:72, height:72,
+                        borderRadius:2, overflow:'hidden', border:`1px solid ${T.border}` }}>
+                        <img src={t.dataUrl} style={{ width:72, height:72, display:'block' }} alt="" />
+                        <div style={{ position:'absolute', bottom:0, left:0, right:0,
+                          background:'rgba(0,0,0,0.55)', textAlign:'center',
+                          fontSize:9, color:'#ddd', lineHeight:'14px' }}>{t.label}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <FieldRow label="Pi3 Backbone">
+                <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                  {['pi3','pi3x','vggt'].map(b => (
+                    <Radio key={b} value={b} checked={settings.glueMapBackbone===b}
+                      onChange={v=>setSettings(s=>({...s,glueMapBackbone:v}))} label={b} />
+                  ))}
+                </div>
+                <div style={{ fontSize:9, color:T.textDim, marginTop:2 }}>
+                  {settings.rigsfmQuadAnchors ? 'Runs on 4 horizon crops per station' : 'Runs on anchor sensor images only'}
+                </div>
+              </FieldRow>
+              <FieldRow label="SIFT Matcher">
+                <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                  {['sequential','exhaustive'].map(m => (
+                    <Radio key={m} value={m}
+                      checked={(settings.rigsfmMatcher||'sequential')===m}
+                      onChange={v=>setSettings(s=>({...s,rigsfmMatcher:v}))} label={m} />
+                  ))}
+                </div>
+                <div style={{ fontSize:9, color:T.textDim, marginTop:2 }}>
+                  Sequential: faster, good for video. Exhaustive: denser matches but O(n²) — use for ≤200 images.
+                </div>
+              </FieldRow>
+              <div style={{ fontSize:10, color:T.textDim, marginTop:6, lineHeight:1.6,
+                borderTop:`1px solid ${T.border}`, paddingTop:8 }}>
+                {settings.rigsfmQuadAnchors
+                  ? <>Quad mode: Pi3 sees a 360° spin at each station before advancing — stronger within-station constraints for sporadic captures. After Pi3, 4 poses per station are averaged (SVD re-orthogonalised) into one rig pose before expanding to all sensors.</>
+                  : <>Anchor: horizon ref sensor (pano_camera0). Pi3 runs on one image per frame, then rig geometry expands all sensor poses mathematically from pitch/yaw settings. Requires <strong style={{color:T.textSec}}>horizon_ref</strong> enabled in view extraction.</>
+                }
+              </div>
+            </Accordion>
+          </div>
+        )}
+
+        {/* ── EquiSfM options ───────────────────────────────────── */}
+        {mode === 'equisfm' && (
+          <div>
+            <Accordion title="EquiSfM Options" defaultOpen={true}>
+              <FieldRow label="Matcher">
+                <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                  <Radio value="sequential" checked={settings.equisfmMatcher==="sequential"}
+                    onChange={v=>setSettings(s=>({...s,equisfmMatcher:v}))} label="Sequential" />
+                  <Radio value="exhaustive" checked={settings.equisfmMatcher==="exhaustive"}
+                    onChange={v=>setSettings(s=>({...s,equisfmMatcher:v}))} label="Exhaustive" />
+                </div>
+              </FieldRow>
+              <div style={{ fontSize:10, color:T.textDim, marginTop:6 }}>
+                COLMAP EQUIRECTANGULAR SfM on raw panos — no Pi3, no anchor staging. Sequential matches neighbouring frames; exhaustive matches all pairs (slower, better for short sequences).
+              </div>
+            </Accordion>
+          </div>
+        )}
+
         {/* ── VGGT options ──────────────────────────────────────── */}
         {mode === 'vggt' && (
           <div>
-            <Accordion title="VGGT Options" defaultOpen={false}>
+            <Accordion title="VGGT Options" defaultOpen={true}>
               <FieldRow label="Confidence">
                 <div style={{ display:"flex", gap:8, alignItems:"center" }}>
                   <input type="range" min={0} max={100} value={settings.vggtConf}
@@ -1512,7 +1951,7 @@ function AlignmentTab({ settings, setSettings }) {
             disabled={mode === 'vggt'}
             onChange={v=>setSettings(s=>({...s,runBrush:v}))} />
           {mode === 'vggt' && (
-            <div style={{ color:T.textDim, fontSize:10 }}>Brush training uses COLMAP/RS/GlueMap output — not available in VGGT mode.</div>
+            <div style={{ color:T.textDim, fontSize:10 }}>Brush training uses COLMAP/RS/GlueMap/RigSfM output — not available in VGGT mode.</div>
           )}
         </div>
       </Accordion>
@@ -1524,6 +1963,8 @@ function AlignmentTab({ settings, setSettings }) {
           {mode === 'colmap'  && `COLMAP ${settings.colmapMode} (${settings.colmapMatcher} matcher)`}
           {mode === 'vggt'    && `VGGT ${settings.vggtMode} pose estimation`}
           {mode === 'gluemap' && `GlueMap (${settings.glueMapBackbone} backbone, ${settings.glueMapNeighbors} neighbours${settings.glueMapSkipDg?', skip-dg':''})`}
+          {mode === 'rigsfm'  && `RigGluemap — Pi3 ${settings.glueMapBackbone||'pi3'} ${settings.rigsfmQuadAnchors ? '4-horizon anchors' : `anchor sensor #${settings.rigsfmAnchorSensor??0}`} → rig expand → SIFT ${settings.rigsfmMatcher||'sequential'}`}
+          {mode === 'equisfm' && `EquiSfM — COLMAP EQUIRECTANGULAR ${settings.equisfmMatcher||'sequential'} matcher → rig expansion`}
           {'\n'}
           {[runPostshot&&'→ Postshot training', runBrush&&'→ Brush training'].filter(Boolean).join('\n') || (mode==='vggt'?'':'→ Alignment only (no training selected)')}
         </div>
@@ -1660,14 +2101,15 @@ const PIPE_TABS = ["Frame & View Extraction","Alignment","Postshot","Brush","Con
 
 function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected,
     settings, setSettings, onSaveConfig, onCancelPq, onDeletePq, machineInfo,
-    cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder, onAddVideoFile,
+    cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder, onAddCameraFiles, onAddVideoFile,
     importStep, importPct, stitching, stitchStep, stitchPct }) {
   const [pipeTab, setPipeTab] = useState(0);
+  const [canvasH, setCanvasH] = useState(600);
   return (
     <div style={{ display:"flex", height:"100%", overflow:"hidden", gap:10 }}>
       <QueuePanel pqItems={pqItems} localQueue={localQueue} setLocalQueue={setLocalQueue}
         selected={selected} setSelected={setSelected} onCancelPq={onCancelPq}
-        onDeletePq={onDeletePq} onAddImageFolder={onAddImageFolder} onAddVideoFile={onAddVideoFile} />
+        onDeletePq={onDeletePq} onAddImageFolder={onAddImageFolder} onAddCameraFiles={onAddCameraFiles} onAddVideoFile={onAddVideoFile} />
 
       <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
         <div style={{ display:"flex", gap:1, marginBottom:0, flexShrink:0, overflowX:"auto" }}>
@@ -1690,8 +2132,10 @@ function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected
           {pipeTab===0 && <ExtractionTab selected={selected} settings={settings} setSettings={setSettings}
             cameraStatus={cameraStatus} importedFiles={importedFiles} projectDirs={projectDirs} onImport={onImport}
             importStep={importStep} importPct={importPct}
-            stitching={stitching} stitchStep={stitchStep} stitchPct={stitchPct} />}
-          {pipeTab===1 && <AlignmentTab settings={settings} setSettings={setSettings} />}
+            stitching={stitching} stitchStep={stitchStep} stitchPct={stitchPct}
+            canvasH={canvasH} setCanvasH={setCanvasH} />}
+          {pipeTab===1 && <AlignmentTab settings={settings} setSettings={setSettings}
+            selected={selected} importedFiles={importedFiles} projectDirs={projectDirs} />}
           {pipeTab===2 && <PostshotTab settings={settings} setSettings={setSettings} />}
           {pipeTab===3 && <BrushTab settings={settings} setSettings={setSettings} />}
           {pipeTab===4 && <ConfigTab settings={settings} setSettings={setSettings}
@@ -1711,11 +2155,17 @@ const _STAGES_COLMAP   = { labels:['Frames','Views','COLMAP','Brush'],
   keys:['frame_extraction','view_extraction','colmap_alignment','brush_training'] };
 const _STAGES_GLUEMAP  = { labels:['Frames','Views','GlueMap','Brush'],
   keys:['frame_extraction','view_extraction','gluemap_alignment','brush_training'] };
+const _STAGES_RIGSFM   = { labels:['Frames','Views','RigGluemap','Brush'],
+  keys:['frame_extraction','view_extraction','rigsfm_alignment','brush_training'] };
+const _STAGES_EQUISFM  = { labels:['Frames','Views','EquiSfM','Brush'],
+  keys:['frame_extraction','view_extraction','equisfm_alignment','brush_training'] };
 
 function ActiveJobTab({ currentJob, progress, statusMsg, logs, currentStage, pipelineMode }) {
   const stageDef = pipelineMode === 'rs_brush' ? _STAGES_RS_BRUSH
                  : pipelineMode === 'colmap'   ? _STAGES_COLMAP
                  : pipelineMode === 'gluemap'  ? _STAGES_GLUEMAP
+                 : pipelineMode === 'rigsfm'   ? _STAGES_RIGSFM
+                 : pipelineMode === 'equisfm'  ? _STAGES_EQUISFM
                  : _STAGES_VGGT;
   const stageIdx = stageDef.keys.indexOf(currentStage);
   // Fall back to proportional mapping when stage name isn't known yet
@@ -1891,11 +2341,13 @@ const _STAGE_LABELS = {
   colmap_alignment:   { label: "COLMAP Alignment",   icon: "📐" },
   vggt_alignment:     { label: "VGGT Alignment",     icon: "🔬" },
   gluemap_alignment:  { label: "GlueMap Alignment",  icon: "🗺️" },
+  rigsfm_alignment:   { label: "RigGluemap Alignment", icon: "🗺️" },
+  equisfm_alignment:  { label: "EquiSfM Alignment",    icon: "🌐" },
   brush_training:   { label: "Brush Training",     icon: "🎨" },
   colmap_export:    { label: "COLMAP Export",      icon: "📦" },
 };
 
-function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCancel }) {
+function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCancel, settings, onSettingsChange }) {
   const [rerunStage, setRerunStage] = useState('');
   if (!state) return null;
 
@@ -1905,29 +2357,44 @@ function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCanc
     ? ['import', 'view_extraction', 'colmap_alignment', 'brush_training']
     : _mode === 'vggt'
     ? ['import', 'view_extraction', 'vggt_alignment', 'brush_training']
+    : _mode === 'gluemap'
+    ? ['import', 'view_extraction', 'gluemap_alignment', 'brush_training']
+    : _mode === 'rigsfm'
+    ? ['import', 'view_extraction', 'rigsfm_alignment', 'brush_training']
+    : _mode === 'equisfm'
+    ? ['import', 'view_extraction', 'equisfm_alignment', 'brush_training']
     : ['import', 'view_extraction', 'realityscan', 'brush_training'];
   const shortDir = projectDir.length > 55 ? '…' + projectDir.slice(-52) : projectDir;
 
   const stageDetail = (key) => {
     const s = stages[key] || {};
     if (!s.done) return 'Not started';
-    if (key === 'import')            return `${s.stitched || 0} files`;
-    if (key === 'view_extraction')   return `${s.views || 0} views`;
-    if (key === 'realityscan')       return `${s.images || 0} images`;
-    if (key === 'colmap_alignment')  return s.cameras ? `${s.cameras} txt file(s)` : 'Done';
-    if (key === 'vggt_alignment')    return 'Done';
-    if (key === 'brush_training')    return `${s.plyFiles || 0} PLY file(s)`;
+    if (key === 'import')             return `${s.stitched || 0} files`;
+    if (key === 'view_extraction')    return `${s.views || 0} views`;
+    if (key === 'realityscan')        return `${s.images || 0} images`;
+    if (key === 'colmap_alignment')   return s.cameras ? `${s.cameras} txt file(s)` : 'Done';
+    if (key === 'gluemap_alignment')  return 'Done';
+    if (key === 'vggt_alignment')     return 'Done';
+    if (key === 'brush_training')     return `${s.plyFiles || 0} PLY file(s)`;
     return 'Done';
   };
 
   const nextLabel = nextStage ? (_STAGE_LABELS[nextStage]?.label || nextStage) : null;
   const rerunableStages = completedStages.filter(s => s !== 'import');
+  const noTraining = !settings?.runBrush && !settings?.runPostshot;
+
+  const chk = (field) => ({
+    type: "checkbox",
+    checked: !!settings?.[field],
+    onChange: e => onSettingsChange?.({ [field]: e.target.checked }),
+    style: { accentColor: T.amber, cursor: "pointer" },
+  });
 
   return (
     <div style={{ position:"fixed", inset:0, zIndex:500, background:"rgba(0,0,0,.65)",
       display:"flex", alignItems:"center", justifyContent:"center" }}>
       <div style={{ background:T.surface, border:`1px solid ${T.borderHi}`, borderRadius:8,
-        width:440, padding:"24px 28px", boxShadow:"0 8px 32px rgba(0,0,0,.6)" }}>
+        width:460, padding:"24px 28px", boxShadow:"0 8px 32px rgba(0,0,0,.6)" }}>
 
         <div style={{ fontSize:13, fontWeight:700, color:T.textPri, marginBottom:4 }}>
           Project Found
@@ -1938,7 +2405,7 @@ function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCanc
         </div>
 
         {/* Stage list */}
-        <div style={{ marginBottom:20 }}>
+        <div style={{ marginBottom:16 }}>
           {allStages.map(key => {
             const s    = stages[key] || {};
             const meta = _STAGE_LABELS[key] || { label: key, icon: "•" };
@@ -1957,10 +2424,32 @@ function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCanc
           })}
         </div>
 
+        {/* Training toggles */}
+        <div style={{ marginBottom:16, padding:"10px 12px",
+          background:T.void, border:`1px solid ${T.border}`, borderRadius:4 }}>
+          <div style={{ fontSize:10, color:T.textDim, textTransform:"uppercase",
+            letterSpacing:".5px", marginBottom:8 }}>Training</div>
+          <div style={{ display:"flex", gap:20 }}>
+            <label style={{ display:"flex", alignItems:"center", gap:6, cursor:"pointer" }}>
+              <input {...chk('runBrush')} />
+              <span style={{ fontSize:12, color:T.textPri }}>Brush</span>
+            </label>
+            <label style={{ display:"flex", alignItems:"center", gap:6, cursor:"pointer" }}>
+              <input {...chk('runPostshot')} />
+              <span style={{ fontSize:12, color:T.textPri }}>Postshot</span>
+            </label>
+          </div>
+          {noTraining && (
+            <div style={{ fontSize:11, color:"#e07070", marginTop:6 }}>
+              Enable at least one training method to continue.
+            </div>
+          )}
+        </div>
+
         {/* Actions */}
         <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
           {nextLabel && (
-            <Btn variant="live" full onClick={() => onContinue(nextStage)}>
+            <Btn variant="live" full disabled={noTraining} onClick={() => !noTraining && onContinue(nextStage)}>
               Continue from {nextLabel}
             </Btn>
           )}
@@ -1976,8 +2465,8 @@ function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCanc
                   <option key={s} value={s}>{_STAGE_LABELS[s]?.label || s}</option>
                 ))}
               </select>
-              <Btn variant="ghost" disabled={!rerunStage}
-                onClick={() => rerunStage && onRerunFrom(rerunStage)}>
+              <Btn variant="ghost" disabled={!rerunStage || noTraining}
+                onClick={() => rerunStage && !noTraining && onRerunFrom(rerunStage)}>
                 Rerun
               </Btn>
             </div>
@@ -2001,11 +2490,14 @@ const defaultSettings = {
   extractionMethod:"interval", intervalValue:1, intervalUnit:"seconds",
   frameCount:30, frameFormat:"jpg",
   pitchAngles:"-50, -7", yawSteps:"6", fov:"94.6", overlayOpacity:0.6,
+  poseSelected:false,
   skipRS:false, runVggt:false, runPostshot:true, runBrush:false,
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
   vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false, gpsTriggersRS:false, gpsPriorsColmap:false,
   runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false, colmapMapper:"incremental", colmapVocabTree:"",
   runGluemap:false, glueMapBackbone:"pi3", glueMapSkipDg:true, glueMapCoarseOnly:false, glueMapSequential:true, glueMapNeighbors:100, glueMapBatchSize:60, glueMapNumTrack:512, glueMapWslHome:"/home/decosson", glueMapWslDistro:"Ubuntu-22.04",
+  runRigsfm:false, rigsfmAnchorSensor:0, rigsfmQuadAnchors:false, rigsfmMatcher:'sequential',
+  runEquisfm:false, equisfmMatcher:'sequential',
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,
@@ -2048,6 +2540,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   const [importedFiles, setImportedFiles] = useState({}); // { [jobId]: { files, total } }
   const [projectDirs, setProjectDirs]       = useState({}); // { [jobId]: string }
   const [lastBrowseDir, setLastBrowseDir]   = useState('C:\\Users');
+  const [cameraImportPending, setCameraImportPending] = useState(null); // { filePaths, projectDir, defaultName }
   const [projectState, setProjectState]     = useState(null); // modal data from /api/project/state
   const [importingJobId, setImportingJobId] = useState(null);
   const [stitchingJobId, setStitchingJobId] = useState(null);
@@ -2075,8 +2568,8 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   }, [api]);
 
   // ── Field jobs ────────────────────────────────────────────
-  const loadFieldJobs = useCallback(() => {
-    setFieldJobsLoading(true);
+  const loadFieldJobs = useCallback((showSpinner = false) => {
+    if (showSpinner) setFieldJobsLoading(true);
     api('/api/user-jobs')
       .then(d => setFieldJobs(d.jobs || []))
       .catch(() => {})
@@ -2085,8 +2578,8 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
 
   useEffect(() => {
     if (activeMainTab !== 0) return;
-    loadFieldJobs();
-    const iv = setInterval(loadFieldJobs, 30_000);
+    loadFieldJobs(true); // spinner only on initial load
+    const iv = setInterval(loadFieldJobs, 30_000); // silent background refresh
     return () => clearInterval(iv);
   }, [activeMainTab, loadFieldJobs]);
 
@@ -2231,7 +2724,8 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     setProjectDirs(prev => ({ ...prev, [jobId]: dir }));
     setSettings(s => ({ ...s, projectDir: dir }));
     if (savedSettings) {
-      setSettings(s => ({ ...s, ...apiConfigToSettings(savedSettings) }));
+      const poseIsConfigured = ['run_gluemap','run_colmap','run_vggt','skip_realityscan'].some(k => k in savedSettings);
+      setSettings(s => ({ ...s, ...apiConfigToSettings(savedSettings), poseSelected: poseIsConfigured }));
     }
 
     // 3. Fetch the specific job doc by id (works regardless of its Firestore status —
@@ -2241,17 +2735,18 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     const dirName = dir.split(/[\\/]/).filter(Boolean).pop() || 'Project';
     try {
       const jobData = await api(`/api/jobs/${jobId}/status`);
-      if (jobData) {
-        const entry = { ...jobData, docId: jobId };
-        setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
-        setSelected({ id: jobId, type: jobType, name: jobData.name || dirName, status: jobData.status });
-      } else {
-        setSelected({ id: jobId, type: jobType, name: dirName, status: 'queued' });
-      }
+      const name = jobData?.name || dirName;
+      const status = jobData?.status || 'queued';
+      const entry = { ...(jobData || {}), docId: jobId, id: jobId, jobType: jobData?.jobType || 'local_folder', name, status };
+      setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
+      setSelected({ id: jobId, type: jobType, name, status });
     } catch {
+      const entry = { docId: jobId, id: jobId, jobType: 'local_folder', name: dirName, status: 'queued' };
+      setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
       setSelected({ id: jobId, type: jobType, name: dirName, status: 'queued' });
     }
     loadQueue();
+    setActiveMainTab(1);
 
     // 4. Check pipeline history and show the resume modal if appropriate
     try {
@@ -2283,7 +2778,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       setCurrentJobId(r.jobId);
       setProgress(0);
       setCurrentStage('');
-      const _mode = settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+      const _mode = settings.runEquisfm ? 'equisfm' : settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : settings.runRigsfm ? 'rigsfm' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
       setPipelineMode(_mode);
       setStatusMsg(`Resuming from ${startFrom || 'beginning'}`);
       addLog(`Pipeline resumed — jobId: ${r.jobId}`);
@@ -2457,43 +2952,107 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     );
     if (!doCopy) { addLog('Import skipped — no photos copied.'); return; }
 
+    const folderName = sourceFolder.split(/[\\/]/).filter(Boolean).pop() || 'Imported Photos';
     let created;
     try {
-      const folderName = sourceFolder.split(/[\\/]/).filter(Boolean).pop() || 'Imported Photos';
       created = await api('/api/jobs/create-local', 'POST', { name: folderName, projectDir });
     } catch (e) {
       addLog(`Could not create project: ${e.message}`);
       return;
     }
-    setProjectDirs(prev => ({ ...prev, [created.processingJobId]: projectDir }));
+
+    // Show immediately in queue so the user sees feedback right away
+    const jobId = created.processingJobId;
+    setProjectDirs(prev => ({ ...prev, [jobId]: projectDir }));
+    setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev
+      : [{ docId: jobId, id: jobId, jobType: 'local_folder', name: folderName, status: 'importing' }, ...prev]);
+    setSelected({ id: jobId, type: 'folder', name: folderName, status: 'importing' });
 
     addLog(`Importing photos from ${sourceFolder}…`);
     try {
       const result = await api('/api/project/import-folder', 'POST', {
-        jobId: created.processingJobId, projectDir, sourceFolder,
+        jobId, projectDir, sourceFolder,
       });
       addLog(`Import complete: ${result.imported} copied, ${result.skipped} skipped`);
     } catch (e) {
       addLog(`Import failed: ${e.message}`);
+      setPqItems(prev => prev.map(j => (j.docId||j.id) === jobId ? { ...j, status: 'error' } : j));
+      setSelected(prev => prev?.id === jobId ? { ...prev, status: 'error' } : prev);
       return;
     }
 
     // Populate the gallery the same way the camera-import flow does.
     const pdParam = encodeURIComponent(projectDir);
-    const files = await api(`/api/jobs/${created.processingJobId}/files?projectDir=${pdParam}`);
-    setImportedFiles(prev => ({ ...prev, [created.processingJobId]: files }));
+    const files = await api(`/api/jobs/${jobId}/files?projectDir=${pdParam}`);
+    setImportedFiles(prev => ({ ...prev, [jobId]: files }));
 
-    api('/api/project/config', 'POST', { dir: projectDir, jobId: created.processingJobId }).catch(() => {});
+    api('/api/project/config', 'POST', { dir: projectDir, jobId }).catch(() => {});
     addLog(`Project ready: ${created.name}`);
+    const folderEntry = { docId: jobId, id: jobId, jobType: 'local_folder', name: folderName, status: 'queued' };
+    setPqItems(prev => prev.map(j => (j.docId||j.id) === jobId ? folderEntry : j));
+    setSelected({ id: jobId, type: 'folder', name: folderName, status: 'queued' });
     loadQueue();
   }, [api, lastBrowseDir, loadQueue, setImportedFiles]);
+
+  const onAddCameraFiles = useCallback(async () => {
+    // Step 1: Pick files first so user can see what's on the camera before naming the project
+    const camDrive = cameraStatus?.camera_drive || 'D:\\';
+    addLog(`Select .insp files from camera (${camDrive})…`);
+    const filesRes = await api(`/api/browse/files?initial=${encodeURIComponent(camDrive)}`);
+    if (!filesRes.paths || filesRes.paths.length === 0) { addLog('No files selected.'); return; }
+    addLog(`${filesRes.paths.length} files selected.`);
+
+    // Step 2: Pick / create the project directory
+    addLog('Select or create a project folder…');
+    const dirRes = await api(`/api/browse/folder?initial=${encodeURIComponent(lastBrowseDir)}`);
+    if (!dirRes.path) { addLog('Cancelled.'); return; }
+    setLastBrowseDir(dirRes.path);
+
+    // Step 3: Show metadata form before committing
+    const defaultName = dirRes.path.split(/[\\/]/).filter(Boolean).pop() || 'Camera Import';
+    setCameraImportPending({ filePaths: filesRes.paths, projectDir: dirRes.path, defaultName });
+  }, [api, lastBrowseDir, cameraStatus]);
+
+  const onConfirmCameraImport = useCallback(async (meta) => {
+    if (!cameraImportPending) return;
+    const { filePaths, projectDir } = cameraImportPending;
+    setCameraImportPending(null);
+
+    addLog(`Copying ${filePaths.length} files into project…`);
+    let created;
+    try {
+      created = await api('/api/jobs/create-from-files', 'POST', {
+        filePaths, projectDir,
+        name:     meta.name,
+        location: meta.location,
+        notes:    meta.notes,
+        siteDate: meta.siteDate,
+      });
+    } catch (e) { addLog(`Failed: ${e.message}`); return; }
+
+    addLog(`Copied ${created.imported} files (${created.skipped} skipped${created.errors ? `, ${created.errors} errors` : ''})`);
+
+    const jobId = created.processingJobId;
+    setProjectDirs(prev => ({ ...prev, [jobId]: projectDir }));
+    const entry = { docId: jobId, id: jobId, jobType: 'local_folder', name: created.name, status: 'queued' };
+    setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
+    setSelected({ id: jobId, type: 'folder', name: created.name, status: 'queued' });
+
+    const files = await api(`/api/jobs/${jobId}/files?projectDir=${encodeURIComponent(projectDir)}`);
+    setImportedFiles(prev => ({ ...prev, [jobId]: files }));
+    api('/api/project/config', 'POST', { dir: projectDir, jobId }).catch(() => {});
+    loadQueue();
+  }, [api, cameraImportPending, loadQueue, setImportedFiles]);
 
   const onQueueJob = useCallback(async (job) => {
     try {
       const result = await api('/api/jobs/queue-for-processing', 'POST', { userJobId: job.id });
       addLog(`Queued: ${result.name}`);
-      loadQueue();
+      const frEntry = { docId: job.id, id: job.id, jobType: job.jobType || 'simple', name: job.clientName || job.name || 'Field Job', status: 'queued', userJobId: job.id };
+      setPqItems(prev => prev.some(j => (j.docId||j.id) === job.id) ? prev : [frEntry, ...prev]);
+      setSelected({ id: job.id, type: 'fieldraven', name: job.clientName || job.name || 'Field Job', status: 'queued' });
       setActiveMainTab(1);
+      loadQueue();
     } catch (e) {
       addLog(`Failed to queue: ${e.message}`);
     }
@@ -2501,6 +3060,14 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
 
   const runPipeline = useCallback(async () => {
     if (!selected) return;
+    if (!settings.poseSelected) {
+      addLog('No alignment method selected. Go to the Alignment tab and choose RealityScan, COLMAP, VGGT, GlueMap, or RigGluemap before running.');
+      return;
+    }
+    if (!settings.runBrush && !settings.runPostshot) {
+      addLog('No training method selected. Go to the Training tab and enable Brush or Postshot before running.');
+      return;
+    }
     if (selected.type === 'fieldraven' || selected.type === 'folder') {
       try {
         addLog(`Accepting job...`);
@@ -2515,7 +3082,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         setCurrentJobId(selected.id);
         setProgress(0);
         setCurrentStage('');
-        const _mode = settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+        const _mode = settings.runEquisfm ? 'equisfm' : settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : settings.runRigsfm ? 'rigsfm' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
         setPipelineMode(_mode);
         setStatusMsg('Pipeline started');
         addLog('Pipeline running');
@@ -2575,6 +3142,9 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       return;
     }
     addLog(`Video project ready: ${created.name}`);
+    const videoEntry = { docId: created.processingJobId, id: created.processingJobId, jobType: 'local_video', name: created.name, status: 'queued' };
+    setPqItems(prev => prev.some(j => (j.docId||j.id) === created.processingJobId) ? prev : [videoEntry, ...prev]);
+    setSelected({ id: created.processingJobId, type: 'video', name: created.name, status: 'queued' });
     loadQueue();
   }, [api, lastBrowseDir, loadQueue]);
 
@@ -2607,6 +3177,8 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       {projectState && (
         <ProjectStateModal
           state={projectState}
+          settings={settings}
+          onSettingsChange={(patch) => setSettings(s => ({ ...s, ...patch }))}
           onContinue={async (nextStage) => {
             await runPipelineResume(projectState.projectDir, projectState.jobId, nextStage);
           }}
@@ -2801,7 +3373,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
             onSaveConfig={onSaveConfig} onCancelPq={onCancelPq} onDeletePq={onDeletePq}
             machineInfo={machineInfo}
             cameraStatus={cameraStatus} importedFiles={importedFiles} projectDirs={projectDirs} onImport={onImport}
-            onAddImageFolder={onAddImageFolder} onAddVideoFile={onAddVideoFile}
+            onAddImageFolder={onAddImageFolder} onAddCameraFiles={onAddCameraFiles} onAddVideoFile={onAddVideoFile}
             importStep={importStep} importPct={importPct}
             stitching={!!stitchingJobId} stitchStep={stitchStep} stitchPct={stitchPct}
           />
@@ -2828,6 +3400,12 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       </div>
 
       <Console logs={logs} visible={consoleVisible} />
+
+      <CameraImportMetaModal
+        pending={cameraImportPending}
+        onConfirm={onConfirmCameraImport}
+        onCancel={() => { setCameraImportPending(null); addLog('Cancelled.'); }}
+      />
     </div>
   );
 }
