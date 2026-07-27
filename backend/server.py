@@ -336,6 +336,7 @@ async def queue_for_processing(
     new_ref.set({
         'assignedMachine': machine_module.get_machine_id(),
         'status': 'queued',
+        'jobType': 'fieldraven',
         'userJobId': request.userJobId,
         'userId': user.uid,
         'clientName': client_name,
@@ -352,6 +353,60 @@ async def queue_for_processing(
     return {"processingJobId": doc_id, "status": "queued", "name": display_name}
 
 
+def _derive_session_times(dest_dir: Path, site_date: str = "", site_time: str = "") -> tuple:
+    """Derive (startMs, endMs) UTC epoch millis for Garmin/Coros activity matching,
+    for jobs with no mobile-app session record (the "From Camera" / local-folder
+    import flow).
+
+    Prefers the actual EXIF DateTimeOriginal span across the imported .insp files
+    (a real measured capture window) over the user-entered date/time (a guess).
+    Insta360 files carry a reliable DateTimeOriginal but never real GPS (confirmed
+    empirically — GPS EXIF is always zeroed on this camera), so this is the only
+    trustworthy signal from the files themselves.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    timestamps: list[_dt] = []
+    try:
+        from PIL import Image
+        from PIL.ExifTags import TAGS
+        for f in sorted(dest_dir.glob("*.insp")):
+            try:
+                exif = Image.open(f)._getexif() or {}
+                for tag_id, val in exif.items():
+                    if TAGS.get(tag_id) == "DateTimeOriginal":
+                        timestamps.append(_dt.strptime(val, "%Y:%m:%d %H:%M:%S"))
+                        break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    local_tz = _dt.now().astimezone().tzinfo
+
+    if timestamps:
+        start = min(timestamps).replace(tzinfo=local_tz).astimezone(_tz.utc)
+        end   = max(timestamps).replace(tzinfo=local_tz).astimezone(_tz.utc)
+        # Photos only mark 360-camera stops during a hike, not the whole hike —
+        # pad generously so the Garmin/Coros overlap match has a realistic window.
+        pad = _td(hours=2)
+        return int((start - pad).timestamp() * 1000), int((end + pad).timestamp() * 1000)
+
+    # No EXIF timestamps at all (e.g. an all-.insv video job) — fall back to the
+    # manually entered date/time as a single anchor with a wider window, since
+    # it's an approximate guess rather than a measured span.
+    if site_date:
+        try:
+            anchor_naive = _dt.strptime(f"{site_date} {site_time or '12:00'}", "%Y-%m-%d %H:%M")
+            anchor = anchor_naive.replace(tzinfo=local_tz).astimezone(_tz.utc)
+            pad = _td(hours=3)
+            return int((anchor - pad).timestamp() * 1000), int((anchor + pad).timestamp() * 1000)
+        except ValueError:
+            pass
+
+    return None, None
+
+
 class CreateFromFilesRequest(BaseModel):
     filePaths: list[str]
     projectDir: str
@@ -359,58 +414,108 @@ class CreateFromFilesRequest(BaseModel):
     location: Optional[str] = None
     notes: Optional[str] = None
     siteDate: Optional[str] = None
+    siteTime: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 @app.post("/api/jobs/create-from-files")
 async def create_from_files(
     request: CreateFromFilesRequest,
     user: CurrentUser = Depends(require_auth),
 ):
-    """Create a pipeline job from a manually selected list of camera files.
-    Copies the files into <projectDir>/import from camera/ then queues the job."""
-    import datetime, shutil as _shutil
+    """Create a pipeline job from manually selected camera files.
+    Creates the Firestore doc immediately (status='importing') so the UI can
+    show progress, then copies files in a background thread before setting
+    status='queued'."""
+    import datetime, shutil as _shutil, asyncio as _asyncio
 
-    project_dir = Path(request.projectDir)
-    dest_dir = project_dir / "import from camera"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    imported = skipped = errors = 0
-    for path_str in request.filePaths:
-        src = Path(path_str)
-        dst = dest_dir / src.name
-        if dst.exists():
-            skipped += 1
-            continue
-        try:
-            _shutil.copy2(str(src), str(dst))
-            imported += 1
-        except Exception as e:
-            errors += 1
-            print(f"  Copy failed {src.name}: {e}")
-
-    display_name = request.name or project_dir.name or 'Camera Import'
+    display_name = request.name or Path(request.projectDir).name or 'Camera Import'
+    project_dir  = Path(request.projectDir)
+    dest_dir     = project_dir / "import from camera"
 
     db = firebase_client.get_db()
     new_ref = db.collection('processing_queue').document()
     new_ref.set({
         'assignedMachine': machine_module.get_machine_id(),
-        'userId': user.uid,
-        'status': 'queued',
-        'jobType': 'local_folder',
-        'name': display_name,
-        'projectDir': str(project_dir),
-        'createdAt': datetime.datetime.utcnow(),
-        'settings': {},
-        'location': request.location or '',
-        'notes': request.notes or '',
-        'siteDate': request.siteDate or '',
+        'userId':          user.uid,
+        'status':          'importing',
+        'jobType':         'local_folder',
+        'name':            display_name,
+        'projectDir':      str(project_dir),
+        'createdAt':       datetime.datetime.utcnow(),
+        'settings':        {},
+        'location':        request.location or '',
+        'notes':           request.notes or '',
+        'siteDate':        request.siteDate or '',
+        'siteTime':        request.siteTime or '',
     })
+    doc_id = new_ref.id
+
+    file_paths  = list(request.filePaths)
+    total_files = len(file_paths)
+
+    def _do_copy():
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        imported = skipped = errors = 0
+        for i, path_str in enumerate(file_paths, 1):
+            src = Path(path_str)
+            dst = dest_dir / src.name
+            if dst.exists():
+                skipped += 1
+            else:
+                try:
+                    _shutil.copy2(str(src), str(dst))
+                    imported += 1
+                except Exception as e:
+                    errors += 1
+                    print(f"  Copy failed {src.name}: {e}")
+            queue_manager.update_job_progress(
+                doc_id, 0,
+                f"Copying {i}/{total_files}: {src.name}",
+            )
+        new_ref.update({'status': 'queued'})
+        return imported, skipped, errors
+
+    imported, skipped, errors = await _asyncio.get_event_loop().run_in_executor(None, _do_copy)
+
+    # Derive session_times so the existing Garmin auto-fetch (garmin_fetcher.py,
+    # currently mobile-job-only) also fires for this camera-folder import flow —
+    # it already knows how to match by time window and fall back to the activity's
+    # first route point as captureLocation; it was just never getting real times.
+    try:
+        s_ms, e_ms = await _asyncio.get_event_loop().run_in_executor(
+            None, _derive_session_times, dest_dir, request.siteDate or "", request.siteTime or ""
+        )
+        if s_ms and e_ms:
+            from . import pipeline_runner
+            pipeline_runner._write_stage_progress(project_dir, "session_times", {
+                "startMs": s_ms, "endMs": e_ms,
+            })
+            print(f"  [session] Derived session_times for {doc_id} ({project_dir.name})")
+    except Exception as e:
+        print(f"  [session] Could not derive session_times: {e}")
+
+    # Manually-picked map location (fallback for when the camera has no GPS —
+    # confirmed the Insta360 files never carry a real fix). Saved now so
+    # _write_capture_location() can use it at publish time even though there's
+    # no mobile job doc for this import flow.
+    if request.lat is not None and request.lon is not None:
+        try:
+            from . import pipeline_runner
+            pipeline_runner._write_stage_progress(project_dir, "manual_location", {
+                "lat": request.lat, "lon": request.lon,
+            })
+            print(f"  [location] Saved manually-picked location for {doc_id}: "
+                  f"{request.lat:.5f}, {request.lon:.5f}")
+        except Exception as e:
+            print(f"  [location] Could not save manual location: {e}")
 
     return {
-        'processingJobId': new_ref.id,
-        'name': display_name,
-        'imported': imported,
-        'skipped': skipped,
-        'errors': errors,
+        'processingJobId': doc_id,
+        'name':            display_name,
+        'imported':        imported,
+        'skipped':         skipped,
+        'errors':          errors,
     }
 
 
@@ -466,7 +571,10 @@ async def create_video_job(
 
     dest = input_dir / video_path.name
     if not dest.exists():
-        _shutil.copy2(str(video_path), str(dest))
+        import asyncio as _asyncio
+        await _asyncio.get_event_loop().run_in_executor(
+            None, lambda: _shutil.copy2(str(video_path), str(dest))
+        )
 
     display_name = request.name or video_path.stem
 
@@ -1692,15 +1800,44 @@ async def serve_input_file(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
+    # The Insta360 stitcher writes equirectangular JPEGs in a background thread
+    # while the gallery may already be polling/loading them. Reading mid-write
+    # doesn't raise -- PIL and browser JPEG decoders both tolerantly render
+    # whatever complete scanlines exist so far (valid top rows, black below)
+    # rather than erroring, so this previously slipped through as a normal
+    # 200 response and got permanently cached (server .thumbs/ cache AND the
+    # browser's own image cache) as a corrupt-but-valid-looking thumbnail/
+    # preview. A real JPEG always ends with the EOI marker (0xFFD9); checking
+    # for it lets us reject a mid-write read with an error instead, which
+    # triggers the frontend's existing onerror retry-with-cache-bust logic
+    # (already implemented for both the canvas preview and the thumbnail
+    # row) rather than silently serving/caching bad data.
+    def _is_complete_jpeg(p: Path) -> bool:
+        try:
+            with open(p, "rb") as fh:
+                fh.seek(-2, 2)
+                return fh.read(2) == b"\xff\xd9"
+        except OSError:
+            return False
+
+    _ext = file_path.suffix.lower()
+    if _ext in ('.jpg', '.jpeg') and not _is_complete_jpeg(file_path):
+        raise HTTPException(status_code=503, detail="File still being written — retry shortly")
+
     # Serve a small disk-cached thumbnail so the gallery doesn't load full 6-12K images
     if thumb and file_path.suffix.lower() in ('.jpg', '.jpeg', '.png'):
         thumb_dir = input_dir / ".thumbs"
         thumb_path = (thumb_dir / filename).resolve()
+        if thumb_path.exists() and thumb_path.stat().st_size < 500:
+            # Cached thumbnail is suspiciously small (corrupt/black) — regenerate it
+            thumb_path.unlink(missing_ok=True)
         if not thumb_path.exists():
             try:
                 from PIL import Image as _PILImage
                 thumb_dir.mkdir(exist_ok=True)
                 with _PILImage.open(str(file_path)) as img:
+                    if img.mode not in ('RGB', 'L'):
+                        img = img.convert('RGB')
                     img.thumbnail((600, 600), _PILImage.LANCZOS)
                     img.save(str(thumb_path), "JPEG", quality=80, optimize=True)
             except Exception as e:
@@ -1720,6 +1857,188 @@ async def serve_input_file(
         return Response(content=file_bytes, media_type=media_type)
 
     return FileResponse(str(file_path))
+
+
+# ── Video preview endpoints ───────────────────────────────────
+# Uses OpenCV VideoCapture (same approach as GPU_video_extraction.py in V13):
+#   - video-info: instant cap props, no subprocess
+#   - preview-frame: seek + single decode + in-memory imencode, no temp file,
+#     optional CUDA decode, orders of magnitude faster than spawning ffmpeg per frame
+
+def _resolve_video_path(job_id: str) -> dict:
+    """Shared helper: look up job data from Firestore for video preview endpoints."""
+    try:
+        doc = firebase_client.get_processing_queue().document(job_id).get()
+        return doc.to_dict() if doc.exists else {}
+    except Exception:
+        return {}
+
+
+def _get_cv2_backend():
+    """Return (cv2, cuda_available) — lazy import so server still starts if cv2 is missing."""
+    try:
+        import cv2 as _cv2
+        cuda_ok = (
+            hasattr(_cv2, 'cuda') and
+            _cv2.cuda.getCudaEnabledDeviceCount() > 0
+        )
+        return _cv2, cuda_ok
+    except ImportError:
+        return None, False
+
+
+@app.get("/api/jobs/{job_id}/video-info")
+async def get_video_info_for_job(job_id: str):
+    """Return duration/fps/dimensions for a local_video job (no auth — localhost only).
+    Uses OpenCV VideoCapture to read container headers instantly — no subprocess."""
+    job_data = _resolve_video_path(job_id)
+
+    video_file = job_data.get('videoFile')
+    if not video_file:
+        raise HTTPException(status_code=404, detail="No video file for this job")
+
+    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
+    video_path = (input_dir / video_file).resolve()
+
+    if not str(video_path).startswith(str(input_dir.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    cv2, _cuda = _get_cv2_backend()
+    if cv2 is None:
+        raise HTTPException(status_code=500, detail="cv2 not available")
+
+    def _read_info() -> dict:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return {}
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            duration = n_frames / fps if fps > 0 else 0.0
+        finally:
+            cap.release()
+
+        # Some containers (e.g. .insv) report 0 frames via CAP_PROP_FRAME_COUNT —
+        # fall back to ffprobe for duration only in that case
+        if duration <= 0:
+            import subprocess as _sp, json as _json, shutil as _shutil
+            ffprobe = _shutil.which('ffprobe') or 'ffprobe'
+            _NO_WIN = {'creationflags': 0x08000000} if os.name == 'nt' else {}
+            try:
+                r = _sp.run(
+                    [ffprobe, '-v', 'quiet', '-print_format', 'json',
+                     '-show_format', str(video_path)],
+                    capture_output=True, text=True, timeout=10, **_NO_WIN,
+                )
+                fmt = _json.loads(r.stdout).get('format', {})
+                duration = float(fmt.get('duration', 0))
+                if fps > 0 and duration > 0:
+                    n_frames = int(duration * fps)
+            except Exception:
+                pass
+
+        if duration <= 0:
+            return {}
+        return {'duration': round(duration, 3), 'fps': round(fps, 3),
+                'width': w, 'height': h, 'frame_count': n_frames}
+
+    info = await asyncio.get_event_loop().run_in_executor(None, _read_info)
+    if not info:
+        raise HTTPException(status_code=500, detail="Cannot open video")
+    return info
+
+
+@app.get("/api/jobs/{job_id}/preview-frame")
+async def preview_frame(job_id: str, timestamp: float = 0.0):
+    """Extract a single JPEG from the job video at the given timestamp (no auth — localhost only).
+    Uses OpenCV seek + decode + in-memory imencode — no subprocess spawn, no temp file.
+    Falls back to ffmpeg subprocess if OpenCV cannot open the file (e.g. unsupported codec)."""
+    job_data = _resolve_video_path(job_id)
+
+    video_file = job_data.get('videoFile')
+    if not video_file:
+        raise HTTPException(status_code=404, detail="No video file for this job")
+
+    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
+    video_path = (input_dir / video_file).resolve()
+
+    if not str(video_path).startswith(str(input_dir.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    timestamp = max(0.0, timestamp)
+    cv2, cuda_ok = _get_cv2_backend()
+
+    def _extract_opencv() -> bytes | None:
+        if cv2 is None:
+            return None
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return None
+        try:
+            # Seek to timestamp via milliseconds (nearest keyframe for compressed video)
+            cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                return None
+            # Scale down to max 1920px wide while keeping aspect ratio
+            h, w = frame.shape[:2]
+            if w > 1920:
+                scale = 1920.0 / w
+                new_w, new_h = int(w * scale), int(h * scale)
+                interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+                if cuda_ok:
+                    try:
+                        gpu = cv2.cuda_GpuMat()
+                        gpu.upload(frame)
+                        gpu = cv2.cuda.resize(gpu, (new_w, new_h), interpolation=interp)
+                        frame = gpu.download()
+                    except Exception:
+                        frame = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+                else:
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return buf.tobytes() if ok else None
+        finally:
+            cap.release()
+
+    def _extract_ffmpeg_fallback() -> bytes | None:
+        import subprocess as _sp, tempfile as _tmp, shutil as _shutil
+        ffmpeg = _shutil.which('ffmpeg') or 'ffmpeg'
+        _NO_WIN = {'creationflags': 0x08000000} if os.name == 'nt' else {}
+        tmp = _tmp.NamedTemporaryFile(suffix='.jpg', delete=False)
+        tmp.close()
+        try:
+            _sp.run(
+                [ffmpeg, '-y', '-ss', f'{timestamp:.3f}', '-i', str(video_path),
+                 '-frames:v', '1', '-vf', 'scale=1920:-2', '-q:v', '3', tmp.name],
+                capture_output=True, timeout=20, **_NO_WIN,
+            )
+            with open(tmp.name, 'rb') as f:
+                data = f.read()
+            return data if data else None
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+    def _extract():
+        result = _extract_opencv()
+        if result:
+            return result
+        # OpenCV couldn't open or decode — fall back to ffmpeg subprocess
+        return _extract_ffmpeg_fallback()
+
+    frame_bytes = await asyncio.get_event_loop().run_in_executor(None, _extract)
+    if not frame_bytes:
+        raise HTTPException(status_code=500, detail="Frame extraction failed")
+    return Response(content=frame_bytes, media_type='image/jpeg')
 
 
 # ── Static Maps proxy ────────────────────────────────────────

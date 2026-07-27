@@ -87,15 +87,24 @@ _VISUALIZER = str(Path(__file__).parent.parent / "tools" / "visualize_cameras.py
 
 
 def _generate_viewer(brush_input_dir: Path, project_dir: Path, pitch_deg: float = 0.0) -> None:
-    """Run visualize_cameras.py on brush_input/ to produce cameras.html in the gluemap folder."""
+    """Run visualize_cameras.py on brush_input/ to produce cameras.html in the gluemap folder.
+
+    Passes brush_input_dir/"images" (populated by _copy_to_brush_input in
+    colmap_runner.py) as the visualizer's images_path so it embeds base64
+    thumbnails in the HTML — this call site was previously missing that arg,
+    producing a cameras.html with zero embedded images."""
     import sys
-    out_html = project_dir / "03_alignment" / "gluemap" / "cameras.html"
+    out_html  = project_dir / "03_alignment" / "gluemap" / "cameras.html"
+    image_dir = brush_input_dir / "images"
     if not Path(_VISUALIZER).exists():
         print("  [gluemap] visualize_cameras.py not found — skipping viewer", flush=True)
         return
     try:
+        args = [sys.executable, _VISUALIZER, str(brush_input_dir), str(out_html), str(pitch_deg), "0.0"]
+        if image_dir.exists():
+            args += ["pano_camera0", str(image_dir)]
         subprocess.run(
-            [sys.executable, _VISUALIZER, str(brush_input_dir), str(out_html), str(pitch_deg), "0.0"],
+            args,
             check=False,
             timeout=120,
         )

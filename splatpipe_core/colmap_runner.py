@@ -29,7 +29,6 @@ import queue
 import re
 import shutil
 import threading
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -552,21 +551,33 @@ def _measure_anchor_pitch(sparse_txt_dir: Path) -> float:
     return float(np.mean(pitches)) if pitches else 0.0
 
 
-def _generate_visualizer(colmap_dir: Path, pitch_deg: float, correction_deg: float = 0.0) -> None:
+def _generate_visualizer(
+    colmap_dir: Path, pitch_deg: float, correction_deg: float = 0.0,
+    image_dir: Optional[Path] = None, anchor_sensor: str = "pano_camera0",
+) -> None:
     """
     Run visualize_cameras.py under Python 3.14 to generate cameras.html,
     then open it automatically in the default browser.
+
+    image_dir, when given, is passed through to the visualizer's optional
+    6th CLI arg so it embeds each camera's thumbnail as base64 JPEG directly
+    in the HTML (self-contained — no separate image upload needed to view
+    it later). Previously only rigsfm_runner.py's call site did this; this
+    plain COLMAP-rig path silently produced a cameras.html with zero
+    embedded images. anchor_sensor defaults to "pano_camera0" — sensor 0 is
+    always the reference/anchor sensor in this pipeline's rig config
+    (see _compute_rig_params).
     """
     import webbrowser
     sparse_txt = colmap_dir / "sparse_txt"
     out_html   = colmap_dir / "cameras.html"
     if not Path(_VISUALIZER).exists() or not sparse_txt.exists():
         return
-    subprocess.run(
-        [_PYTHON_314, _VISUALIZER, str(sparse_txt), str(out_html),
-         str(pitch_deg), str(correction_deg)],
-        check=False,  # visualizer failure must not abort the pipeline
-    )
+    args = [_PYTHON_314, _VISUALIZER, str(sparse_txt), str(out_html),
+            str(pitch_deg), str(correction_deg)]
+    if image_dir is not None:
+        args += [anchor_sensor, str(image_dir)]
+    subprocess.run(args, check=False)  # visualizer failure must not abort the pipeline
     if out_html.exists():
         webbrowser.open(out_html.as_uri())
         print(f"  [colmap] Opened camera visualizer: {out_html}")
@@ -726,9 +737,6 @@ def _run_perspective_rig(
 
     worker_lines   = []
     current_pct    = 12
-    _last_report_t = 0.0   # time of last Firestore write
-    _last_report_p = -1    # pct at last write — always write on pct change
-    _FB_INTERVAL   = 3.0   # seconds between Firebase writes during log-spam phases
     while True:
         raw = process.stdout.readline()
         if not raw and process.poll() is not None:
@@ -747,14 +755,14 @@ def _run_perspective_rig(
             except (ValueError, IndexError):
                 msg = clean
             _forward_stderr(current_pct)
-            # Rate-limit Firestore writes: only push if pct changed or 3s elapsed.
-            # Prevents ~600 sequential writes during COLMAP matching (one per image)
-            # which caused a 2+ minute write backlog that made the app appear hung.
-            now = time.time()
-            if current_pct != _last_report_p or (now - _last_report_t) >= _FB_INTERVAL:
-                report(PipelineStage.COLMAP_ALIGNMENT, current_pct, msg)
-                _last_report_t = now
-                _last_report_p = current_pct
+            # report() (_make_reporter in pipeline.py) already dedupes Firebase
+            # pushes by (stage, pct) and local prints by (stage, pct, message)
+            # independently — call it unconditionally. A previous version added
+            # a 3s/pct-change gate here on top of that, which also silently
+            # dropped genuinely new messages (e.g. the vocab-tree pass
+            # announcement) arriving within 3s of the prior same-pct message,
+            # hiding them from the local log too, not just Firebase.
+            report(PipelineStage.COLMAP_ALIGNMENT, current_pct, msg)
             if cancel_event.is_set():
                 process.terminate()
                 return
@@ -1001,7 +1009,8 @@ def run_colmap_pipeline(
         pitch = settings.pitch_angles[0] if settings.pitch_angles else -10.0
         report(PipelineStage.COLMAP_ALIGNMENT, 99, "Generating camera visualizer…")
         # correction_deg=0.0 because the bias is already corrected in sparse_txt
-        _generate_visualizer(colmap_dir, float(pitch), correction_deg=0.0)
+        _generate_visualizer(colmap_dir, float(pitch), correction_deg=0.0,
+                              image_dir=colmap_dir / "images")
 
     report(PipelineStage.COLMAP_ALIGNMENT, 100,
            f"COLMAP alignment complete — {txt_count} text files in brush_input/")

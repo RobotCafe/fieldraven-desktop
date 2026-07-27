@@ -1,17 +1,38 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
+import markerIcon   from "leaflet/dist/images/marker-icon.png";
+import markerShadow from "leaflet/dist/images/marker-shadow.png";
+
+// Vite doesn't resolve Leaflet's default icon image paths the way its own
+// bundled CSS expects, so L.marker() renders with a broken/missing icon
+// unless the URLs are re-pointed at Vite-resolved asset imports. (L.circleMarker,
+// used elsewhere in this file, is an SVG circle and never hits this.)
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: markerIcon2x,
+  iconUrl:       markerIcon,
+  shadowUrl:     markerShadow,
+});
 
 function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const nowTime = now.toTimeString().slice(0, 5);
   const [name,     setName]     = useState(pending?.defaultName || '');
   const [location, setLocation] = useState('');
   const [notes,    setNotes]    = useState('');
   const [siteDate, setSiteDate] = useState(today);
+  const [siteTime, setSiteTime] = useState(nowTime);
+  const [pickedLat, setPickedLat] = useState(null);
+  const [pickedLon, setPickedLon] = useState(null);
+  const handlePick = useCallback((la, lo) => { setPickedLat(la); setPickedLon(lo); }, []);
   useEffect(() => { setName(pending?.defaultName || ''); }, [pending?.defaultName]);
   if (!pending) return null;
   const inp = { background: T.void, border: `1px solid ${T.border}`, borderRadius: 4,
-    color: T.text, padding: '5px 8px', fontSize: 12, width: '100%', boxSizing: 'border-box', outline: 'none' };
+    color: T.textPri, caretColor: T.textPri, colorScheme: 'dark',
+    padding: '5px 8px', fontSize: 12, width: '100%', boxSizing: 'border-box', outline: 'none' };
   return (
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.7)', zIndex:9999,
       display:'flex', alignItems:'center', justifyContent:'center' }}>
@@ -29,8 +50,11 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
           <input style={inp} value={location} onChange={e=>setLocation(e.target.value)} placeholder="e.g. Kings Peak, Strathcona Park" />
         </div>
         <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
-          <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Date Captured</label>
-          <input style={inp} type="date" value={siteDate} onChange={e=>setSiteDate(e.target.value)} />
+          <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Date / Time Captured</label>
+          <div style={{ display:'flex', gap:6 }}>
+            <input style={{ ...inp, flex:1.4 }} type="date" value={siteDate} onChange={e=>setSiteDate(e.target.value)} />
+            <input style={{ ...inp, flex:1 }} type="time" value={siteTime} onChange={e=>setSiteTime(e.target.value)} />
+          </div>
         </div>
         <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
           <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Notes</label>
@@ -39,13 +63,34 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
             placeholder="Conditions, route, camera settings…" />
         </div>
 
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
+            <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>
+              Location on Map (optional)
+            </label>
+            {pickedLat != null && (
+              <button onClick={()=>{ setPickedLat(null); setPickedLon(null); }}
+                style={{ background:'none', border:'none', color:T.textDim, fontSize:10,
+                  cursor:'pointer', textDecoration:'underline', padding:0 }}>
+                Clear
+              </button>
+            )}
+          </div>
+          <div style={{ fontSize:10, color:T.textDim }}>
+            {pickedLat != null
+              ? `${pickedLat.toFixed(5)}, ${pickedLon.toFixed(5)}`
+              : 'This camera has no GPS — click the map if you know roughly where this was shot.'}
+          </div>
+          <LocationPickerMap lat={pickedLat} lon={pickedLon} onPick={handlePick} />
+        </div>
+
         <div style={{ display:'flex', gap:8, justifyContent:'flex-end', marginTop:4 }}>
           <button onClick={onCancel}
             style={{ background:'none', border:`1px solid ${T.border}`, color:T.textDim,
               borderRadius:4, padding:'6px 14px', cursor:'pointer', fontSize:12 }}>
             Cancel
           </button>
-          <button onClick={()=>onConfirm({ name: name.trim() || pending.defaultName, location, notes, siteDate })}
+          <button onClick={()=>onConfirm({ name: name.trim() || pending.defaultName, location, notes, siteDate, siteTime, lat: pickedLat, lon: pickedLon })}
             disabled={!name.trim()}
             style={{ background:T.amber, border:'none', color:'#000', borderRadius:4,
               padding:'6px 14px', cursor:'pointer', fontSize:12, fontWeight:700,
@@ -56,6 +101,39 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
       </div>
     </div>
   );
+}
+
+function LocationPickerMap({ lat, lon, onPick }) {
+  const divRef    = useRef(null);
+  const mapRef    = useRef(null);
+  const markerRef = useRef(null);
+  useEffect(() => {
+    if (!divRef.current || mapRef.current) return;
+    const hasPoint = lat != null && lon != null;
+    // No default GPS to center on -- fall back to a wide regional view rather
+    // than (0,0), so the map is actually useful to click into on first open.
+    const map = L.map(divRef.current, {
+      center: hasPoint ? [lat, lon] : [49.6, -125.5],
+      zoom:   hasPoint ? 12 : 6,
+      zoomControl: true,
+    });
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "© OpenStreetMap contributors",
+    }).addTo(map);
+    if (hasPoint) {
+      markerRef.current = L.marker([lat, lon]).addTo(map);
+    }
+    map.on('click', (e) => {
+      const { lat: clat, lng: clon } = e.latlng;
+      if (markerRef.current) markerRef.current.setLatLng([clat, clon]);
+      else markerRef.current = L.marker([clat, clon]).addTo(map);
+      onPick(clat, clon);
+    });
+    mapRef.current = map;
+    return () => { map.remove(); mapRef.current = null; markerRef.current = null; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // init once — onPick is a stable useCallback, lat/lon only seed the initial view
+  return <div ref={divRef} style={{ width:'100%', height:160, borderRadius:6, cursor:'crosshair' }} />;
 }
 
 function MiniMap({ lat, lon }) {
@@ -304,7 +382,7 @@ const API_TO_UI = {
   brush_path:'brush', rs_settings_path:'rsSettings', vggt_path:'vggt', colmap_bin:'colmapBin',
   insp_stitch_type:'inspStitchType', insp_lens_guard:'inspLensGuard',
   insp_flowstate:'inspFlowState', insp_cuda:'inspCuda',
-  insp_workers:'inspWorkers',
+  insp_workers:'inspWorkers', insp_output_width:'inspOutputWidth',
 };
 
 function parseApiVal(v) {
@@ -728,6 +806,13 @@ function FieldRavenTab({ fieldJobs, loading, pqItems, machineInfo, cameraStatus,
 }
 
 // ─── Frame & View Extraction Tab ──────────────────────────────────────────────
+function fmtTs(secs) {
+  const s = Math.max(0, secs);
+  const m = Math.floor(s / 60);
+  const rem = (s - m * 60).toFixed(1);
+  return `${m}:${rem.padStart(4, '0')}`;
+}
+
 function ExtractionTab({ selected, settings, setSettings, cameraStatus, importedFiles, projectDirs, onImport,
   importStep, importPct, stitching, stitchStep, stitchPct, canvasH, setCanvasH }) {
   const [frames, setFrames]           = useState([]);
@@ -736,10 +821,15 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
   const [importError, setImportError] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
   const [canvasVersion, setCanvasVersion] = useState(0);
+  // Video preview state
+  const [videoInfo, setVideoInfo]     = useState(null);   // {duration, fps, width, height}
+  const [previewTs, setPreviewTs]     = useState(0);      // scrubber position (seconds)
+  const [debouncedTs, setDebouncedTs] = useState(0);      // debounced for URL (avoids ffmpeg spam)
   const canvasRef  = useRef();
   const imgCacheRef = useRef(new Map());
   const dragRef    = useRef({ active: false, startY: 0, startH: 0 });
   const leftColRef = useRef();
+  const tsDebounceRef = useRef();
 
   // Resize the canvas buffer to match its actual CSS size × DPR so it's
   // always crisp — no upscaling blur regardless of window size or HiDPI screen
@@ -785,6 +875,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
   const isFR     = selected?.type === 'fieldraven';
   const isFolder = selected?.type === 'folder' || isFR;
+  const isVideo  = selected?.type === 'video';
 
   // Files already on disk for this job — FieldRaven (camera) jobs AND local
   // image-folder jobs both browse a raw file gallery; only 'video' falls
@@ -799,7 +890,26 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
   const camCount     = cameraStatus?.file_count ?? 0;
 
   // Reset gallery when selection changes
-  useEffect(() => { setFrames([]); setCurrentFrame(0); setImportError(null); setSelectedFile(null); }, [selected?.id]);
+  useEffect(() => {
+    setFrames([]); setCurrentFrame(0); setImportError(null); setSelectedFile(null);
+    setVideoInfo(null); setPreviewTs(0); setDebouncedTs(0);
+  }, [selected?.id]);
+
+  // Fetch video metadata when a video job is selected
+  useEffect(() => {
+    if (!isVideo || !selected?.id) return;
+    fetch(`/api/jobs/${selected.id}/video-info`)
+      .then(r => r.ok ? r.json() : null)
+      .then(info => { if (info?.duration) setVideoInfo(info); })
+      .catch(() => {});
+  }, [isVideo, selected?.id]);
+
+  // Debounce the preview timestamp (300ms) so rapid scrubbing doesn't hammer ffmpeg
+  useEffect(() => {
+    clearTimeout(tsDebounceRef.current);
+    tsDebounceRef.current = setTimeout(() => setDebouncedTs(previewTs), 300);
+    return () => clearTimeout(tsDebounceRef.current);
+  }, [previewTs]);
 
   // Inline preview URL: selected gallery file takes priority, else first JPEG
   const firstJpgName = hasFiles
@@ -809,6 +919,12 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
   const currentPreviewUrl = (isFolder && currentFileName && selected?.id)
     ? `/api/jobs/${selected.id}/input/${encodeURIComponent(currentFileName)}?projectDir=${encodeURIComponent(projectDir || '')}`
     : null;
+
+  // Video: URL for the debounced preview frame (avoids ffmpeg spam during scrubbing)
+  const videoPreviewUrl = (isVideo && selected?.id && videoInfo)
+    ? `/api/jobs/${selected.id}/preview-frame?timestamp=${debouncedTs.toFixed(3)}`
+    : null;
+  const activePreviewUrl = isVideo ? videoPreviewUrl : currentPreviewUrl;
 
   // Pre-load gallery images into cache so canvas draws are instant on click
   useEffect(() => {
@@ -904,6 +1020,10 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         ctx.fillStyle = T.live; ctx.textAlign = "right";
         ctx.fillText(canvasFileLabel, W-8, 14);
       }
+      if (isVideo && videoInfo) {
+        ctx.fillStyle = T.vidColor; ctx.textAlign = "right"; ctx.font = "10px monospace";
+        ctx.fillText(`${fmtTs(previewTs)} / ${fmtTs(videoInfo.duration)}  ·  ${Math.round(videoInfo.fps||30)}fps`, W-8, 14);
+      }
     }
 
     const drawGradientBg = () => {
@@ -912,8 +1032,8 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
       ctx.fillStyle = sky; ctx.fillRect(0,0,W,H);
     };
 
-    if (currentPreviewUrl) {
-      const cached = imgCacheRef.current.get(currentPreviewUrl);
+    if (activePreviewUrl) {
+      const cached = imgCacheRef.current.get(activePreviewUrl);
       if (cached) {
         // Draw synchronously — zero flicker
         ctx.drawImage(cached, 0, 0, W, H);
@@ -929,7 +1049,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         const img = new Image();
         img.onload = () => {
           if (cancelled) return;
-          imgCacheRef.current.set(currentPreviewUrl, img);
+          imgCacheRef.current.set(activePreviewUrl, img);
           ctx.clearRect(0,0,W,H);
           ctx.drawImage(img, 0, 0, W, H);
           ctx.globalAlpha = 0.35; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1;
@@ -937,12 +1057,13 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         };
         const attemptLoad = () => {
           img.src = retryCount === 0
-            ? currentPreviewUrl
-            : currentPreviewUrl.replace(/&_r=\d+/, '') + `&_r=${retryCount}`;
+            ? activePreviewUrl
+            : activePreviewUrl.replace(/&_r=\d+/, '') + `&_r=${retryCount}`;
         };
         img.onerror = () => {
           if (cancelled) return;
-          if (retryCount < 6) {
+          // Video frames don't retry — ffmpeg failure is real, not transient
+          if (!isVideo && retryCount < 6) {
             retryCount++;
             retryTimer = setTimeout(attemptLoad, 1500 * retryCount);
           } else {
@@ -958,10 +1079,44 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
     drawGradientBg();
     drawOverlays();
-  }, [selected, settings, hasFiles, camConnected, camDrive, isFolder, currentPreviewUrl, canvasFileLabel, canvasVersion]);
+  }, [selected, settings, hasFiles, camConnected, camDrive, isFolder, isVideo,
+      activePreviewUrl, canvasFileLabel, canvasVersion, previewTs, videoInfo]);
+
+  // Navigate to a specific frame index (updates both frame index and scrubber for video)
+  const navFrame = (idx) => {
+    const clamped = Math.max(0, Math.min((frames.length||1) - 1, idx));
+    setCurrentFrame(clamped);
+    if (isVideo && frames.length > 0) {
+      const ts = frames[clamped];
+      setPreviewTs(ts);
+      setDebouncedTs(ts);
+    }
+  };
 
   const doExtract = () => {
     if (!selected) return;
+    if (isVideo && videoInfo?.duration) {
+      const dur = videoInfo.duration;
+      const fps = videoInfo.fps || 30;
+      let timestamps = [];
+      if (settings.extractionMethod === 'count') {
+        const count = Math.max(2, parseInt(settings.frameCount) || 30);
+        for (let i = 0; i < count; i++) {
+          timestamps.push(parseFloat(((i / (count - 1)) * dur).toFixed(3)));
+        }
+      } else {
+        const rawInterval = parseFloat(settings.intervalValue) || 1.0;
+        const interval = settings.intervalUnit === 'frames' ? rawInterval / fps : rawInterval;
+        const safeInterval = Math.max(1 / fps, interval);
+        for (let t = 0; t < dur; t += safeInterval) {
+          timestamps.push(parseFloat(t.toFixed(3)));
+        }
+      }
+      setFrames(timestamps);
+      setCurrentFrame(0);
+      if (timestamps.length > 0) { setPreviewTs(timestamps[0]); setDebouncedTs(timestamps[0]); }
+      return;
+    }
     const count = parseInt(settings.frameCount)||30;
     setFrames(Array.from({length:count},(_,i)=>i));
     setCurrentFrame(0);
@@ -1010,7 +1165,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
                 <img
                   src={`/api/jobs/${selected.id}/input/${encodeURIComponent(f.name)}?projectDir=${encodeURIComponent(projectDir || '')}&thumb=true`}
                   alt={f.name}
-                  style={{ width:'100%', height:'100%', objectFit:'cover' }}
+                  style={{ width:'100%', height:'100%', objectFit:'contain', background:T.void }}
                   loading="lazy"
                   onError={e => {
                     const el = e.currentTarget;
@@ -1024,6 +1179,42 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
                     }
                   }}
                 />
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    if (isVideo) {
+      if (frames.length === 0) return (
+        <div style={{ color:T.textDim, fontSize:11, textAlign:"center", padding:20 }}>
+          {videoInfo ? 'Click "Extract Frames" to populate frame list' : 'Loading video…'}
+        </div>
+      );
+      return (
+        <div style={{ display:"flex", flexWrap:"wrap", gap:3 }}>
+          {frames.map((ts, i) => {
+            const isActive = i === currentFrame;
+            const thumbUrl = selected?.id
+              ? `/api/jobs/${selected.id}/preview-frame?timestamp=${ts.toFixed(3)}`
+              : null;
+            return (
+              <div key={i} onClick={() => navFrame(i)}
+                style={{ width:72, height:40, borderRadius:2, background:T.surfaceEl,
+                  border:`2px solid ${isActive ? T.vidColor : T.border}`,
+                  overflow:'hidden', position:'relative', flexShrink:0,
+                  cursor:"pointer", boxSizing:'border-box', transition:'border-color .1s' }}>
+                {thumbUrl && (
+                  <img src={thumbUrl} alt={`frame ${i+1}`}
+                    style={{ width:'100%', height:'100%', objectFit:'cover', display:'block' }}
+                    loading="lazy"
+                  />
+                )}
+                <div style={{ position:'absolute', bottom:1, left:2, fontSize:8,
+                  color: isActive ? T.vidColor : T.textDim, fontFamily:'monospace',
+                  textShadow:'0 0 3px #000' }}>
+                  {fmtTs(ts)}
+                </div>
               </div>
             );
           })}
@@ -1112,6 +1303,18 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
               </span>
             </div>
           )}
+
+          {/* Video: loading spinner before first frame arrives */}
+          {selected && isVideo && !videoInfo && (
+            <div style={{ position:"absolute", inset:0, display:"flex",
+              flexDirection:"column", alignItems:"center", justifyContent:"center",
+              pointerEvents:"none", gap:10 }}>
+              <div style={{ width:28, height:28, borderRadius:"50%",
+                border:`2px solid ${T.vidColor}33`, borderTopColor:T.vidColor,
+                animation:"frSpin 0.9s linear infinite" }} />
+              <span style={{ fontSize:11, color:T.vidColor }}>Loading video info…</span>
+            </div>
+          )}
         </div>
 
         {/* Drag splitter */}
@@ -1163,8 +1366,8 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
         <div style={{ background:T.surface, border:`1px solid ${T.border}`, borderRadius:4,
           padding:"6px 10px", fontSize:11, color:T.textSec, flexShrink:0,
           display:"flex", alignItems:"center", gap:8 }}>
-          <span style={{ color:T.amber }}>
-            {isFolder ? '360 Source Files' : '360 Extracted View Preview'}
+          <span style={{ color: isVideo ? T.vidColor : T.amber }}>
+            {isFolder ? '360 Source Files' : isVideo ? '360 Video Preview' : '360 Extracted View Preview'}
           </span>
           {hasFiles && (() => {
             const jpgCount = (jobFiles?.files||[]).filter(f=>f.ext==='.jpg'||f.ext==='.jpeg').length;
@@ -1173,7 +1376,12 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
               {jpgCount > 0 ? `${jpgCount} files ready` : `${inspCount} .insp (not converted)`}
             </span>;
           })()}
-          {!isFolder && frames.length > 0 && (
+          {isVideo && videoInfo && (
+            <span style={{ color:T.textDim, fontFamily:"monospace" }}>
+              {fmtTs(previewTs)} / {fmtTs(videoInfo.duration)}
+            </span>
+          )}
+          {!isFolder && !isVideo && frames.length > 0 && (
             <span style={{ color:T.textDim, fontFamily:"monospace" }}>
               frame {String(currentFrame+1).padStart(3,"0")}/{frames.length}
             </span>
@@ -1191,8 +1399,13 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
       {/* Right panel */}
       <div style={{ overflowY:"auto", display:"flex", flexDirection:"column", gap:0 }}>
 
-        {/* Insta360 stitch settings — only for FieldRaven jobs */}
-        {isFR && <Accordion title="Insta360 Stitch" accent={T.info} defaultOpen={true}>
+        {/* Insta360 stitch settings — applies to any job with .insp files to
+            convert, not just FieldRaven jobs. _stitch_insp_files() (backend)
+            runs identically for both job types against the same global
+            splat_config settings; this panel was only gated to FieldRaven
+            jobs, hiding it (and the ability to change it) for From Camera /
+            image-folder imports even though it was still being applied. */}
+        {isFolder && <Accordion title="Insta360 Stitch" accent={T.info} defaultOpen={true}>
           <FieldRow label="Stitch Type">
             <select value={settings.inspStitchType}
               onChange={e=>setSettings(s=>({...s,inspStitchType:e.target.value}))}
@@ -1372,9 +1585,50 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
         {!isFolder && (
           <Accordion title="Frame Navigator" defaultOpen={true}>
-            {frames.length===0
-              ? <div style={{ fontSize:11, color:T.textDim }}>Extract frames to enable</div>
-              : <>
+            {isVideo ? (
+              <>
+                {videoInfo ? (
+                  <>
+                    <div style={{ fontSize:10, color:T.textDim, marginBottom:5, textTransform:"uppercase",
+                      letterSpacing:.5 }}>Preview position</div>
+                    <input type="range" min={0} max={videoInfo.duration} step={0.1} value={previewTs}
+                      onChange={e => setPreviewTs(+e.target.value)}
+                      style={{ width:"100%", accentColor:T.vidColor }} />
+                    <div style={{ display:"flex", justifyContent:"space-between", fontSize:10,
+                      color:T.textDim, fontFamily:"monospace", marginTop:3 }}>
+                      <span>{fmtTs(previewTs)}</span>
+                      <span>{fmtTs(videoInfo.duration)} · {Math.round(videoInfo.fps||30)} fps</span>
+                    </div>
+                    {frames.length > 0 && <>
+                      <div style={{ borderTop:`1px solid ${T.border}`, margin:"8px 0" }} />
+                      <div style={{ fontSize:10, color:T.textDim, marginBottom:4,
+                        textTransform:"uppercase", letterSpacing:.5 }}>
+                        Extracted frames ({frames.length})
+                      </div>
+                      <div style={{ display:"flex", gap:3, justifyContent:"center", marginBottom:8 }}>
+                        {[["⏮",()=>navFrame(0)],["◀",()=>navFrame(currentFrame-1)],
+                          ["▶",()=>navFrame(currentFrame+1)],["⏭",()=>navFrame(frames.length-1)]]
+                          .map(([icon,fn],i)=>(
+                          <Btn key={i} small variant="ghost" onClick={fn}>{icon}</Btn>
+                        ))}
+                      </div>
+                      <input type="range" min={0} max={frames.length-1} value={currentFrame}
+                        onChange={e => navFrame(+e.target.value)}
+                        style={{ width:"100%", accentColor:T.amber }} />
+                      <div style={{ textAlign:"center", fontSize:10, color:T.textDim, marginTop:3,
+                        fontFamily:"monospace" }}>
+                        {currentFrame+1} / {frames.length} · {fmtTs(frames[currentFrame] ?? 0)}
+                      </div>
+                    </>}
+                  </>
+                ) : (
+                  <div style={{ fontSize:11, color:T.textDim }}>Loading video…</div>
+                )}
+              </>
+            ) : frames.length===0 ? (
+              <div style={{ fontSize:11, color:T.textDim }}>Extract frames to enable</div>
+            ) : (
+              <>
                 <div style={{ display:"flex", gap:3, justifyContent:"center", marginBottom:8 }}>
                   {[["⏮",()=>setCurrentFrame(0)],["◀",()=>setCurrentFrame(f=>Math.max(0,f-1))],
                     ["▶",()=>setCurrentFrame(f=>Math.min(frames.length-1,f+1))],
@@ -1389,7 +1643,8 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
                   fontFamily:"monospace" }}>
                   {currentFrame+1} / {frames.length}
                 </div>
-              </>}
+              </>
+            )}
           </Accordion>
         )}
 
@@ -1462,8 +1717,12 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
               </span>
             </div>
           ) : (
-            <Btn onClick={doExtract} disabled={!selected} full variant="primary">
-              Extract Frames
+            <Btn onClick={doExtract}
+              disabled={!selected || (isVideo && !videoInfo)}
+              full variant="primary">
+              {isVideo
+                ? (frames.length > 0 ? `Re-extract (${frames.length} frames)` : 'Calculate Frame List')
+                : 'Extract Frames'}
             </Btn>
           )}
         </div>
@@ -2598,8 +2857,10 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       // this poll fired and aren't yet in the server response.
       setPqItems(prev => {
         const freshIds = new Set(fresh.map(j => j.docId || j.id));
+        // Preserve locally-added items (any known type) not yet confirmed by the server poll,
+        // so the item stays visible during the ~8s window between queue and first poll.
         const pinned = prev.filter(
-          j => (j.jobType === 'local_folder' || j.jobType === 'local_video') &&
+          j => (j.jobType === 'local_folder' || j.jobType === 'local_video' || j.jobType === 'fieldraven') &&
                !freshIds.has(j.docId || j.id)
         );
         return [...fresh, ...pinned];
@@ -3013,10 +3274,13 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     setCameraImportPending({ filePaths: filesRes.paths, projectDir: dirRes.path, defaultName });
   }, [api, lastBrowseDir, cameraStatus]);
 
+  const [cameraImportBusy, setCameraImportBusy] = useState(false);
+
   const onConfirmCameraImport = useCallback(async (meta) => {
     if (!cameraImportPending) return;
     const { filePaths, projectDir } = cameraImportPending;
     setCameraImportPending(null);
+    setCameraImportBusy(true);
 
     addLog(`Copying ${filePaths.length} files into project…`);
     let created;
@@ -3027,8 +3291,16 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         location: meta.location,
         notes:    meta.notes,
         siteDate: meta.siteDate,
+        siteTime: meta.siteTime,
+        lat:      meta.lat,
+        lon:      meta.lon,
       });
-    } catch (e) { addLog(`Failed: ${e.message}`); return; }
+    } catch (e) {
+      addLog(`Failed: ${e.message}`);
+      setCameraImportBusy(false);
+      return;
+    }
+    setCameraImportBusy(false);
 
     addLog(`Copied ${created.imported} files (${created.skipped} skipped${created.errors ? `, ${created.errors} errors` : ''})`);
 
@@ -3042,15 +3314,30 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     setImportedFiles(prev => ({ ...prev, [jobId]: files }));
     api('/api/project/config', 'POST', { dir: projectDir, jobId }).catch(() => {});
     loadQueue();
+
+    // Trigger immediate .insp → equirectangular conversion in background, same as
+    // the Firestore-matched camera-import flow (onImportFromCamera) already does —
+    // this flow was missing it, leaving files sitting imported-but-unconverted.
+    const inspFiles = (files.files || []).filter(f => f.ext === '.insp');
+    if (inspFiles.length > 0) {
+      addLog(`Starting conversion of ${inspFiles.length} .insp files…`);
+      setStitchingJobId(jobId);
+      setStitchingProjectDir(projectDir);
+      api(`/api/jobs/${jobId}/stitch`, 'POST')
+        .then(r => addLog(r.message))
+        .catch(e => { addLog(`Conversion note: ${e.message}`); setStitchingJobId(null); setStitchingProjectDir(null); });
+    }
   }, [api, cameraImportPending, loadQueue, setImportedFiles]);
 
   const onQueueJob = useCallback(async (job) => {
     try {
       const result = await api('/api/jobs/queue-for-processing', 'POST', { userJobId: job.id });
       addLog(`Queued: ${result.name}`);
-      const frEntry = { docId: job.id, id: job.id, jobType: job.jobType || 'simple', name: job.clientName || job.name || 'Field Job', status: 'queued', userJobId: job.id };
-      setPqItems(prev => prev.some(j => (j.docId||j.id) === job.id) ? prev : [frEntry, ...prev]);
-      setSelected({ id: job.id, type: 'fieldraven', name: job.clientName || job.name || 'Field Job', status: 'queued' });
+      const pqId = result.processingJobId;
+      const jobName = result.name || job.clientName || job.name || 'Field Job';
+      const frEntry = { docId: pqId, id: pqId, jobType: 'fieldraven', name: jobName, status: 'queued', userJobId: job.id };
+      setPqItems(prev => prev.some(j => (j.docId||j.id) === pqId) ? prev : [frEntry, ...prev]);
+      setSelected({ id: pqId, type: 'fieldraven', name: jobName, status: 'queued' });
       setActiveMainTab(1);
       loadQueue();
     } catch (e) {
@@ -3406,6 +3693,17 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         onConfirm={onConfirmCameraImport}
         onCancel={() => { setCameraImportPending(null); addLog('Cancelled.'); }}
       />
+      {cameraImportBusy && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:9999,
+          display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <div style={{ background:T.surface, border:`1px solid ${T.borderHi}`, borderRadius:8,
+            padding:'24px 32px', display:'flex', flexDirection:'column', alignItems:'center', gap:12 }}>
+            <div style={{ fontSize:22, animation:'frSpin 0.9s linear infinite', display:'inline-block' }}>⟳</div>
+            <div style={{ fontSize:12, color:T.textPri, fontWeight:600 }}>Copying files from camera…</div>
+            <div style={{ fontSize:11, color:T.textDim }}>This may take a minute for large files.</div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

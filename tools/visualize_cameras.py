@@ -407,7 +407,7 @@ input[type=range]    {{ flex: 1; accent-color: #6e82ff; cursor: pointer; height:
     <div class="gallery-grid" id="gallery-grid"></div>
     <div class="sep" id="target-sep" style="display:none;margin-top:8px"></div>
     <div id="target-section" style="display:none">
-      <div class="gallery-header" style="margin-bottom:5px">Nodal spread</div>
+      <div class="gallery-header" style="margin-bottom:5px" title="Rings are scaled against a fixed 1e-3 scene-unit floor, not the noise itself — dots near the crosshair mean spread is at or below sub-mm rounding noise (rig locked), regardless of how small the true value is.">Nodal spread</div>
       <canvas id="target-canvas" width="260" height="200"></canvas>
       <div id="target-legend"></div>
     </div>
@@ -433,6 +433,11 @@ const KNOWN_PITCH_DEG = {pitch_deg:.1f}; // rig pitch from pipeline settings
 const CORRECTION_DEG  = {correction_deg:.1f}; // post-hoc gravity correction applied to sparse_txt
 const SPREAD          = {spread_json};
 const SPREAD_SCALE    = Object.values(SPREAD).reduce((m, f) => Math.max(m, f.max), 1e-9);
+// Absolute reference floor (same constant the bar chart uses below): 1e-3 scene
+// units ≈ sub-mm. Below this, deviation is COLMAP text-format rounding noise,
+// not real rig drift. Charts scale against this floor, not their own noise
+// ceiling, so noise collapses toward zero instead of always filling the plot.
+const SPREAD_NOISE_FLOOR = 1e-3;
 const ANCHOR_SENSOR   = '{anchor_sensor}';
 const QUAD_POSES      = {quad_poses_json};
 
@@ -768,9 +773,12 @@ function _drawTarget(frameKey) {{
     return {{ sensor: c.sensor, u: ox*lr.x+oy*lr.y+oz*lr.z, v: ox*lf.x+oy*lf.y+oz*lf.z }};
   }});
 
-  // Scale: fit to SPREAD_SCALE with a little padding so the outermost ring = max known spread
+  // Scale against the absolute noise floor, not SPREAD_SCALE itself — otherwise
+  // a dataset with only nanometer-scale rounding noise (rig genuinely locked)
+  // gets that noise stretched to fill the whole disc. Real spread above the
+  // floor still grows the scale normally; noise below it collapses to center.
   const pad  = 26;
-  const maxR = Math.max(SPREAD_SCALE * 1.3, 1e-12);
+  const maxR = Math.max(SPREAD_SCALE * 1.3, SPREAD_NOISE_FLOOR);
   const R0   = Math.min(W * 0.82, H) / 2 - pad;
   const scl  = R0 / maxR;
   const cx   = W * 0.42, cy = H / 2;  // shift left to leave room for labels
@@ -1202,9 +1210,9 @@ window.addEventListener('keydown', e => {{
   const barW = W / stations.length;
 
   // Use an absolute reference scale for the y-axis so the chart reflects
-  // true deviation magnitude, not just relative differences.
-  // Reference: 1e-3 scene units ≈ sub-mm; values below this are rig noise.
-  const absRef = Math.max(maxVal * 1.2, 1e-3);
+  // true deviation magnitude, not just relative differences (see
+  // SPREAD_NOISE_FLOOR definition above for why).
+  const absRef = Math.max(maxVal * 1.2, SPREAD_NOISE_FLOOR);
 
   function draw(hoverIdx) {{
     ctx.clearRect(0, 0, W, H);

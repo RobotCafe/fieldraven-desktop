@@ -804,21 +804,41 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     except Exception as _loc_exc:
                         print(f"  [location] Non-fatal: {_loc_exc}")
 
-                    # Auto-fetch Garmin activity using exact session times.
-                    # Requires mobile job start/end — no date-only guessing.
+                    # Upload the standalone cameras.html point-cloud/camera
+                    # visualizer, if the alignment stage generated one, as a
+                    # second, separately-openable viewer alongside the splat.
                     try:
-                        from splatpipe_core import garmin_fetcher
-                        _session_start, _session_end = _get_session_times(job_id, job_data, _db)
-                        if _session_start and _session_end:
+                        _upload_and_link_cameras_html(proj_root, job_id, _db)
+                    except Exception as _viz_exc:
+                        print(f"  [cameras] Non-fatal: {_viz_exc}")
+
+                    # Auto-fetch Garmin/Coros activity using exact session times.
+                    # Requires session start/end — mobile job doc, or (for the
+                    # From Camera flow) EXIF-derived times, see _derive_session_times
+                    # in server.py. Both fetchers are independent and non-fatal;
+                    # run both since a user may have activity history in either.
+                    _session_start, _session_end = _get_session_times(job_id, job_data, _db)
+                    if _session_start and _session_end:
+                        try:
+                            from splatpipe_core import garmin_fetcher
                             garmin_fetcher.fetch_and_store(
                                 job_id, _session_start.astimezone().date(), _db,
                                 session_start=_session_start,
                                 session_end=_session_end,
                             )
-                        else:
-                            print("  [garmin] Skipping — no session times (not a mobile job or times not saved)")
-                    except Exception as _g_exc:
-                        print(f"  [garmin] Non-fatal: {_g_exc}")
+                        except Exception as _g_exc:
+                            print(f"  [garmin] Non-fatal: {_g_exc}")
+                        try:
+                            from splatpipe_core import coros_fetcher
+                            coros_fetcher.fetch_and_store(
+                                job_id, _session_start.astimezone().date(), _db,
+                                session_start=_session_start,
+                                session_end=_session_end,
+                            )
+                        except Exception as _c_exc:
+                            print(f"  [coros] Non-fatal: {_c_exc}")
+                    else:
+                        print("  [garmin/coros] Skipping — no session times available")
                 elif ply_file and not r2_client.is_configured():
                     print("  [r2] Skipping upload — r2_config.json not configured")
             except Exception as exc:
@@ -1114,7 +1134,10 @@ def _get_session_times(job_id: str, job_data: dict, db):
         fj_path = _job_root(job_id, job_data) / "fieldraven.json"
         if fj_path.exists():
             fj = _json.loads(fj_path.read_text(encoding="utf-8"))
-            st = fj.get("session_times", {})
+            # _write_stage_progress() nests everything under "stages" — read from
+            # there, not the top level, to actually match what gets written.
+            st = (fj.get("stages", {}).get("session_times")
+                  or fj.get("session_times") or {})
             s_ms, e_ms = st.get("startMs"), st.get("endMs")
             if s_ms and e_ms:
                 start, end = _ms_to_utc(s_ms), _ms_to_utc(e_ms)
@@ -1140,19 +1163,81 @@ def _get_session_times(job_id: str, job_data: dict, db):
     return start, end
 
 
+def _upload_and_link_cameras_html(proj_root: Path, job_id: str, db) -> None:
+    """
+    Find an already-generated cameras.html (tools/visualize_cameras.py output
+    — point cloud, rig sensor gallery, nodal spread chart, base64-embedded
+    thumbnails — written by whichever alignment stage ran, when
+    colmap_visualize/equivalent is enabled) and upload it to R2 as its own
+    standalone artifact, storing the URL on gallery/{job_id} as
+    pointCloudViewerUrl.
+
+    Deliberately kept as a second, separately-openable viewer rather than
+    merged into the splat viewer's own lightweight cameras.json-driven
+    frustum overlay (_build_and_upload_cameras_json) — the two serve
+    different purposes (rich standalone point-cloud inspection vs. a quick
+    in-scene frustum toggle) and can be opened side by side in separate tabs.
+    """
+    from . import r2_client
+    if not r2_client.is_configured():
+        return
+
+    candidates = []
+    for subdir in ("03_alignment/colmap", "03_alignment/gluemap",
+                   "03_alignment/equisfm", "03_alignment/rigsfm"):
+        p = proj_root / subdir / "cameras.html"
+        if p.exists():
+            candidates.append(p)
+    if not candidates:
+        candidates = list(proj_root.rglob("cameras.html"))
+    if not candidates:
+        print("  [cameras] No cameras.html found — skipping point-cloud viewer upload")
+        return
+
+    try:
+        url = r2_client.upload_cameras_html(candidates[0], job_id)
+        db.collection("gallery").document(job_id).update({"pointCloudViewerUrl": url})
+        print(f"  [cameras] Point-cloud viewer linked: {url}")
+    except Exception as e:
+        print(f"  [cameras] cameras.html upload/link failed (non-fatal): {e}")
+
+
 def _write_capture_location(job_id: str, job_data: dict, db) -> None:
     """
-    Read gpsStart from the mobile job doc and write captureLocation to the
-    gallery/{job_id} document so the web map can show a pin.
+    Write captureLocation to gallery/{job_id} so the web map can show a pin.
+
+    Priority:
+      1. Mobile job doc gpsStart/gpsEnd (phone GPS during a FieldRaven field job).
+      2. Manually-picked location saved to fieldraven.json at import time (the
+         "From Camera" flow's map picker) -- used when the camera itself has no
+         GPS. Confirmed empirically: Insta360 .insp/.insv files never carry a
+         real GPS fix (GPS EXIF is always zeroed), so this is the only location
+         signal for camera-only imports with no linked mobile job.
+      3. Neither: leave captureLocation unset. garmin_fetcher.fetch_and_store()
+         has its own later fallback using the matched activity's first route
+         point, so this isn't the last chance to get a pin.
     """
+    lat = lon = None
+
     doc = _get_mobile_job_doc(job_id, job_data, db)
-    if not doc:
-        return
-    gps = doc.get("gpsStart") or doc.get("gpsEnd")
-    if not gps:
-        return
-    lat = gps.get("lat")
-    lon = gps.get("lon") or gps.get("lng")
+    if doc:
+        gps = doc.get("gpsStart") or doc.get("gpsEnd")
+        if gps:
+            lat = gps.get("lat")
+            lon = gps.get("lon") or gps.get("lng")
+
+    if lat is None or lon is None:
+        try:
+            fj_path = _job_root(job_id, job_data) / "fieldraven.json"
+            if fj_path.exists():
+                fj = json.loads(fj_path.read_text(encoding="utf-8"))
+                manual = fj.get("stages", {}).get("manual_location") or {}
+                if manual.get("lat") is not None and manual.get("lon") is not None:
+                    lat, lon = manual["lat"], manual["lon"]
+                    print(f"  [location] Using manually-picked location for {job_id}")
+        except Exception:
+            pass
+
     if lat is None or lon is None:
         return
     db.collection("gallery").document(job_id).update({

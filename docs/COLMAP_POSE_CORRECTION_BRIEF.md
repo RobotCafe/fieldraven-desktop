@@ -581,3 +581,94 @@ User reported visible doubling of wall surfaces in trained Gaussian splats and d
 2. Full Brush training run (30,000 steps, `nile_creek_focal_fix_run`, the same re-extracted images and reconstruction measured above): user confirmed the result is "about as good as it can get" — no doubling, clean single wall/rock surfaces throughout, matching the quality the original screenshot showed missing.
 
 This closes the investigation that started with the reported double-vision screenshot. The full chain of causes, in the order they were actually found and fixed across Problems 10-15: sensor-within-rig orientation (matrix order, then sign convention) → same-rig-frame zero-baseline contamination → a broken custom densification script (retired) → per-frame pose flattening (replaced with single global leveling) → and finally the focal-length/frustum-shape mismatch, which turned out to be the dominant remaining source of the visible doubling. Each fix was verified independently via reprojection error before being layered on the next, which is why the final fix's improvement (1.320px → 0.893px mean, 32% lower, plus ~3.3x more surviving matched observations) could be attributed cleanly to the focal-length correction alone, not a mix of overlapping changes.
+
+---
+
+## Post-Problem-15 Changes (not yet reflected above)
+
+This brief was last committed 2026-06-30 (`bf50f43`), ending at Problem 15. Everything below landed after that and is not covered by the narrative above:
+
+- **GPS geo-registration** (`6f92032`) — optional `model_aligner --ref_is_gps 1 --alignment_type ecef` pass, fits the reconstruction to real-world coordinates from `.gps.json` sidecars.
+- **`model_orientation_aligner` option** (`bf8e78e`) — optional second, COLMAP-native leveling refinement (`--method IMAGE_ORIENTATION`) that stacks after the rig-reference correction.
+- **pycolmap 4.x API churn** (`eb939f9`, `516b63d`) — `Camera.create()` → `create_from_model_id()` → `model_id=` renamed to `model=`. Worker now tries three call signatures.
+- **GLOMAP global mapper + vocab-tree loop closure** (`e9174b4`) — `colmap_mapper: "global"` as a no-rig-constraint alternative to incremental mapping; vocab-tree second matching pass for loop closure on self-crossing walks.
+- **Firebase write rate-limiting, round 2** (`b11a511`) — same class of fix as Problem 5, recurred and was re-fixed with a 3-second/pct-change gate.
+- **`cameras.html` auto-opens** (`576ccf5`).
+- **Leveling target generalized** (`7abe87a`) — no longer assumes sensor-0 is literally the 0° anchor; targets whatever DIAG pitch it should have given `horizon_ref`/`pitch_angles[0]`.
+- **Vocab-tree stall fix** (uncommitted, this session) — `num_images_after_verification` now scales 5/10/20 by image count instead of a hardcoded 50 that produced ~8,775 candidate pairs and multi-hour runs on 351-image jobs; the pass is now non-fatal.
+- **Undocumented until now: split-reconstruction auto-retry** — if mapping produces >1 disconnected fragment and total images ≤400, the worker clears matches and retries once with exhaustive matching before falling back to the largest fragment.
+
+---
+
+## Appendix: End-to-End Pipeline Architecture & Bottleneck Map
+
+Scope: everything inside `run_colmap_pipeline()` (rig mode — the path actually used; spherical mode is a rarely-used fail-fast alternative gated on an unavailable camera model on Windows wheels). Input is `02_views/` (perspective crops already rendered from the source equirectangular panoramas); output is `04_training/brush_input/`.
+
+### Call graph
+
+```mermaid
+flowchart TD
+    A["run_colmap_pipeline()<br/>colmap_runner.py — Python 3.13"] --> C["_run_perspective_rig()"]
+    C --> C1["_reorganize_views()<br/>02_views/ → per-sensor dirs"]
+    C1 --> C2["_compute_rig_params()<br/>pure numpy — cam_from_rig matrices"]
+    C2 --> C3["spawn colmap_worker.py<br/>subprocess, Python 3.14 / pycolmap 4.0.4"]
+
+    subgraph W["colmap_worker.py"]
+      direction TB
+      W1["1. feature_extractor CLI<br/>SIFT, max_num_features=16384"] --> W2["2/3. apply_rig_config()<br/>pycolmap, in-process"]
+      W2 --> W3["4. sequential_matcher CLI<br/>overlap=20, quadratic_overlap=1"]
+      W3 --> W4{"vocab_tree_path set?"}
+      W4 -- yes --> W5["4b. vocab_tree_matcher CLI<br/>k = 5/10/20 by image count"]
+      W4 -- no --> W6["4c. _purge_same_frame_pairs()<br/>SQL delete, zero-baseline sibling pairs"]
+      W5 --> W6
+      W6 --> W7["5. incremental_mapping / global_mapping<br/>pycolmap — CPU-only Ceres BA"]
+      W7 --> W8{">1 fragment AND N≤400?"}
+      W8 -- yes --> W9["clear matches → exhaustive_matcher retry<br/>→ re-purge → re-map"]
+      W9 --> W10["6. write sparse_txt"]
+      W8 -- no --> W10
+    end
+
+    C3 --> D["_apply_global_level_correction()<br/>pure numpy — one rigid rotation"]
+    D --> E{"colmap_orientation_align?"}
+    E -- yes --> E1["model_orientation_aligner CLI"]
+    E -- no --> F["_copy_to_brush_input()"]
+    E1 --> F
+    F --> G{"gps_priors_colmap?"}
+    G -- yes --> G1["model_aligner CLI — ECEF georegistration"]
+    G -- no --> H{"colmap_visualize?"}
+    G1 --> H
+    H -- yes --> H1["visualize_cameras.py subprocess<br/>→ cameras.html, auto-opened"]
+    H -- no --> I["done — brush_input/ ready"]
+    H1 --> I
+```
+
+### Stage-by-stage: what's called, what it costs
+
+| # | Stage | Called | Cost driver | Runs on |
+|---|-------|--------|-------------|---------|
+| 1 | Feature extraction | `feature_extractor` CLI (or pycolmap fallback if no `colmap_bin`) | Linear in image count × `max_num_features` (16384, 2× COLMAP default) | GPU (CLI) / CPU (fallback) |
+| 2–3 | Rig config build + apply | `apply_rig_config()`, in-process pycolmap | O(sensors), negligible | CPU |
+| 4 | Sequential matching | `sequential_matcher` CLI, `overlap=20`, `quadratic_overlap=1` | ~O(N × overlap) candidate pairs; each pair's cost scales with feature-set overlap | GPU |
+| 4b | Vocab-tree loop closure | `vocab_tree_matcher` CLI, optional | O(N × k) candidate pairs — **was the single biggest bottleneck until today's fix** (k=50 static → ~8,775 pairs on N=351, hours) | GPU |
+| 4c | Same-frame purge | `_purge_same_frame_pairs()`, raw SQL | O(verified pairs), cheap | CPU |
+| 5 | Mapping | `pycolmap.incremental_mapping()` or `global_mapping()` (GLOMAP) | BA is **CPU-only Ceres** — grows worse than linearly with image count; incremental mapping also does repeated re-registration + local/global BA rounds | CPU |
+| 5b | Split-retry | clear matches → `exhaustive_matcher` CLI → re-map | Doubles stages 4–5's cost entirely, only for N≤400 fragments | GPU + CPU |
+| — | Leveling | `_apply_global_level_correction()`, pure numpy | O(frames + points), single pass | CPU |
+| — | Orientation align (opt.) | `model_orientation_aligner` CLI | Single pass on finished model, cheap | CPU |
+| — | GPS geo-reg (opt.) | `model_aligner` CLI | Single pass, cheap | CPU |
+| — | Visualizer (opt.) | `visualize_cameras.py` subprocess | O(images), reads reconstruction once | CPU |
+
+### Bottlenecks found and already fixed (chronological)
+
+1. **Firebase write backpressure** (Problem 5, recurred in `b11a511`) — looked like a matcher stall; was actually the progress-reporting pipe blocking on synchronous Firestore writes. Fixed both times with a pct-change/time-interval gate.
+2. **Same-rig-frame zero-baseline contamination** (Problem 12) — wasted matching + triangulation effort on 252+ un-triangulable pairs per run, degrading both raw point density and the (since-retired) densification pass. Fixed with a post-match purge.
+3. **Custom densification script** (Problem 13) — a second, never-fully-diagnosed bug in `retriangulate_points.py` on top of the Problem 12 fix. Retired entirely in favor of just extracting more SIFT features natively.
+4. **Vocab-tree loop closure runaway** (today) — hardcoded `k=50` produced ~8,775 candidate pairs on a 351-image job, some pairs taking 200+ seconds, ballooning to 6–10+ hours. Fixed by scaling `k` down as image count grows (351 images → k=5 → ~877 pairs).
+
+### Candidate bottlenecks — not yet addressed
+
+1. **Bundle adjustment is CPU-only Ceres.** The installed `colmap.exe` (4.1.0.dev0, CUDA build) supports `bundle_adjuster --BundleAdjustmentCeres.use_gpu 1` *and* rig-constraint flags (`--BundleAdjustment.refine_sensor_from_rig 0`, `--BundleAdjustment.refine_rig_from_world 1`) simultaneously — GPU BA with rig rigidity is possible today without a Caspar build (Caspar explicitly can't do rig BA anyway). The catch, already identified in Problem 9: `pycolmap.incremental_mapping()` runs its BA internally with no hook to swap in GPU Ceres — using it inside the main loop means hand-rolling the incremental loop (registration + local/global BA), a real rewrite. **Lower-risk option:** add an optional post-hoc `bundle_adjuster` CLI polish pass on the finished reconstruction (same pattern already used for `model_orientation_aligner`), giving a GPU-refined BA result without touching the mapping loop itself. Not yet attempted.
+2. **Sequential matcher's `overlap=20`/`quadratic_overlap=1` is not scaled by image count.** This is the exact shape of bug the vocab-tree pass just had — quadratic overlap on a very large sequential capture could reproduce a similar multi-hour stall. Worth applying the same N-based scaling treatment used for vocab-tree `k` before it happens in production.
+3. **Split-reconstruction exhaustive retry** doubles the cost of stages 4–5 entirely (full re-match + re-map) whenever triggered, with no time budget or early-abort — only an image-count gate (≤400).
+4. **`max_num_features=16384`** is a deliberate 2× COLMAP-default choice (Problem 13, replacing the retired densification script) — doubles per-image extraction and matching cost by design; not a bug, but the dominant fixed cost on every run regardless of N.
+5. **GLOMAP (`colmap_mapper: "global"`) BA backend is unverified** — likely still CPU Ceres internally since it's invoked via the plain `pycolmap.global_mapping()` Python API, not a CLI with exposed GPU flags. Worth confirming before recommending it as a speed fix for large N.

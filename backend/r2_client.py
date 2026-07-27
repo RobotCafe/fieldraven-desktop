@@ -151,6 +151,48 @@ def upload_cameras_json(local_path: str | Path, job_id: str) -> str:
     return public_url
 
 
+def upload_cameras_html(local_path: str | Path, job_id: str) -> str:
+    """
+    Upload the standalone cameras.html point-cloud/camera visualizer to R2
+    under {job_id}/cameras.html. This is a separate, self-contained artifact
+    (tools/visualize_cameras.py output — point cloud, rig sensor gallery,
+    nodal spread chart, base64-embedded thumbnails) from cameras.json (which
+    only drives the splat viewer's own lightweight frustum overlay). Kept as
+    two independently-openable viewers by design, not merged into one.
+    Returns the public HTTPS URL.
+    """
+    import boto3
+    from botocore.config import Config
+
+    cfg = _load_config()
+    local_path = Path(local_path)
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=cfg["endpoint"],
+        aws_access_key_id=cfg["access_key_id"],
+        aws_secret_access_key=cfg["secret_access_key"],
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+
+    key = f"{job_id}/cameras.html"
+    s3.upload_file(
+        str(local_path),
+        cfg["bucket"],
+        key,
+        ExtraArgs={
+            "ContentType": "text/html",
+            # Not immutable — may be regenerated on re-processing, same as cameras.json.
+            "CacheControl": "public, max-age=60",
+        },
+    )
+
+    public_url = f"{cfg['public_base_url'].rstrip('/')}/{key}"
+    print(f"  [r2] cameras.html → {public_url}")
+    return public_url
+
+
 def upload_thumbnail(local_path: str | Path, job_id: str) -> str:
     """
     Upload a JPEG thumbnail to R2 under {job_id}/thumbnail.jpg.

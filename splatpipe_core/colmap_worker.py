@@ -231,7 +231,12 @@ def main():
             pycolmap.apply_rig_config([rig_config], db)
 
         # ── 4. Feature matching ────────────────────────────────────────────────
-        _prog(40, f"Matching features ({matcher})…")
+        # Image count for matcher scaling below. image_path's direct children are
+        # per-sensor folders (pano_camera0/, pano_camera1/, …), not image files —
+        # iterdir()+is_file() sees zero files here; must recurse.
+        _n_imgs = sum(1 for p in image_path.rglob("*") if p.is_file())
+
+        _prog(40, f"Matching features ({matcher}, {_n_imgs} images)…")
         if colmap_bin:
             cli_cmd = {
                 "sequential": "sequential_matcher",
@@ -243,15 +248,24 @@ def main():
                 "--database_path", str(db_path),
             ]
             if matcher == "sequential":
-                # Wider-than-default overlap for denser matches/point cloud. The
-                # earlier stall at image [5/196] was actually Firebase write
-                # backpressure on the progress-reporting pipe (see
-                # COLMAP_POSE_CORRECTION_BRIEF.md Problem 5 / Problem 6 follow-up),
-                # not quadratic_overlap — restoring it (COLMAP default) and
-                # raising overlap now that the real bottleneck is fixed.
+                # Wider-than-default overlap for denser matches/point cloud (see
+                # COLMAP_POSE_CORRECTION_BRIEF.md Problem 5 / Problem 6 follow-up —
+                # the earlier stall was Firebase backpressure, not quadratic_overlap).
+                # But neither overlap nor quadratic_overlap scale down on their own,
+                # and this pipeline's virtual multi-sensor rig frames mean many
+                # nearby images share near-identical content — the same shape of
+                # risk that made the vocab-tree pass balloon to hours on a large
+                # job. Scale back toward COLMAP's own default as N grows instead of
+                # applying the generous small-job setting unconditionally.
+                if _n_imgs > 300:
+                    _overlap, _quad = 10, 0
+                elif _n_imgs > 150:
+                    _overlap, _quad = 15, 1
+                else:
+                    _overlap, _quad = 20, 1
                 cli_args += [
-                    "--SequentialMatching.overlap",           "20",
-                    "--SequentialMatching.quadratic_overlap", "1",
+                    "--SequentialMatching.overlap",           str(_overlap),
+                    "--SequentialMatching.quadratic_overlap", str(_quad),
                 ]
             _run_cli(cli_args, pct=40)
         else:
@@ -268,16 +282,28 @@ def main():
         # them by global visual similarity. Only fires when a vocab tree .bin is
         # configured AND colmap_bin is set (no pycolmap vocab tree path API).
         if vocab_tree_path and colmap_bin and matcher == "sequential":
-            _prog(58, f"Vocab tree loop closure pass — {vocab_tree_path.rsplit('/', 1)[-1].rsplit(chr(92), 1)[-1]}…")
-            _run_cli([
-                "vocab_tree_matcher",
-                "--database_path",                   str(db_path),
-                "--VocabTreeMatching.vocab_tree_path", vocab_tree_path,
-                "--VocabTreeMatching.num_images_after_verification", "50",
-                "--SiftMatching.use_gpu",  "1",
-                "--SiftMatching.gpu_index", "0",
-            ], pct=58)
-            _prog(60, "Vocab tree loop closure pass complete.")
+            # Scale retrieval window inversely with image count (_n_imgs computed
+            # above, before sequential matching). With N=351 and k=50 the matcher
+            # generates ~8,775 candidate pairs — some take 200+ seconds on
+            # non-trivial feature sets, making the pass take hours. Loop-closure
+            # only needs a handful of true revisits; small k is sufficient.
+            _vt_k = 5 if _n_imgs > 200 else (10 if _n_imgs > 100 else 20)
+            _prog(58, f"Vocab tree loop closure pass — {vocab_tree_path.rsplit('/', 1)[-1].rsplit(chr(92), 1)[-1]}… ({_n_imgs} images, k={_vt_k})")
+            try:
+                _run_cli([
+                    "vocab_tree_matcher",
+                    "--database_path",                   str(db_path),
+                    "--VocabTreeMatching.vocab_tree_path", vocab_tree_path,
+                    "--VocabTreeMatching.num_images_after_verification", str(_vt_k),
+                    "--FeatureMatching.use_gpu",  "1",
+                    "--FeatureMatching.gpu_index", "-1",
+                ], pct=58)
+                _prog(60, "Vocab tree loop closure pass complete.")
+            except RuntimeError as _vt_err:
+                # Non-fatal — the sequential matches already exist; vocab tree is a bonus
+                # loop-closure pass. Common failure: FAISS .bin file with a non-FAISS
+                # COLMAP build. Pipeline continues without it.
+                print(f"WORKER_PROGRESS:58:⚠️ Vocab tree pass skipped (non-fatal): {_vt_err}", flush=True)
 
         # ── 4c. Purge same-rig-frame sibling pairs ──────────────────────────────
         # pycolmap's own matcher excludes these via skip_image_pairs_in_same_frame
@@ -315,12 +341,20 @@ def main():
                 if not recs:
                     raise RuntimeError("GLOMAP global mapping produced no reconstructions.")
             else:
-                _prog(60, f"Running incremental mapping, fixed rig ({label})…")
+                _prog(60, f"Running incremental mapping, fixed rig, GPU BA ({label})…")
+                # ba_use_gpu/ba_gpu_index: bundle adjustment was previously assumed to
+                # require a CLI subprocess (colmap.exe bundle_adjuster) to get GPU Ceres,
+                # since pycolmap.incremental_mapping() looked like a black box with no
+                # BA-backend hook. The installed pycolmap (4.1.0, newer than the 4.0.4
+                # this codebase was originally built against) exposes these fields
+                # directly on IncrementalPipelineOptions — same call, no rewrite needed.
                 map_opts = pycolmap.IncrementalPipelineOptions(
                     ba_refine_sensor_from_rig=False,
                     ba_refine_focal_length=False,
                     ba_refine_principal_point=False,
                     ba_refine_extra_params=False,
+                    ba_use_gpu=True,
+                    ba_gpu_index="-1",  # string field, unlike the CLI's int gpu_index flags
                 )
                 recs = pycolmap.incremental_mapping(
                     str(db_path), str(image_path), str(sparse_path), map_opts
