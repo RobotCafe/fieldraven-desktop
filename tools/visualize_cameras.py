@@ -66,19 +66,28 @@ def _parse_images_txt(rec_dir: Path) -> dict:
     data_line = False
     for raw in images_txt.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#"):
+        # Comment lines never count toward the pose/points2D pair alternation,
+        # but a genuinely BLANK points2D line still must -- some writers
+        # (e.g. equi_sfm_runner.py's _write_sensor_sparse_txt, which has no
+        # per-sensor track data) emit an empty second line for every image.
+        # Treating "blank" the same as "comment" here desyncs the toggle
+        # permanently after the first such image, silently dropping every
+        # other image from then on (confirmed: exactly half of a 312-image
+        # sensor_sparse_txt was lost this way, in a clean alternating pattern).
+        if line.startswith("#"):
             continue
         if not data_line:
-            parts = line.split()
-            if len(parts) >= 10:
-                img_id = int(parts[0])
-                qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-                tx, ty, tz     = float(parts[5]), float(parts[6]), float(parts[7])
-                cam_id = int(parts[8])
-                name   = parts[9]
-                R = _quat_to_mat(qw, qx, qy, qz)
-                t = np.array([tx, ty, tz], dtype=np.float64)
-                result[img_id] = (R, t, cam_id, name)
+            if line:
+                parts = line.split()
+                if len(parts) >= 10:
+                    img_id = int(parts[0])
+                    qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                    tx, ty, tz     = float(parts[5]), float(parts[6]), float(parts[7])
+                    cam_id = int(parts[8])
+                    name   = parts[9]
+                    R = _quat_to_mat(qw, qx, qy, qz)
+                    t = np.array([tx, ty, tz], dtype=np.float64)
+                    result[img_id] = (R, t, cam_id, name)
             data_line = True
         else:
             data_line = False

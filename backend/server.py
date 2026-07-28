@@ -355,14 +355,17 @@ async def queue_for_processing(
 
 def _derive_session_times(dest_dir: Path, site_date: str = "", site_time: str = "") -> tuple:
     """Derive (startMs, endMs) UTC epoch millis for Garmin/Coros activity matching,
-    for jobs with no mobile-app session record (the "From Camera" / local-folder
-    import flow).
+    for jobs with no mobile-app session record (From Camera, image-folder, and
+    video local-import flows all call this).
 
-    Prefers the actual EXIF DateTimeOriginal span across the imported .insp files
+    Prefers the actual EXIF DateTimeOriginal span across the imported image files
     (a real measured capture window) over the user-entered date/time (a guess).
-    Insta360 files carry a reliable DateTimeOriginal but never real GPS (confirmed
-    empirically — GPS EXIF is always zeroed on this camera), so this is the only
-    trustworthy signal from the files themselves.
+    Insta360 .insp files carry a reliable DateTimeOriginal but never real GPS
+    (confirmed empirically — GPS EXIF is always zeroed on this camera); plain
+    photo formats from the image-folder import flow may carry both, but only
+    DateTimeOriginal is used here for consistency. Video files have no per-frame
+    EXIF to scan, so this glob simply finds nothing for that flow and falls
+    through to the site_date/site_time fallback below.
     """
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 
@@ -370,7 +373,9 @@ def _derive_session_times(dest_dir: Path, site_date: str = "", site_time: str = 
     try:
         from PIL import Image
         from PIL.ExifTags import TAGS
-        for f in sorted(dest_dir.glob("*.insp")):
+        _exts = ("*.insp", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.png")
+        _files = sorted(f for ext in _exts for f in dest_dir.glob(ext))
+        for f in _files:
             try:
                 exif = Image.open(f)._getexif() or {}
                 for tag_id, val in exif.items():
@@ -405,6 +410,42 @@ def _derive_session_times(dest_dir: Path, site_date: str = "", site_time: str = 
             pass
 
     return None, None
+
+
+async def _write_session_meta(
+    project_dir: Path, dest_dir: Path, doc_id: str,
+    site_date: str = "", site_time: str = "",
+    lat: Optional[float] = None, lon: Optional[float] = None,
+) -> None:
+    """Shared by create-from-files, import-folder, and create-video: derive
+    session_times (for Garmin/Coros auto-fetch matching) and save a manually
+    picked map location (fallback captureLocation when there's no real GPS),
+    both written to fieldraven.json so _get_session_times()/_write_capture_location()
+    in pipeline_runner.py pick them up automatically at publish time — no
+    further wiring needed per call site."""
+    import asyncio as _asyncio
+    from . import pipeline_runner
+
+    try:
+        s_ms, e_ms = await _asyncio.get_event_loop().run_in_executor(
+            None, _derive_session_times, dest_dir, site_date, site_time
+        )
+        if s_ms and e_ms:
+            pipeline_runner._write_stage_progress(project_dir, "session_times", {
+                "startMs": s_ms, "endMs": e_ms,
+            })
+            print(f"  [session] Derived session_times for {doc_id} ({project_dir.name})")
+    except Exception as e:
+        print(f"  [session] Could not derive session_times: {e}")
+
+    if lat is not None and lon is not None:
+        try:
+            pipeline_runner._write_stage_progress(project_dir, "manual_location", {
+                "lat": lat, "lon": lon,
+            })
+            print(f"  [location] Saved manually-picked location for {doc_id}: {lat:.5f}, {lon:.5f}")
+        except Exception as e:
+            print(f"  [location] Could not save manual location: {e}")
 
 
 class CreateFromFilesRequest(BaseModel):
@@ -478,37 +519,9 @@ async def create_from_files(
 
     imported, skipped, errors = await _asyncio.get_event_loop().run_in_executor(None, _do_copy)
 
-    # Derive session_times so the existing Garmin auto-fetch (garmin_fetcher.py,
-    # currently mobile-job-only) also fires for this camera-folder import flow —
-    # it already knows how to match by time window and fall back to the activity's
-    # first route point as captureLocation; it was just never getting real times.
-    try:
-        s_ms, e_ms = await _asyncio.get_event_loop().run_in_executor(
-            None, _derive_session_times, dest_dir, request.siteDate or "", request.siteTime or ""
-        )
-        if s_ms and e_ms:
-            from . import pipeline_runner
-            pipeline_runner._write_stage_progress(project_dir, "session_times", {
-                "startMs": s_ms, "endMs": e_ms,
-            })
-            print(f"  [session] Derived session_times for {doc_id} ({project_dir.name})")
-    except Exception as e:
-        print(f"  [session] Could not derive session_times: {e}")
-
-    # Manually-picked map location (fallback for when the camera has no GPS —
-    # confirmed the Insta360 files never carry a real fix). Saved now so
-    # _write_capture_location() can use it at publish time even though there's
-    # no mobile job doc for this import flow.
-    if request.lat is not None and request.lon is not None:
-        try:
-            from . import pipeline_runner
-            pipeline_runner._write_stage_progress(project_dir, "manual_location", {
-                "lat": request.lat, "lon": request.lon,
-            })
-            print(f"  [location] Saved manually-picked location for {doc_id}: "
-                  f"{request.lat:.5f}, {request.lon:.5f}")
-        except Exception as e:
-            print(f"  [location] Could not save manual location: {e}")
+    await _write_session_meta(project_dir, dest_dir, doc_id,
+                               request.siteDate or "", request.siteTime or "",
+                               request.lat, request.lon)
 
     return {
         'processingJobId': doc_id,
@@ -522,6 +535,12 @@ async def create_from_files(
 class CreateLocalJobRequest(BaseModel):
     name: Optional[str] = None
     projectDir: str
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    siteDate: Optional[str] = None
+    siteTime: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 @app.post("/api/jobs/create-local")
 async def create_local_job(
@@ -543,6 +562,10 @@ async def create_local_job(
         'projectDir': request.projectDir,
         'createdAt': datetime.datetime.utcnow(),
         'settings': {},
+        'location': request.location or '',
+        'notes': request.notes or '',
+        'siteDate': request.siteDate or '',
+        'siteTime': request.siteTime or '',
     })
 
     return {"processingJobId": new_ref.id, "status": "queued", "name": display_name}
@@ -552,6 +575,12 @@ class CreateVideoJobRequest(BaseModel):
     projectDir: str
     videoPath: str
     name: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    siteDate: Optional[str] = None
+    siteTime: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 @app.post("/api/jobs/create-video")
 async def create_video_job(
@@ -589,7 +618,18 @@ async def create_video_job(
         'videoFile': video_path.name,
         'createdAt': datetime.datetime.utcnow(),
         'settings': {},
+        'location': request.location or '',
+        'notes': request.notes or '',
+        'siteDate': request.siteDate or '',
+        'siteTime': request.siteTime or '',
     })
+
+    # No per-frame EXIF to scan for a single video file — _derive_session_times
+    # finds nothing under input_dir and falls straight through to the
+    # site_date/site_time fallback, same as any other flow with no EXIF hits.
+    await _write_session_meta(project_dir, input_dir, new_ref.id,
+                               request.siteDate or "", request.siteTime or "",
+                               request.lat, request.lon)
 
     return {"processingJobId": new_ref.id, "status": "queued", "name": display_name}
 
@@ -891,7 +931,11 @@ async def browse_folder(initial: str = "C:\\Users", title: Optional[str] = None)
 @app.get("/api/browse/video")
 async def browse_video(initial: str = "C:\\Users"):
     """Open a video file-picker dialog; returns selected path or null."""
-    path = await asyncio.get_event_loop().run_in_executor(None, _tk_browse_video, initial)
+    # Auto-navigate into DCIM subfolder if it exists (e.g. when initial is a
+    # camera's mounted drive root) -- same convenience as /api/browse/files.
+    dcim = os.path.join(initial.rstrip("\\"), "DCIM")
+    start_dir = dcim if os.path.isdir(dcim) else initial
+    path = await asyncio.get_event_loop().run_in_executor(None, _tk_browse_video, start_dir)
     return {"path": path}
 
 
@@ -1158,6 +1202,10 @@ class ImportFolderRequest(BaseModel):
     jobId: Optional[str] = None
     projectDir: str
     sourceFolder: str
+    siteDate: Optional[str] = None
+    siteTime: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 _IMPORT_FOLDER_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 
@@ -1222,6 +1270,9 @@ async def import_folder(
 
     if request.jobId:
         queue_manager.update_job_progress(request.jobId, 30, f"Import complete — {imported} copied, {skipped} skipped")
+        await _write_session_meta(project_dir, dest_dir, request.jobId,
+                                   request.siteDate or "", request.siteTime or "",
+                                   request.lat, request.lon)
 
     return {
         "imported": imported, "skipped": skipped, "errors": errors,
@@ -1317,15 +1368,24 @@ async def write_project_config(
     # Use set(merge=True) so the doc is recreated if it was deleted.
     if request.jobId:
         try:
-            firebase_client.get_processing_queue().document(request.jobId).set(
-                {
-                    "projectDir":      str(project_dir),
-                    "jobType":         "local_folder",
-                    "assignedMachine": machine_module.get_machine_id(),
-                    "name":            request.dir.split("\\")[-1].split("/")[-1] or "Project",
-                },
-                merge=True,
-            )
+            doc_ref = firebase_client.get_processing_queue().document(request.jobId)
+            # This endpoint is called generically for every job type (a debounced
+            # autosave effect in App.jsx fires it for whatever job is currently
+            # selected, video or folder). It used to hardcode jobType="local_folder"
+            # unconditionally, which silently reclassified freshly-created video
+            # jobs as folder jobs within moments of selecting them. Preserve
+            # whatever jobType is already set; only default it for a genuinely
+            # new doc that has none yet.
+            existing_doc = doc_ref.get()
+            existing_data = existing_doc.to_dict() if existing_doc.exists else {}
+            update_data = {
+                "projectDir":      str(project_dir),
+                "assignedMachine": machine_module.get_machine_id(),
+                "name":            request.dir.split("\\")[-1].split("/")[-1] or "Project",
+            }
+            if not existing_data.get("jobType"):
+                update_data["jobType"] = "local_folder"
+            doc_ref.set(update_data, merge=True)
         except Exception as e:
             print(f"⚠️ Could not save projectDir to Firestore: {e}")
 
@@ -1673,6 +1733,7 @@ async def resume_project(
             "rigsfm_matcher":             saved_settings.get("rigsfm_matcher", "sequential"),
             "run_equisfm":                saved_settings.get("run_equisfm", False),
             "equisfm_matcher":            saved_settings.get("equisfm_matcher", "sequential"),
+            "equisfm_triangulate":        saved_settings.get("equisfm_triangulate", False),
             "export_xmp":          saved_settings.get("export_xmp", False),
             "brush_rerun_logging": saved_settings.get("brush_rerun_logging", False),
             "gps_priors_rs":       saved_settings.get("gps_priors_rs", False),
@@ -1740,7 +1801,12 @@ async def stitch_job(
     job_id: str,
     user: CurrentUser = Depends(require_auth),
 ):
-    """Convert any .insp files in the job's input dir to equirectangular JPEGs (background thread)."""
+    """Convert any .insp photos or .insv videos in the job's input dir to
+    equirectangular output (background thread). Photos take priority if a
+    job somehow has both; the pipeline's own synchronous pre-check
+    (backend/pipeline_runner.py's _worker) is the real correctness guarantee
+    regardless of whether this endpoint ever ran -- this is just the
+    immediate-after-import head start, same as the existing .insp flow."""
     import threading
     from . import pipeline_runner
 
@@ -1752,24 +1818,33 @@ async def stitch_job(
 
     input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
     insp_files = list(input_dir.glob("*.insp")) if input_dir.exists() else []
-    if not insp_files:
-        return {"total": 0, "message": "No .insp files to convert"}
+    insv_files = list(input_dir.glob("*.insv")) if input_dir.exists() else []
+    if not insp_files and not insv_files:
+        return {"total": 0, "message": "No .insp/.insv files to convert"}
 
-    total = len(insp_files)
+    is_video = not insp_files and bool(insv_files)
+    total = len(insv_files) if is_video else len(insp_files)
     cancel = threading.Event()
 
     def _run():
         try:
-            count = pipeline_runner._stitch_insp_files(job_id, cancel, job_data)
-            queue_manager.update_job_progress(
-                job_id, 50, f"Converted {count}/{total} .insp files to equirectangular"
-            )
+            if is_video:
+                count = pipeline_runner._stitch_insv_files(job_id, cancel, job_data)
+                queue_manager.update_job_progress(
+                    job_id, 50, f"Converted {count}/{total} .insv video(s) to equirectangular"
+                )
+            else:
+                count = pipeline_runner._stitch_insp_files(job_id, cancel, job_data)
+                queue_manager.update_job_progress(
+                    job_id, 50, f"Converted {count}/{total} .insp files to equirectangular"
+                )
         except Exception as e:
             queue_manager.update_job_progress(job_id, 0, f"Conversion failed: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
-    queue_manager.update_job_progress(job_id, 31, f"Converting {total} .insp files…")
-    return {"total": total, "message": f"Converting {total} .insp files in background"}
+    kind = ".insv video(s)" if is_video else ".insp files"
+    queue_manager.update_job_progress(job_id, 31, f"Converting {total} {kind}…")
+    return {"total": total, "message": f"Converting {total} {kind} in background"}
 
 
 @app.get("/api/jobs/{job_id}/input/{filename}")

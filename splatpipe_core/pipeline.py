@@ -332,7 +332,7 @@ def _run_brush_training(
     command = [
         str(brush_exe),
         str(brush_input),
-        "--total-steps",    str(total_steps),
+        "--total-train-iters", str(total_steps),
         "--max-splats",     str(settings.brush_max_splats),
         "--max-resolution", str(settings.brush_max_resolution),
         "--seed",           str(settings.brush_seed),

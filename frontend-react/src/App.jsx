@@ -16,7 +16,7 @@ L.Icon.Default.mergeOptions({
   shadowUrl:     markerShadow,
 });
 
-function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
+function CameraImportMetaModal({ pending, onConfirm, onCancel, settings, setSettings }) {
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
   const nowTime = now.toTimeString().slice(0, 5);
@@ -39,7 +39,14 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
       <div style={{ background:T.surface, border:`1px solid ${T.borderHi}`, borderRadius:8,
         padding:24, width:380, display:'flex', flexDirection:'column', gap:14 }}>
         <div style={{ fontSize:13, fontWeight:700, color:T.amber }}>Job Details</div>
-        <div style={{ fontSize:11, color:T.textDim }}>{pending.filePaths.length} files · {pending.projectDir}</div>
+        <div style={{ fontSize:11, color:T.textDim }}>
+          {pending.kind === 'folder'
+            ? `Folder: ${pending.sourceFolder}`
+            : pending.kind === 'video'
+              ? `Video: ${pending.videoPath.split(/[\\/]/).pop()}`
+              : `${pending.filePaths.length} file${pending.filePaths.length === 1 ? '' : 's'}`}
+          {' · '}{pending.projectDir}
+        </div>
 
         <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
           <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Job Name *</label>
@@ -79,10 +86,66 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel }) {
           <div style={{ fontSize:10, color:T.textDim }}>
             {pickedLat != null
               ? `${pickedLat.toFixed(5)}, ${pickedLon.toFixed(5)}`
-              : 'This camera has no GPS — click the map if you know roughly where this was shot.'}
+              : 'No GPS recorded — click the map if you know roughly where this was shot.'}
           </div>
           <LocationPickerMap lat={pickedLat} lon={pickedLon} onPick={handlePick} />
         </div>
+
+        {pending.kind === 'video' && settings && setSettings && (
+          <div style={{ display:'flex', flexDirection:'column', gap:8,
+            borderTop:`1px solid ${T.border}`, paddingTop:12 }}>
+            <label style={{ fontSize:10, color:T.info, textTransform:'uppercase', letterSpacing:1 }}>
+              Insta360 Stitch Settings
+            </label>
+            <div style={{ display:'flex', gap:8 }}>
+              <select style={{ ...inp, flex:1 }} value={settings.inspStitchType}
+                onChange={e=>setSettings(s=>({...s,inspStitchType:e.target.value}))}>
+                <option value="template">Template (fastest)</option>
+                <option value="optflow">Optical Flow</option>
+                <option value="dynamic">Dynamic Stitch</option>
+                <option value="ai">AI Stitch</option>
+              </select>
+              <select style={{ ...inp, flex:1 }} value={settings.inspOutputWidth}
+                onChange={e=>setSettings(s=>({...s,inspOutputWidth:e.target.value}))}>
+                <option value="11968">12K (slowest)</option>
+                <option value="5984">6K</option>
+                <option value="3840">4K</option>
+                <option value="2880">3K (fastest)</option>
+              </select>
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <select style={{ ...inp, flex:1 }} value={settings.inspLensGuard}
+                onChange={e=>setSettings(s=>({...s,inspLensGuard:e.target.value}))}>
+                <option value="none">No Lens Guard</option>
+                <option value="a">Lens Guard A (X3/X4/X5)</option>
+                <option value="s">Lens Guard S (X3/X4/X5)</option>
+                <option value="as">Lens Guard AS (X4)</option>
+                <option value="waterproof">Dive Case</option>
+              </select>
+              <select style={{ ...inp, flex:1 }} value={settings.inspWorkers}
+                onChange={e=>setSettings(s=>({...s,inspWorkers:e.target.value}))}>
+                <option value="1">1 worker</option>
+                <option value="2">2 workers</option>
+                <option value="3">3 workers</option>
+                <option value="4">4 workers</option>
+              </select>
+            </div>
+            <div style={{ display:'flex', gap:16 }}>
+              <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:11, color:T.textSec, cursor:'pointer' }}>
+                <input type="checkbox" checked={!!settings.inspFlowState}
+                  onChange={e=>setSettings(s=>({...s,inspFlowState:e.target.checked}))}
+                  style={{ accentColor:T.info }} />
+                FlowState
+              </label>
+              <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:11, color:T.textSec, cursor:'pointer' }}>
+                <input type="checkbox" checked={!!settings.inspCuda}
+                  onChange={e=>setSettings(s=>({...s,inspCuda:e.target.checked}))}
+                  style={{ accentColor:T.info }} />
+                CUDA
+              </label>
+            </div>
+          </div>
+        )}
 
         <div style={{ display:'flex', gap:8, justifyContent:'flex-end', marginTop:4 }}>
           <button onClick={onCancel}
@@ -369,7 +432,7 @@ const API_TO_UI = {
   run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign', colmap_mapper:'colmapMapper', colmap_vocab_tree:'colmapVocabTree',
   run_gluemap:'runGluemap', gluemap_backbone:'glueMapBackbone', gluemap_skip_doppelgangers:'glueMapSkipDg', gluemap_coarse_only:'glueMapCoarseOnly', gluemap_is_sequential:'glueMapSequential', gluemap_num_neighbors:'glueMapNeighbors', gluemap_batch_size:'glueMapBatchSize', gluemap_num_track_per_img:'glueMapNumTrack', gluemap_wsl_home:'glueMapWslHome', gluemap_wsl_distro:'glueMapWslDistro',
   run_rigsfm:'runRigsfm', rigsfm_anchor_sensor:'rigsfmAnchorSensor', rigsfm_quad_anchors:'rigsfmQuadAnchors', rigsfm_matcher:'rigsfmMatcher',
-  run_equisfm:'runEquisfm', equisfm_matcher:'equisfmMatcher',
+  run_equisfm:'runEquisfm', equisfm_matcher:'equisfmMatcher', equisfm_triangulate:'equisfmTriangulate',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -439,7 +502,7 @@ function statusColor(s) {
 }
 
 // ─── Queue Panel ──────────────────────────────────────────────────────────────
-function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq, onDeletePq, onAddImageFolder, onAddCameraFiles, onAddVideoFile }) {
+function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected, onCancelPq, onDeletePq, onAddImageFolder, onAddCameraFiles, onAddVideoFile, onAddVideoFromCamera }) {
   const queuedOrProcessing = j => j.status === 'queued' || j.status === 'processing';
   const frItems = pqItems
     .filter(j => queuedOrProcessing(j) && j.jobType !== 'local_folder' && j.jobType !== 'local_video')
@@ -515,10 +578,10 @@ function QueuePanel({ pqItems, localQueue, setLocalQueue, selected, setSelected,
                   onClick={()=> type==='folder' ? onAddImageFolder?.() : onAddVideoFile?.()}>
                   + Add
                 </Btn>
-                {type === 'folder' && (
+                {(type === 'folder' || type === 'video') && (
                   <Btn small variant="ghost"
                     style={{ flex:1, fontSize:10, borderColor:`${cfg.color}44`, color:cfg.color }}
-                    onClick={()=> onAddCameraFiles?.()}>
+                    onClick={()=> type==='folder' ? onAddCameraFiles?.() : onAddVideoFromCamera?.()}>
                     + From Camera
                   </Btn>
                 )}
@@ -849,6 +912,26 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
     observer.observe(canvas);
     return () => observer.disconnect();
   }, []);
+
+  // Keep canvasH from over-constraining the box when the column itself resizes
+  // (app window resize, sidebar toggle, etc.) — same clamp onSplitPointerMove
+  // already uses during a manual drag. Without this, the box has both an
+  // explicit height (canvasH) AND a maxWidth-clamped width at the same time,
+  // which can't honor aspectRatio:"2/1" (over-constrained) — the canvas
+  // visibly stretches on resize until the user drags the splitter, which
+  // happens to re-run this same clamp as a side effect of setCanvasH.
+  useEffect(() => {
+    const col = leftColRef.current;
+    if (!col) return;
+    const observer = new ResizeObserver(() => {
+      const maxFromRatio = Math.floor(col.offsetWidth / 2);
+      const maxFromSpace = col.offsetHeight - 120;
+      const maxH = Math.min(maxFromRatio, maxFromSpace);
+      setCanvasH(h => Math.max(80, Math.min(h, maxH)));
+    });
+    observer.observe(col);
+    return () => observer.disconnect();
+  }, [setCanvasH]);
 
   const onSplitPointerDown = (e) => {
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -1399,13 +1482,13 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
       {/* Right panel */}
       <div style={{ overflowY:"auto", display:"flex", flexDirection:"column", gap:0 }}>
 
-        {/* Insta360 stitch settings — applies to any job with .insp files to
-            convert, not just FieldRaven jobs. _stitch_insp_files() (backend)
-            runs identically for both job types against the same global
-            splat_config settings; this panel was only gated to FieldRaven
-            jobs, hiding it (and the ability to change it) for From Camera /
-            image-folder imports even though it was still being applied. */}
-        {isFolder && <Accordion title="Insta360 Stitch" accent={T.info} defaultOpen={true}>
+        {/* Insta360 stitch settings — applies to any job with .insp/.insv files
+            to convert, not just FieldRaven jobs. _stitch_insp_files() (backend)
+            runs against the same global splat_config settings regardless of
+            job type; this panel was gated to isFolder only, hiding it (and the
+            ability to change it) for video jobs too even though the same
+            global settings still apply to them. */}
+        {(isFolder || isVideo) && <Accordion title="Insta360 Stitch" accent={T.info} defaultOpen={true}>
           <FieldRow label="Stitch Type">
             <select value={settings.inspStitchType}
               onChange={e=>setSettings(s=>({...s,inspStitchType:e.target.value}))}
@@ -2152,6 +2235,13 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
               <div style={{ fontSize:10, color:T.textDim, marginTop:6 }}>
                 COLMAP EQUIRECTANGULAR SfM on raw panos — no Pi3, no anchor staging. Sequential matches neighbouring frames; exhaustive matches all pairs (slower, better for short sequences).
               </div>
+              <div style={{ marginTop:10 }}>
+                <Toggle checked={!!settings.equisfmTriangulate} label="Real per-sensor triangulation (rig glue)"
+                  onChange={v=>setSettings(s=>({...s,equisfmTriangulate:v}))} />
+              </div>
+              <div style={{ fontSize:10, color:T.textDim, marginTop:6 }}>
+                Runs real SIFT matching + triangulation across the 312 per-sensor images using the poses EquiSfM already solved — camera positions are never moved, only used to triangulate a denser, properly-tracked point cloud for Brush. Off by default; adds real SIFT cost across all sensor images (no longer near-instant).
+              </div>
             </Accordion>
           </div>
         )}
@@ -2223,7 +2313,7 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
           {mode === 'vggt'    && `VGGT ${settings.vggtMode} pose estimation`}
           {mode === 'gluemap' && `GlueMap (${settings.glueMapBackbone} backbone, ${settings.glueMapNeighbors} neighbours${settings.glueMapSkipDg?', skip-dg':''})`}
           {mode === 'rigsfm'  && `RigGluemap — Pi3 ${settings.glueMapBackbone||'pi3'} ${settings.rigsfmQuadAnchors ? '4-horizon anchors' : `anchor sensor #${settings.rigsfmAnchorSensor??0}`} → rig expand → SIFT ${settings.rigsfmMatcher||'sequential'}`}
-          {mode === 'equisfm' && `EquiSfM — COLMAP EQUIRECTANGULAR ${settings.equisfmMatcher||'sequential'} matcher → rig expansion`}
+          {mode === 'equisfm' && `EquiSfM — COLMAP EQUIRECTANGULAR ${settings.equisfmMatcher||'sequential'} matcher → rig expansion${settings.equisfmTriangulate ? ' → per-sensor SIFT triangulation (poses fixed)' : ''}`}
           {'\n'}
           {[runPostshot&&'→ Postshot training', runBrush&&'→ Brush training'].filter(Boolean).join('\n') || (mode==='vggt'?'':'→ Alignment only (no training selected)')}
         </div>
@@ -2360,7 +2450,7 @@ const PIPE_TABS = ["Frame & View Extraction","Alignment","Postshot","Brush","Con
 
 function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected,
     settings, setSettings, onSaveConfig, onCancelPq, onDeletePq, machineInfo,
-    cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder, onAddCameraFiles, onAddVideoFile,
+    cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder, onAddCameraFiles, onAddVideoFile, onAddVideoFromCamera,
     importStep, importPct, stitching, stitchStep, stitchPct }) {
   const [pipeTab, setPipeTab] = useState(0);
   const [canvasH, setCanvasH] = useState(600);
@@ -2368,7 +2458,8 @@ function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected
     <div style={{ display:"flex", height:"100%", overflow:"hidden", gap:10 }}>
       <QueuePanel pqItems={pqItems} localQueue={localQueue} setLocalQueue={setLocalQueue}
         selected={selected} setSelected={setSelected} onCancelPq={onCancelPq}
-        onDeletePq={onDeletePq} onAddImageFolder={onAddImageFolder} onAddCameraFiles={onAddCameraFiles} onAddVideoFile={onAddVideoFile} />
+        onDeletePq={onDeletePq} onAddImageFolder={onAddImageFolder} onAddCameraFiles={onAddCameraFiles} onAddVideoFile={onAddVideoFile}
+        onAddVideoFromCamera={onAddVideoFromCamera} />
 
       <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
         <div style={{ display:"flex", gap:1, marginBottom:0, flexShrink:0, overflowX:"auto" }}>
@@ -2756,7 +2847,7 @@ const defaultSettings = {
   runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false, colmapMapper:"incremental", colmapVocabTree:"",
   runGluemap:false, glueMapBackbone:"pi3", glueMapSkipDg:true, glueMapCoarseOnly:false, glueMapSequential:true, glueMapNeighbors:100, glueMapBatchSize:60, glueMapNumTrack:512, glueMapWslHome:"/home/decosson", glueMapWslDistro:"Ubuntu-22.04",
   runRigsfm:false, rigsfmAnchorSensor:0, rigsfmQuadAnchors:false, rigsfmMatcher:'sequential',
-  runEquisfm:false, equisfmMatcher:'sequential',
+  runEquisfm:false, equisfmMatcher:'sequential', equisfmTriangulate:false,
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,
@@ -3196,64 +3287,23 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   // not a camera import) — establish/create a project folder, pick the source photos
   // folder, optionally copy them into "imported photos", then register a job so it
   // runs through the same pipeline as an accepted FieldRaven job.
+  // Select content first, project directory second — same order as the camera
+  // flow, so the metadata modal always appears right before committing,
+  // regardless of which import path the user took.
   const onAddImageFolder = useCallback(async () => {
-    addLog('Select or create a project folder…');
-    const dirRes = await api(`/api/browse/folder?initial=${encodeURIComponent(lastBrowseDir)}`);
-    if (!dirRes.path) { addLog('Cancelled.'); return; }
-    const projectDir = dirRes.path;
-    setLastBrowseDir(projectDir);
-
     addLog('Select the folder containing your photos…');
-    const srcRes = await api(`/api/browse/folder?initial=${encodeURIComponent(projectDir)}&title=${encodeURIComponent('Select the folder containing your photos')}`);
+    const srcRes = await api(`/api/browse/folder?initial=${encodeURIComponent(lastBrowseDir)}&title=${encodeURIComponent('Select the folder containing your photos')}`);
     if (!srcRes.path) { addLog('Cancelled.'); return; }
     const sourceFolder = srcRes.path;
 
-    const doCopy = window.confirm(
-      `Copy photos from:\n${sourceFolder}\n\ninto the project folder as "imported photos"?`
-    );
-    if (!doCopy) { addLog('Import skipped — no photos copied.'); return; }
+    addLog('Select or create a project folder…');
+    const dirRes = await api(`/api/browse/folder?initial=${encodeURIComponent(sourceFolder)}`);
+    if (!dirRes.path) { addLog('Cancelled.'); return; }
+    setLastBrowseDir(dirRes.path);
 
-    const folderName = sourceFolder.split(/[\\/]/).filter(Boolean).pop() || 'Imported Photos';
-    let created;
-    try {
-      created = await api('/api/jobs/create-local', 'POST', { name: folderName, projectDir });
-    } catch (e) {
-      addLog(`Could not create project: ${e.message}`);
-      return;
-    }
-
-    // Show immediately in queue so the user sees feedback right away
-    const jobId = created.processingJobId;
-    setProjectDirs(prev => ({ ...prev, [jobId]: projectDir }));
-    setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev
-      : [{ docId: jobId, id: jobId, jobType: 'local_folder', name: folderName, status: 'importing' }, ...prev]);
-    setSelected({ id: jobId, type: 'folder', name: folderName, status: 'importing' });
-
-    addLog(`Importing photos from ${sourceFolder}…`);
-    try {
-      const result = await api('/api/project/import-folder', 'POST', {
-        jobId, projectDir, sourceFolder,
-      });
-      addLog(`Import complete: ${result.imported} copied, ${result.skipped} skipped`);
-    } catch (e) {
-      addLog(`Import failed: ${e.message}`);
-      setPqItems(prev => prev.map(j => (j.docId||j.id) === jobId ? { ...j, status: 'error' } : j));
-      setSelected(prev => prev?.id === jobId ? { ...prev, status: 'error' } : prev);
-      return;
-    }
-
-    // Populate the gallery the same way the camera-import flow does.
-    const pdParam = encodeURIComponent(projectDir);
-    const files = await api(`/api/jobs/${jobId}/files?projectDir=${pdParam}`);
-    setImportedFiles(prev => ({ ...prev, [jobId]: files }));
-
-    api('/api/project/config', 'POST', { dir: projectDir, jobId }).catch(() => {});
-    addLog(`Project ready: ${created.name}`);
-    const folderEntry = { docId: jobId, id: jobId, jobType: 'local_folder', name: folderName, status: 'queued' };
-    setPqItems(prev => prev.map(j => (j.docId||j.id) === jobId ? folderEntry : j));
-    setSelected({ id: jobId, type: 'folder', name: folderName, status: 'queued' });
-    loadQueue();
-  }, [api, lastBrowseDir, loadQueue, setImportedFiles]);
+    const defaultName = sourceFolder.split(/[\\/]/).filter(Boolean).pop() || 'Imported Photos';
+    setCameraImportPending({ kind: 'folder', sourceFolder, projectDir: dirRes.path, defaultName });
+  }, [api, lastBrowseDir]);
 
   const onAddCameraFiles = useCallback(async () => {
     // Step 1: Pick files first so user can see what's on the camera before naming the project
@@ -3271,61 +3321,139 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
 
     // Step 3: Show metadata form before committing
     const defaultName = dirRes.path.split(/[\\/]/).filter(Boolean).pop() || 'Camera Import';
-    setCameraImportPending({ filePaths: filesRes.paths, projectDir: dirRes.path, defaultName });
+    setCameraImportPending({ kind: 'camera', filePaths: filesRes.paths, projectDir: dirRes.path, defaultName });
   }, [api, lastBrowseDir, cameraStatus]);
 
   const [cameraImportBusy, setCameraImportBusy] = useState(false);
 
-  const onConfirmCameraImport = useCallback(async (meta) => {
+  const onConfirmImport = useCallback(async (meta) => {
     if (!cameraImportPending) return;
-    const { filePaths, projectDir } = cameraImportPending;
+    const { kind, projectDir } = cameraImportPending;
     setCameraImportPending(null);
     setCameraImportBusy(true);
 
-    addLog(`Copying ${filePaths.length} files into project…`);
-    let created;
+    const metaFields = {
+      name:     meta.name,
+      location: meta.location,
+      notes:    meta.notes,
+      siteDate: meta.siteDate,
+      siteTime: meta.siteTime,
+      lat:      meta.lat,
+      lon:      meta.lon,
+    };
+
     try {
-      created = await api('/api/jobs/create-from-files', 'POST', {
-        filePaths, projectDir,
-        name:     meta.name,
-        location: meta.location,
-        notes:    meta.notes,
-        siteDate: meta.siteDate,
-        siteTime: meta.siteTime,
-        lat:      meta.lat,
-        lon:      meta.lon,
-      });
-    } catch (e) {
-      addLog(`Failed: ${e.message}`);
+      if (kind === 'camera') {
+        const { filePaths } = cameraImportPending;
+        addLog(`Copying ${filePaths.length} files into project…`);
+        const created = await api('/api/jobs/create-from-files', 'POST', { filePaths, projectDir, ...metaFields });
+        setCameraImportBusy(false);
+        addLog(`Copied ${created.imported} files (${created.skipped} skipped${created.errors ? `, ${created.errors} errors` : ''})`);
+
+        const jobId = created.processingJobId;
+        setProjectDirs(prev => ({ ...prev, [jobId]: projectDir }));
+        const entry = { docId: jobId, id: jobId, jobType: 'local_folder', name: created.name, status: 'queued' };
+        setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
+        setSelected({ id: jobId, type: 'folder', name: created.name, status: 'queued' });
+
+        const files = await api(`/api/jobs/${jobId}/files?projectDir=${encodeURIComponent(projectDir)}`);
+        setImportedFiles(prev => ({ ...prev, [jobId]: files }));
+        api('/api/project/config', 'POST', { dir: projectDir, jobId }).catch(() => {});
+        loadQueue();
+
+        // Trigger immediate .insp → equirectangular conversion in background —
+        // this flow was previously missing it, leaving files imported-but-unconverted.
+        const inspFiles = (files.files || []).filter(f => f.ext === '.insp');
+        if (inspFiles.length > 0) {
+          addLog(`Starting conversion of ${inspFiles.length} .insp files…`);
+          setStitchingJobId(jobId);
+          setStitchingProjectDir(projectDir);
+          api(`/api/jobs/${jobId}/stitch`, 'POST')
+            .then(r => addLog(r.message))
+            .catch(e => { addLog(`Conversion note: ${e.message}`); setStitchingJobId(null); setStitchingProjectDir(null); });
+        }
+        return;
+      }
+
+      if (kind === 'folder') {
+        const { sourceFolder } = cameraImportPending;
+        const folderName = meta.name || cameraImportPending.defaultName;
+        let created;
+        try {
+          created = await api('/api/jobs/create-local', 'POST', { projectDir, ...metaFields });
+        } catch (e) {
+          addLog(`Could not create project: ${e.message}`);
+          setCameraImportBusy(false);
+          return;
+        }
+        const jobId = created.processingJobId;
+        setProjectDirs(prev => ({ ...prev, [jobId]: projectDir }));
+        setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev
+          : [{ docId: jobId, id: jobId, jobType: 'local_folder', name: folderName, status: 'importing' }, ...prev]);
+        setSelected({ id: jobId, type: 'folder', name: folderName, status: 'importing' });
+
+        addLog(`Importing photos from ${sourceFolder}…`);
+        try {
+          const result = await api('/api/project/import-folder', 'POST', {
+            jobId, projectDir, sourceFolder,
+            siteDate: meta.siteDate, siteTime: meta.siteTime, lat: meta.lat, lon: meta.lon,
+          });
+          addLog(`Import complete: ${result.imported} copied, ${result.skipped} skipped`);
+        } catch (e) {
+          addLog(`Import failed: ${e.message}`);
+          setPqItems(prev => prev.map(j => (j.docId||j.id) === jobId ? { ...j, status: 'error' } : j));
+          setSelected(prev => prev?.id === jobId ? { ...prev, status: 'error' } : prev);
+          setCameraImportBusy(false);
+          return;
+        }
+        setCameraImportBusy(false);
+
+        const files = await api(`/api/jobs/${jobId}/files?projectDir=${encodeURIComponent(projectDir)}`);
+        setImportedFiles(prev => ({ ...prev, [jobId]: files }));
+        api('/api/project/config', 'POST', { dir: projectDir, jobId }).catch(() => {});
+        addLog(`Project ready: ${created.name}`);
+        const folderEntry = { docId: jobId, id: jobId, jobType: 'local_folder', name: folderName, status: 'queued' };
+        setPqItems(prev => prev.map(j => (j.docId||j.id) === jobId ? folderEntry : j));
+        setSelected({ id: jobId, type: 'folder', name: folderName, status: 'queued' });
+        loadQueue();
+        return;
+      }
+
+      if (kind === 'video') {
+        const { videoPath } = cameraImportPending;
+        let created;
+        try {
+          created = await api('/api/jobs/create-video', 'POST', { projectDir, videoPath, ...metaFields });
+        } catch (e) {
+          addLog(`Could not create video project: ${e.message}`);
+          setCameraImportBusy(false);
+          return;
+        }
+        setCameraImportBusy(false);
+        addLog(`Video project ready: ${created.name}`);
+        const videoJobId = created.processingJobId;
+        const videoEntry = { docId: videoJobId, id: videoJobId, jobType: 'local_video', name: created.name, status: 'queued' };
+        setProjectDirs(prev => ({ ...prev, [videoJobId]: projectDir }));
+        setPqItems(prev => prev.some(j => (j.docId||j.id) === videoJobId) ? prev : [videoEntry, ...prev]);
+        setSelected({ id: videoJobId, type: 'video', name: created.name, status: 'queued' });
+
+        // Raw .insv is dual-fisheye, not equirectangular yet -- kick off
+        // stitching immediately in the background so it's done (or well
+        // underway) by the time settings are reviewed and Run is clicked,
+        // same head-start the camera/folder photo imports already get.
+        // The pipeline's own synchronous pre-check is the real correctness
+        // guarantee either way (see backend/pipeline_runner.py _worker).
+        if (videoPath.toLowerCase().endsWith('.insv')) {
+          addLog('Starting video stitch (raw .insv → equirectangular)…');
+          api(`/api/jobs/${videoJobId}/stitch`, 'POST')
+            .then(r => addLog(r.message))
+            .catch(e => addLog(`Stitch note: ${e.message}`));
+        }
+        loadQueue();
+        return;
+      }
+    } finally {
       setCameraImportBusy(false);
-      return;
-    }
-    setCameraImportBusy(false);
-
-    addLog(`Copied ${created.imported} files (${created.skipped} skipped${created.errors ? `, ${created.errors} errors` : ''})`);
-
-    const jobId = created.processingJobId;
-    setProjectDirs(prev => ({ ...prev, [jobId]: projectDir }));
-    const entry = { docId: jobId, id: jobId, jobType: 'local_folder', name: created.name, status: 'queued' };
-    setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
-    setSelected({ id: jobId, type: 'folder', name: created.name, status: 'queued' });
-
-    const files = await api(`/api/jobs/${jobId}/files?projectDir=${encodeURIComponent(projectDir)}`);
-    setImportedFiles(prev => ({ ...prev, [jobId]: files }));
-    api('/api/project/config', 'POST', { dir: projectDir, jobId }).catch(() => {});
-    loadQueue();
-
-    // Trigger immediate .insp → equirectangular conversion in background, same as
-    // the Firestore-matched camera-import flow (onImportFromCamera) already does —
-    // this flow was missing it, leaving files sitting imported-but-unconverted.
-    const inspFiles = (files.files || []).filter(f => f.ext === '.insp');
-    if (inspFiles.length > 0) {
-      addLog(`Starting conversion of ${inspFiles.length} .insp files…`);
-      setStitchingJobId(jobId);
-      setStitchingProjectDir(projectDir);
-      api(`/api/jobs/${jobId}/stitch`, 'POST')
-        .then(r => addLog(r.message))
-        .catch(e => { addLog(`Conversion note: ${e.message}`); setStitchingJobId(null); setStitchingProjectDir(null); });
     }
   }, [api, cameraImportPending, loadQueue, setImportedFiles]);
 
@@ -3411,29 +3539,35 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   }, [api, selected]);
 
   const onAddVideoFile = useCallback(async () => {
+    addLog('Select the video file…');
+    const fileRes = await api(`/api/browse/video?initial=${encodeURIComponent(lastBrowseDir)}`);
+    if (!fileRes.path) { addLog('Cancelled.'); return; }
+
+    addLog('Select or create a project folder for this video…');
+    const dirRes = await api(`/api/browse/folder?initial=${encodeURIComponent(fileRes.path)}`);
+    if (!dirRes.path) { addLog('Cancelled.'); return; }
+    setLastBrowseDir(dirRes.path);
+
+    const defaultName = fileRes.path.split(/[\\/]/).filter(Boolean).pop()?.replace(/\.[^.]+$/, '') || 'Video Import';
+    setCameraImportPending({ kind: 'video', videoPath: fileRes.path, projectDir: dirRes.path, defaultName });
+  }, [api, lastBrowseDir]);
+
+  const onAddVideoFromCamera = useCallback(async () => {
+    // Mirrors onAddCameraFiles: pick content first (a video off the camera's
+    // mounted drive), then the project folder, same as every other import flow.
+    const camDrive = cameraStatus?.camera_drive || 'D:\\';
+    addLog(`Select a video from camera (${camDrive})…`);
+    const fileRes = await api(`/api/browse/video?initial=${encodeURIComponent(camDrive)}`);
+    if (!fileRes.path) { addLog('Cancelled.'); return; }
+
     addLog('Select or create a project folder for this video…');
     const dirRes = await api(`/api/browse/folder?initial=${encodeURIComponent(lastBrowseDir)}`);
     if (!dirRes.path) { addLog('Cancelled.'); return; }
-    const projectDir = dirRes.path;
-    setLastBrowseDir(projectDir);
+    setLastBrowseDir(dirRes.path);
 
-    addLog('Select the video file…');
-    const fileRes = await api(`/api/browse/video?initial=${encodeURIComponent(projectDir)}`);
-    if (!fileRes.path) { addLog('Cancelled.'); return; }
-
-    let created;
-    try {
-      created = await api('/api/jobs/create-video', 'POST', { projectDir, videoPath: fileRes.path });
-    } catch (e) {
-      addLog(`Could not create video project: ${e.message}`);
-      return;
-    }
-    addLog(`Video project ready: ${created.name}`);
-    const videoEntry = { docId: created.processingJobId, id: created.processingJobId, jobType: 'local_video', name: created.name, status: 'queued' };
-    setPqItems(prev => prev.some(j => (j.docId||j.id) === created.processingJobId) ? prev : [videoEntry, ...prev]);
-    setSelected({ id: created.processingJobId, type: 'video', name: created.name, status: 'queued' });
-    loadQueue();
-  }, [api, lastBrowseDir, loadQueue]);
+    const defaultName = fileRes.path.split(/[\\/]/).filter(Boolean).pop()?.replace(/\.[^.]+$/, '') || 'Video Import';
+    setCameraImportPending({ kind: 'video', videoPath: fileRes.path, projectDir: dirRes.path, defaultName });
+  }, [api, lastBrowseDir, cameraStatus]);
 
   const onSaveConfig = useCallback(async () => {
     try {
@@ -3661,6 +3795,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
             machineInfo={machineInfo}
             cameraStatus={cameraStatus} importedFiles={importedFiles} projectDirs={projectDirs} onImport={onImport}
             onAddImageFolder={onAddImageFolder} onAddCameraFiles={onAddCameraFiles} onAddVideoFile={onAddVideoFile}
+            onAddVideoFromCamera={onAddVideoFromCamera}
             importStep={importStep} importPct={importPct}
             stitching={!!stitchingJobId} stitchStep={stitchStep} stitchPct={stitchPct}
           />
@@ -3690,8 +3825,10 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
 
       <CameraImportMetaModal
         pending={cameraImportPending}
-        onConfirm={onConfirmCameraImport}
+        onConfirm={onConfirmImport}
         onCancel={() => { setCameraImportPending(null); addLog('Cancelled.'); }}
+        settings={settings}
+        setSettings={setSettings}
       />
       {cameraImportBusy && (
         <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:9999,

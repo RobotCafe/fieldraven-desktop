@@ -38,6 +38,7 @@ from .gluemap_runner import _sample_and_write_colored_recon
 
 _PYTHON_314 = "C:\\Python314\\python.exe"
 _WORKER     = str(Path(__file__).parent / "equi_sfm_worker.py")
+_TRIANGULATE_WORKER = str(Path(__file__).parent / "equi_triangulate_worker.py")
 _VISUALIZER = str(Path(__file__).parent.parent / "tools" / "visualize_cameras.py")
 _ANSI       = re.compile(r"\x1b\[[0-9;]*[mA-Za-z]")
 
@@ -118,11 +119,18 @@ def _write_sensor_sparse_txt(
     cx = image_w / 2.0
     cy = image_h / 2.0
 
-    # ── cameras.txt: one shared PINHOLE camera ─────────────────────────────
+    # ── cameras.txt: one shared SIMPLE_PINHOLE camera ──────────────────────
+    # Must be SIMPLE_PINHOLE (single shared focal length), not PINHOLE (separate
+    # fx/fy) -- every other pipeline in this codebase uses SIMPLE_PINHOLE, and
+    # visualize_cameras.py reads cam.focal_length, a convenience property that's
+    # only well-defined for a single-focal-length model. PINHOLE has two focal
+    # length param indices (fx, fy), so that property hard-asserts in COLMAP's
+    # C++ layer ("Check failed: idxs.size() == 1 (2 vs. 1)") -- confirmed by
+    # reproducing the crash directly against a real sensor_sparse_txt output.
     (sensor_dir / "cameras.txt").write_text(
         "# Camera list with one line of data per camera:\n"
         "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
-        f"1 PINHOLE {image_w} {image_h} {focal:.6f} {focal:.6f} {cx:.6f} {cy:.6f}\n",
+        f"1 SIMPLE_PINHOLE {image_w} {image_h} {focal:.6f} {cx:.6f} {cy:.6f}\n",
         encoding="utf-8",
     )
 
@@ -153,6 +161,155 @@ def _write_sensor_sparse_txt(
     for pt_id, x, y, z, r, g, b, err in pano_points:
         pt_lines.append(f"{pt_id} {x:.6f} {y:.6f} {z:.6f} {r} {g} {b} {err:.6f}\n")
     (sensor_dir / "points3D.txt").write_text("".join(pt_lines), encoding="utf-8")
+
+
+def _run_triangulate_worker(
+    equisfm_dir: Path,
+    image_dir: Path,
+    sensor_sparse_dir: Path,
+    all_poses: dict[str, tuple[np.ndarray, np.ndarray]],
+    abs_rots: list[np.ndarray],
+    focal: float,
+    image_w: int,
+    image_h: int,
+    matcher: str,
+    colmap_bin: str,
+    vocab_tree_path: str,
+    report: Callable[[PipelineStage, int, str], None],
+    stage: PipelineStage,
+    cancel_event: threading.Event,
+) -> bool:
+    """
+    Spawn equi_triangulate_worker.py to replace sensor_sparse_dir's sparse,
+    track-free point cloud with a real, densely-tracked one triangulated from
+    the actual per-sensor images -- using all_poses as the starting point.
+
+    The worker now runs a real, rig-constrained, GPU bundle adjustment pass:
+    the 13-sensor rig geometry (abs_rots) is locked exactly like colmap_worker.py
+    locks it, but each frame's overall pose is free to move to better fit the
+    real per-sensor image data -- this is a deliberate change from this
+    stage's original "poses never move at all" design, made after comparing
+    EquiSfM's fixed-pose reconstruction against a plain-COLMAP one on the same
+    data and finding real, uncorrected pose disagreement (see
+    project-equi-triangulate-worker memory). The worker's final JSON carries a
+    mandatory rig_fixed verification flag (the rig itself never moved, across
+    BA AND the write/read round trip). Only on that flag being true do we copy
+    its output over sensor_sparse_dir; any failure (crash, rig drift, missing
+    output) leaves sensor_sparse_dir exactly as _write_sensor_sparse_txt left
+    it and returns False -- the existing sparse pano-copied point cloud is
+    always a safe fallback.
+    """
+    db_path    = equisfm_dir / "triangulate_database.db"
+    output_dir = equisfm_dir / "triangulated_sparse_txt"
+
+    payload = json.dumps({
+        "database_path":   str(db_path),
+        "image_path":      str(image_dir),
+        "sparse_txt_path": str(output_dir),
+        "poses": {name: {"R": R.tolist(), "t": t.tolist()} for name, (R, t) in all_poses.items()},
+        "abs_rots": [r.tolist() for r in abs_rots],
+        "focal":   focal,
+        "image_w": image_w,
+        "image_h": image_h,
+        "matcher": matcher,
+        "colmap_bin":      colmap_bin,
+        "vocab_tree_path": vocab_tree_path,
+    })
+
+    # Windows CreateProcess limit ~32 KB; 300+ poses (R 3x3 + t each) easily
+    # exceeds it -- same fix already used by rigsfm_runner.py for the same reason.
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(payload)
+        payload_path = tf.name
+
+    proc = subprocess.Popen(
+        [_PYTHON_314, "-P", _TRIANGULATE_WORKER, f"@{payload_path}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    last_json = ""
+    _last_t = time.time()
+    while True:
+        raw = proc.stdout.readline()
+        if not raw and proc.poll() is not None:
+            break
+        if not raw:
+            continue
+        line = _ANSI.sub("", raw).rstrip()
+        if not line:
+            continue
+        print(f"  [equi_triangulate_worker] {line}", flush=True)
+
+        if line.startswith("WORKER_PROGRESS:"):
+            parts = line.split(":", 2)
+            pct = None
+            try:
+                pct = 73 + int(int(parts[1]) * 0.15)  # remap worker's 0-100 into 73..88
+            except (ValueError, IndexError):
+                pass
+            msg = parts[2] if len(parts) > 2 else line
+            if pct is not None and time.time() - _last_t >= 2.0:
+                report(stage, pct, msg)
+                _last_t = time.time()
+        elif line.startswith("{"):
+            last_json = line
+
+        if cancel_event.is_set():
+            proc.terminate()
+            return False
+
+    proc.wait()
+
+    result: dict = {}
+    try:
+        result = json.loads(last_json)
+    except Exception:
+        pass
+
+    if proc.returncode != 0 or not result.get("success"):
+        print(f"  [equisfm] Triangulation worker failed: {result.get('error', 'no result')}", flush=True)
+        return False
+
+    if not result.get("rig_fixed", False):
+        print(
+            "  [equisfm] Triangulation worker reported the RIG itself moved -- "
+            f"rot={result.get('max_rig_rot_drift')} t={result.get('max_rig_t_drift')} "
+            f"roundtrip_rot={result.get('max_rig_roundtrip_rot_drift')} "
+            f"roundtrip_t={result.get('max_rig_roundtrip_t_drift')} -- "
+            "discarding output, the 13-sensor rig geometry must never move "
+            "even though frame poses now can",
+            flush=True,
+        )
+        return False
+
+    if not output_dir.exists():
+        return False
+
+    n_pts = result.get("points3D", 0)
+    mean_reproj = result.get("reproj_mean_reproj_px")
+    pct_over_4 = result.get("reproj_pct_over_4px")
+    ba_ran = result.get("ba_ran", False)
+    frame_rot = result.get("max_frame_pose_rot_delta")
+    frame_t = result.get("max_frame_pose_t_delta")
+    report(stage, 88,
+           f"EquiSfM: triangulation glue produced {n_pts:,} points "
+           f"(mean reproj {mean_reproj}px, {pct_over_4}% over 4px), "
+           f"BA {'ran' if ba_ran else 'skipped'} "
+           f"(frame pose moved rot={frame_rot} t={frame_t})")
+
+    # The rig itself is provably unchanged (rig_fixed verified above) -- frame
+    # poses and points3D may both differ from what _write_sensor_sparse_txt
+    # wrote, since BA is now allowed to refine them.
+    for f in output_dir.iterdir():
+        shutil.copy2(str(f), str(sensor_sparse_dir / f.name))
+
+    return True
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
@@ -354,6 +511,35 @@ def run_equisfm_pipeline(
     if cancel_event.is_set():
         return
 
+    # ── 6b. Optional: real per-sensor SIFT triangulation + rig-constrained BA
+    #        ("rig glue") ──────────────────────────────────────────────────
+    # The 312 poses above are the starting point, not untouchable: this step
+    # adds real 3D structure from the actual per-sensor images, then runs a
+    # rig-constrained GPU bundle adjustment (13-sensor rig geometry locked,
+    # exactly like colmap_worker.py locks it) so each frame's overall pose can
+    # self-correct against the real image data -- see equi_triangulate_worker.py's
+    # rig_fixed verification gate for the actual hard safety boundary (the rig
+    # itself, not individual poses). Off by default until validated on real
+    # jobs (equisfm_triangulate setting).
+    if getattr(settings, "equisfm_triangulate", False):
+        report(stage, 73, "EquiSfM: triangulating + rig-constrained BA (rig fixed, frame poses free)…")
+        tri_ok = _run_triangulate_worker(
+            equisfm_dir, image_dir, sensor_sparse_dir, all_poses, abs_rots,
+            focal, iw, ih, getattr(settings, "equisfm_matcher", "sequential"),
+            getattr(settings, "colmap_bin", "") or "",
+            getattr(settings, "colmap_vocab_tree", "") or "",
+            report, stage, cancel_event,
+        )
+        if not tri_ok:
+            print(
+                "  [equisfm] Triangulation glue failed or didn't pass verification -- "
+                "keeping sparse pano-copied point cloud instead",
+                flush=True,
+            )
+
+    if cancel_event.is_set():
+        return
+
     # ── 7. Build brush_input/ ──────────────────────────────────────────────
     report(stage, 90, "EquiSfM: copying reconstruction → brush_input/…")
     if brush_input_dir.exists():
@@ -378,11 +564,16 @@ def run_equisfm_pipeline(
         print(f"  [equisfm] Color sampling failed ({_ce}) — using pano colors", flush=True)
 
     # ── 8. Open visualizer ─────────────────────────────────────────────────
+    # Read from brush_input_dir, not sensor_sparse_dir: color-sampling (step 7)
+    # writes its colored points3D.txt into brush_input_dir only -- sensor_sparse_dir
+    # still has whatever it had before that call (all-black points if the
+    # triangulation glue ran, since IncrementalTriangulator never sets color).
     _viz_html = equisfm_dir / "cameras.html"
-    if Path(_VISUALIZER).exists() and sensor_sparse_dir.exists():
+    _viz_source_dir = brush_input_dir if brush_input_dir.exists() else sensor_sparse_dir
+    if Path(_VISUALIZER).exists() and _viz_source_dir.exists():
         anchor_sensor = "pano_camera0"
         subprocess.run(
-            [_PYTHON_314, _VISUALIZER, str(sensor_sparse_dir), str(_viz_html),
+            [_PYTHON_314, _VISUALIZER, str(_viz_source_dir), str(_viz_html),
              "0", "0", anchor_sensor, str(image_dir)],
             check=False,
         )

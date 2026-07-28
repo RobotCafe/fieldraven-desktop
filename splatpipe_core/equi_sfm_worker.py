@@ -95,7 +95,7 @@ def main():
     # Export per-pano cam_from_world poses for the runner (plain serialisable dicts)
     poses: dict = {}
     for img in best.images.values():
-        cfw = img.cam_from_world
+        cfw = img.cam_from_world()  # method in pycolmap 4.1.0, not a property
         R = cfw.rotation.matrix()
         t = cfw.translation
         poses[img.name] = {

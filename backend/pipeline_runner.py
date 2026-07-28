@@ -22,6 +22,7 @@ INSP_EXT    = {'.insp'}
 # Insta360 Media SDK — needed at runtime by insp_stitch.exe
 _SDK_BIN = Path("C:/Users/DenmanNic/Projects/Windows_CameraSDK-2.1.1_MediaSDK-3.1.3/MediaSDK-3.1.3-20260128-win64_1769600100370/MediaSDK-3.1.3-20260128-win64/MediaSDK/bin")
 _INSP_STITCH_EXE = Path(__file__).resolve().parent.parent / "tools" / "insp_stitch.exe"
+_INSV_STITCH_EXE = Path(__file__).resolve().parent.parent / "tools" / "insv_stitch.exe"
 
 # Maps pipeline stage → (low%, high%) of overall 0-100 progress
 # Two variants: with and without a preceding stitch step
@@ -222,6 +223,13 @@ def _find_primary_input(job_id: str, job_data: Optional[dict] = None) -> Optiona
     files = sorted(input_dir.iterdir())
     for f in files:
         if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
+            if f.suffix.lower() == ".insv":
+                # Raw .insv is dual-fisheye, not equirectangular -- prefer the
+                # stitched output (_stitch_insv_files) if it already exists so
+                # frame extraction never runs against unstitched footage.
+                stitched = input_dir / (f.stem + "_equirect.mp4")
+                if stitched.exists():
+                    return str(stitched)
             return str(f)
     if any(f.is_file() and f.suffix.lower() in IMAGE_EXTS for f in files):
         return str(input_dir)
@@ -385,6 +393,7 @@ def _build_settings(job_data: dict):
         if "rigsfm_quad_anchors" in ui:        s.rigsfm_quad_anchors        = _to_bool(ui["rigsfm_quad_anchors"])
         if "run_equisfm" in ui:                s.run_equisfm                = _to_bool(ui["run_equisfm"])
         if "equisfm_matcher" in ui:            s.equisfm_matcher            = ui["equisfm_matcher"]
+        if "equisfm_triangulate" in ui:        s.equisfm_triangulate        = _to_bool(ui["equisfm_triangulate"])
         if "colmap_image_width" in ui:         s.colmap_image_width         = int(float(ui["colmap_image_width"]))
         if "yaw_steps" in ui:         s.yaw_steps         = int(ui["yaw_steps"])
         if "fov" in ui:               s.fov               = float(ui["fov"])
@@ -531,6 +540,99 @@ def _stitch_insp_files(job_id: str, cancel_event: threading.Event, job_data: Opt
     return ok[0]
 
 
+def _stitch_insv_files(job_id: str, cancel_event: threading.Event, job_data: Optional[dict] = None) -> int:
+    """Convert any raw (unstitched) .insv videos in the job input dir to
+    equirectangular .mp4 files, so frame extraction (ffmpeg) always runs
+    against already-stitched footage exactly like it does for images.
+    Output lands alongside the source as '{stem}_equirect.mp4'; the raw
+    .insv is left in place (matching the .insp -> .jpg convention) and
+    _find_primary_input() prefers the stitched output once it exists.
+    Returns number of files successfully stitched."""
+    input_dir = _input_dir(_job_root(job_id, job_data))
+    insv_files = sorted(input_dir.glob("*.insv"))
+    if not insv_files:
+        return 0
+
+    if not _INSV_STITCH_EXE.exists():
+        raise FileNotFoundError(f"insv_stitch.exe not found at {_INSV_STITCH_EXE}. Run tools/build_insv_stitch.bat first.")
+
+    env = os.environ.copy()
+    env["PATH"] = str(_SDK_BIN) + ";" + env.get("PATH", "")
+
+    from . import splat_config
+    cfg = splat_config.load()
+    extra_args: list[str] = []
+
+    out_w_str = cfg.get("insp_output_width", "")
+    if out_w_str:
+        try:
+            w = int(out_w_str)
+            extra_args += ["--width", str(w), "--height", str(w // 2)]
+        except ValueError:
+            pass
+
+    stitch_type = cfg.get("insp_stitch_type", "template")
+    if stitch_type and stitch_type != "template":
+        extra_args += ["--stitch-type", stitch_type]
+    lens_guard = cfg.get("insp_lens_guard", "none")
+    if lens_guard and lens_guard != "none":
+        extra_args += ["--lens-guard", lens_guard]
+    if _to_bool(cfg.get("insp_flowstate", "false")):
+        extra_args.append("--flowstate")
+    use_cuda = _to_bool(cfg.get("insp_cuda", "false"))
+    if use_cuda:
+        extra_args.append("--cuda")
+
+    to_stitch = [f for f in insv_files if not (input_dir / (f.stem + "_equirect.mp4")).exists()]
+    already_done = len(insv_files) - len(to_stitch)
+    print(f"ℹ️  Video stitch: {len(insv_files)} file(s), {len(to_stitch)} to convert, cuda={use_cuda}, args={extra_args}")
+
+    ok = already_done
+    for insv in to_stitch:
+        if cancel_event.is_set():
+            break
+        out_mp4 = input_dir / (insv.stem + "_equirect.mp4")
+        queue_manager.update_job_progress(job_id, 3, f"Stitching video {insv.name}…")
+
+        proc = subprocess.Popen(
+            [str(_INSV_STITCH_EXE), str(insv), str(out_mp4)] + extra_args,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env,
+        )
+        last_pct = -1
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith("PROGRESS:"):
+                try:
+                    pct = int(line.split(":", 1)[1])
+                except ValueError:
+                    pct = None
+                if pct is not None and pct != last_pct:
+                    last_pct = pct
+                    # Video stitching is one long-running file, not many quick
+                    # ones -- map its own 0-100 into the same 3-45 band
+                    # _stitch_insp_files uses for its per-file counting.
+                    queue_manager.update_job_progress(
+                        job_id, int(3 + pct * 0.42), f"Stitching {insv.name}: {pct}%"
+                    )
+            else:
+                print(f"  [{insv.name}] {line}")
+            if cancel_event.is_set():
+                proc.terminate()
+                break
+        proc.wait()
+
+        if proc.returncode == 0 and out_mp4.exists():
+            print(f"✅ Stitched video: {insv.name}")
+            ok += 1
+        else:
+            print(f"⚠️ Video stitch failed: {insv.name}")
+
+    return ok
+
+
 # ── Worker thread ─────────────────────────────────────────────
 
 def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
@@ -593,6 +695,26 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             queue_manager.update_job_progress(job_id, 45, f"Stitched {stitched}/{insp_count} files", milestone=True)
             proj_root = _job_root(job_id, job_data)
             _write_stage_progress(proj_root, "import", {"stitched": stitched, "total": insp_count})
+
+        # Stitch any raw .insv videos to equirectangular .mp4 before the
+        # pipeline runs -- frame extraction assumes its input is already
+        # equirectangular (it only crops panorama -> perspective views, it
+        # never un-fisheyes anything), so this must happen before
+        # _find_primary_input() / run_pipeline() regardless of whether the
+        # frontend's own immediate-post-import stitch trigger already ran.
+        insv_count = len(list(input_dir.glob("*.insv"))) if input_dir.exists() else 0
+        if insv_count:
+            queue_manager.update_job_progress(job_id, 3, f"Found {insv_count} Insta360 video(s) — stitching…", milestone=True)
+            stitched_v = _stitch_insv_files(job_id, cancel_event, job_data)
+            if cancel_event.is_set():
+                queue_manager.fail_job(job_id, "Cancelled by user")
+                return
+            if stitched_v == 0:
+                queue_manager.fail_job(job_id, "Video stitch step produced no output — check MediaSDK setup")
+                return
+            queue_manager.update_job_progress(job_id, 45, f"Stitched {stitched_v}/{insv_count} video(s)", milestone=True)
+            proj_root = _job_root(job_id, job_data)
+            _write_stage_progress(proj_root, "import", {"stitched": stitched_v, "total": insv_count})
 
         # ── Storage download (web-queued jobs only) ──────────────
         storage_prefix = job_data.get('storageInputPath')

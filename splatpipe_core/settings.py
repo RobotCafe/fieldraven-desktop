@@ -90,6 +90,7 @@ class PipelineSettings:
     # ── EquiSfM ──────────────────────────────────────────────────
     run_equisfm: bool = False
     equisfm_matcher: str = "sequential"   # "sequential" | "exhaustive"
+    equisfm_triangulate: bool = False     # real per-sensor SIFT triangulation glue (poses stay fixed); off until validated on real jobs
 
     # ── GlueMap ──────────────────────────────────────────────────
     run_gluemap: bool = False
