@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import LensCalibrationTab from "./LensCalibrationTab";
+import { calibratorApi } from "./calibratorApi";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
@@ -27,9 +29,12 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel, settings, setSett
   const [siteTime, setSiteTime] = useState(nowTime);
   const [pickedLat, setPickedLat] = useState(null);
   const [pickedLon, setPickedLon] = useState(null);
+  const [importMode, setImportMode] = useState('copy');
   const handlePick = useCallback((la, lo) => { setPickedLat(la); setPickedLon(lo); }, []);
   useEffect(() => { setName(pending?.defaultName || ''); }, [pending?.defaultName]);
+  useEffect(() => { setImportMode('copy'); }, [pending]);
   if (!pending) return null;
+  const showImportMode = pending.kind === 'folder' || (pending.kind === 'video' && !pending.viaCamera);
   const inp = { background: T.void, border: `1px solid ${T.border}`, borderRadius: 4,
     color: T.textPri, caretColor: T.textPri, colorScheme: 'dark',
     padding: '5px 8px', fontSize: 12, width: '100%', boxSizing: 'border-box', outline: 'none' };
@@ -47,6 +52,38 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel, settings, setSett
               : `${pending.filePaths.length} file${pending.filePaths.length === 1 ? '' : 's'}`}
           {' · '}{pending.projectDir}
         </div>
+
+        {showImportMode && (
+          <div style={{ display:'flex', flexDirection:'column', gap:6,
+            background:T.void, border:`1px solid ${T.border}`, borderRadius:4, padding:10 }}>
+            <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>
+              Import Mode
+            </label>
+            <label style={{ display:'flex', alignItems:'flex-start', gap:8, cursor:'pointer' }}>
+              <input type="radio" checked={importMode === 'copy'}
+                onChange={() => setImportMode('copy')} style={{ marginTop:3 }} />
+              <span style={{ fontSize:11, color:T.textPri }}>
+                Copy into project folder
+                <span style={{ color:T.textDim }}> — recommended, safe, portable</span>
+              </span>
+            </label>
+            <label style={{ display:'flex', alignItems:'flex-start', gap:8, cursor:'pointer' }}>
+              <input type="radio" checked={importMode === 'reference'}
+                onChange={() => setImportMode('reference')} style={{ marginTop:3 }} />
+              <span style={{ fontSize:11, color:T.textPri }}>
+                Reference in original location
+                <span style={{ color:T.textDim }}> — no duplication, saves disk space and time</span>
+              </span>
+            </label>
+            {importMode === 'reference' && (
+              <div style={{ fontSize:10, color:T.amber }}>
+                ⚠ The source {pending.kind === 'folder' ? 'folder' : 'file'} must stay in its
+                current location — unmoved, unrenamed, undeleted — until this project is finished.
+                Moving it will break processing.
+              </div>
+            )}
+          </div>
+        )}
 
         <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
           <label style={{ fontSize:10, color:T.textDim, textTransform:'uppercase', letterSpacing:1 }}>Job Name *</label>
@@ -107,6 +144,7 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel, settings, setSett
               </select>
               <select style={{ ...inp, flex:1 }} value={settings.inspOutputWidth}
                 onChange={e=>setSettings(s=>({...s,inspOutputWidth:e.target.value}))}>
+                <option value="">Source (no upscale)</option>
                 <option value="11968">12K (slowest)</option>
                 <option value="5984">6K</option>
                 <option value="3840">4K</option>
@@ -153,14 +191,50 @@ function CameraImportMetaModal({ pending, onConfirm, onCancel, settings, setSett
               borderRadius:4, padding:'6px 14px', cursor:'pointer', fontSize:12 }}>
             Cancel
           </button>
-          <button onClick={()=>onConfirm({ name: name.trim() || pending.defaultName, location, notes, siteDate, siteTime, lat: pickedLat, lon: pickedLon })}
+          <button onClick={()=>onConfirm({ name: name.trim() || pending.defaultName, location, notes, siteDate, siteTime, lat: pickedLat, lon: pickedLon, importMode })}
             disabled={!name.trim()}
             style={{ background:T.amber, border:'none', color:'#000', borderRadius:4,
               padding:'6px 14px', cursor:'pointer', fontSize:12, fontWeight:700,
               opacity: name.trim() ? 1 : 0.4 }}>
-            Copy & Queue
+            {showImportMode && importMode === 'reference' ? 'Reference & Queue' : 'Copy & Queue'}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ProgressToast({ visible, title, doneTitle, step, pct, done, footerRunning, footerDone, onDismiss }) {
+  if (!visible) return null;
+  const pctDisplay = Math.max(0, Math.min(100, Math.round(pct)));
+  return (
+    <div style={{ position:'fixed', bottom:36, left:'50%', transform:'translateX(-50%)', zIndex:9998,
+      width:340, background:T.surface, border:`1px solid ${T.borderHi}`, borderRadius:8,
+      padding:16, display:'flex', flexDirection:'column', gap:10,
+      boxShadow:'0 8px 24px rgba(0,0,0,0.4)' }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <div style={{ fontSize:12, fontWeight:700, color:T.info }}>
+          {done ? doneTitle : title}
+        </div>
+        <button onClick={onDismiss} title="Dismiss (keeps running in the background)"
+          style={{ background:'none', border:'none', color:T.textDim, cursor:'pointer',
+            fontSize:14, lineHeight:1, padding:2 }}>
+          ✕
+        </button>
+      </div>
+      <div style={{ fontSize:10, color:T.textDim, fontFamily:'monospace',
+        overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+        {step || 'Initialising…'}
+      </div>
+      <div style={{ height:4, background:T.border, borderRadius:2 }}>
+        <div style={{ height:'100%', background: done ? T.live : T.info, borderRadius:2,
+          width:`${pctDisplay}%`, transition:'width .5s' }} />
+      </div>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <span style={{ fontSize:10, color:T.textDim }}>
+          {done ? footerDone : footerRunning}
+        </span>
+        <span style={{ fontSize:10, color:T.info, fontFamily:'monospace' }}>{pctDisplay}%</span>
       </div>
     </div>
   );
@@ -271,6 +345,45 @@ function Btn({ children, onClick, disabled, variant="primary", small, full, styl
 function Label({ children, color, style={} }) {
   return <span style={{ fontSize:10, fontWeight:700, letterSpacing:".6px",
     textTransform:"uppercase", color: color||T.textDim, ...style }}>{children}</span>;
+}
+
+// Browsers cap concurrent HTTP/1.1 connections per origin at ~6. The extraction
+// gallery can render hundreds of on-demand preview-frame thumbnails (each a live
+// ffmpeg decode, not instant) at once; left unthrottled they saturate every
+// connection slot for as long as extraction is running, so the tiny but critical
+// /status polling fetch (driving the progress toast) gets queued behind them
+// indefinitely and never actually reaches the server. Capping how many thumbnail
+// requests are in flight at once leaves headroom for that poll to get through.
+const _thumbQueue = { active: 0, pending: [] };
+const _THUMB_MAX_CONCURRENT = 3;
+function _thumbRelease() {
+  _thumbQueue.active--;
+  const next = _thumbQueue.pending.shift();
+  if (next) { _thumbQueue.active++; next(); }
+}
+function _thumbAcquire(cb) {
+  if (_thumbQueue.active < _THUMB_MAX_CONCURRENT) { _thumbQueue.active++; cb(); }
+  else _thumbQueue.pending.push(cb);
+}
+
+function ThrottledImg({ src, alt, style }) {
+  const [ready, setReady] = useState(false);
+  const releasedRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    releasedRef.current = false;
+    setReady(false);
+    _thumbAcquire(() => { if (!cancelled) setReady(true); });
+    return () => {
+      cancelled = true;
+      if (!releasedRef.current) { releasedRef.current = true; _thumbRelease(); }
+    };
+  }, [src]);
+  const handleDone = () => {
+    if (!releasedRef.current) { releasedRef.current = true; _thumbRelease(); }
+  };
+  if (!ready) return <div style={style} />;
+  return <img src={src} alt={alt} style={style} loading="lazy" onLoad={handleDone} onError={handleDone} />;
 }
 
 function FieldRow({ label, children, hint }) {
@@ -429,10 +542,11 @@ const API_TO_UI = {
   vggt_show_camera:'vggtShowCam', vggt_temporal_sequencing:'vggtTemporal',
   vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
   export_xmp:'exportXmp', gps_priors_rs:'gpsTriggersRS', gps_priors_colmap:'gpsPriorsColmap',
-  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign', colmap_mapper:'colmapMapper', colmap_vocab_tree:'colmapVocabTree',
+  run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign', colmap_mapper:'colmapMapper', colmap_vocab_tree:'colmapVocabTree', colmap_vocab_tree_enabled:'colmapVocabTreeEnabled',
+  run_colmap_fisheye:'runColmapFisheye', colmap_fisheye_matcher:'colmapFisheyeMatcher', colmap_fisheye_front_profile:'colmapFisheyeFrontProfile', colmap_fisheye_back_profile:'colmapFisheyeBackProfile', colmap_fisheye_raw_dir:'colmapFisheyeRawDir',
   run_gluemap:'runGluemap', gluemap_backbone:'glueMapBackbone', gluemap_skip_doppelgangers:'glueMapSkipDg', gluemap_coarse_only:'glueMapCoarseOnly', gluemap_is_sequential:'glueMapSequential', gluemap_num_neighbors:'glueMapNeighbors', gluemap_batch_size:'glueMapBatchSize', gluemap_num_track_per_img:'glueMapNumTrack', gluemap_wsl_home:'glueMapWslHome', gluemap_wsl_distro:'glueMapWslDistro',
   run_rigsfm:'runRigsfm', rigsfm_anchor_sensor:'rigsfmAnchorSensor', rigsfm_quad_anchors:'rigsfmQuadAnchors', rigsfm_matcher:'rigsfmMatcher',
-  run_equisfm:'runEquisfm', equisfm_matcher:'equisfmMatcher', equisfm_triangulate:'equisfmTriangulate',
+  run_equisfm:'runEquisfm', equisfm_matcher:'equisfmMatcher', equisfm_mapper:'equisfmMapper', equisfm_triangulate:'equisfmTriangulate', equisfm_mvs:'equisfmMvs',
   postshot_profile:'postshotProfile', postshot_max_image_size:'postshotMaxSize',
   postshot_train_steps:'postshotSteps', postshot_max_splats:'postshotMaxSplats',
   postshot_anti_aliasing:'postshotAA', postshot_show_train_error:'postshotError',
@@ -461,8 +575,9 @@ const STRING_SETTINGS = new Set(['pitchAngles', 'vggtMode', 'postshotProfile',
   'brush', 'rsSettings', 'vggt', 'colmapBin', 'inspStitchType', 'inspLensGuard',
   'inspOutputWidth', 'inspWorkers', 'colmapMode', 'colmapMatcher',
   'colmapMapper', 'colmapVocabTree',
+  'colmapFisheyeMatcher', 'colmapFisheyeFrontProfile', 'colmapFisheyeBackProfile', 'colmapFisheyeRawDir',
   'glueMapBackbone', 'glueMapWslHome', 'glueMapWslDistro',
-  'rigsfmMatcher', 'equisfmMatcher']);
+  'rigsfmMatcher', 'equisfmMatcher', 'equisfmMapper']);
 
 function apiConfigToSettings(cfg) {
   const out = {};
@@ -877,8 +992,26 @@ function fmtTs(secs) {
 }
 
 function ExtractionTab({ selected, settings, setSettings, cameraStatus, importedFiles, projectDirs, onImport,
-  importStep, importPct, stitching, stitchStep, stitchPct, canvasH, setCanvasH }) {
-  const [frames, setFrames]           = useState([]);
+  importStep, importPct, stitching, stitchStep, stitchPct, canvasH, setCanvasH,
+  extractedFrames, setExtractedFrames, realFrames, refreshRealFrames, onExtractFrames }) {
+  // Lifted to App so switching pipeline sub-tabs (which unmounts this component)
+  // doesn't throw away the already-computed frame preview for this job.
+  const frames = extractedFrames[selected?.id] || [];
+  const setFrames = (val) => {
+    if (!selected?.id) return;
+    setExtractedFrames(prev => ({ ...prev, [selected.id]: val }));
+  };
+  // Real files already written to 01_frames/ (by /extract-frames or a real
+  // pipeline run) -- takes priority over the client-only timestamp preview
+  // above once populated, since it reflects what's actually on disk.
+  const realFrameFiles = realFrames?.[selected?.id] || [];
+  const hasRealFrames = realFrameFiles.length > 0;
+  // Real frames (once extracted) drive the gallery/nav by their own count --
+  // real extraction samples at a uniform rate server-side and may legitimately
+  // produce a different frame count than the client-computed timestamp preview,
+  // so every control that steps through "frames" needs to agree on this count
+  // rather than some using the real count and others the client-preview count.
+  const galleryCount = hasRealFrames ? realFrameFiles.length : frames.length;
   const [currentFrame, setCurrentFrame] = useState(0);
   const [importing, setImporting]     = useState(false);
   const [importError, setImportError] = useState(null);
@@ -965,27 +1098,42 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
   // through to the extracted-frames preview below.
   const jobFiles  = isFolder ? (importedFiles[selected?.id] || null) : null;
   const hasFiles  = jobFiles && jobFiles.total > 0;
-  const projectDir = isFolder ? (projectDirs?.[selected?.id] || null) : null;
+  const projectDir = (isFolder || isVideo) ? (projectDirs?.[selected?.id] || null) : null;
 
   // Camera availability
   const camConnected = cameraStatus?.camera_connected;
   const camDrive     = cameraStatus?.camera_drive;
   const camCount     = cameraStatus?.file_count ?? 0;
 
-  // Reset gallery when selection changes
+  // Reset per-selection UI state when selection changes. Frames themselves are
+  // NOT reset here -- they're looked up per-job from the lifted extractedFrames
+  // map above, so switching selection naturally shows that job's own cached
+  // preview (or empty if it was never computed) without erasing anything.
   useEffect(() => {
-    setFrames([]); setCurrentFrame(0); setImportError(null); setSelectedFile(null);
+    setCurrentFrame(0); setImportError(null); setSelectedFile(null);
     setVideoInfo(null); setPreviewTs(0); setDebouncedTs(0);
   }, [selected?.id]);
 
-  // Fetch video metadata when a video job is selected
+  // Fetch video metadata when a video job is selected. Passes projectDir so this
+  // works even if the job's Firestore doc has no videoFile yet (e.g. right after
+  // reopening a project whose job was previously deleted) -- otherwise this races
+  // the project-config autosave that would otherwise backfill it server-side.
   useEffect(() => {
     if (!isVideo || !selected?.id) return;
-    fetch(`/api/jobs/${selected.id}/video-info`)
+    const q = projectDir ? `?projectDir=${encodeURIComponent(projectDir)}` : '';
+    fetch(`/api/jobs/${selected.id}/video-info${q}`)
       .then(r => r.ok ? r.json() : null)
       .then(info => { if (info?.duration) setVideoInfo(info); })
       .catch(() => {});
-  }, [isVideo, selected?.id]);
+  }, [isVideo, selected?.id, projectDir]);
+
+  // Check for already-extracted real frames when a video job is selected --
+  // so a job extracted earlier (this session or a prior one) shows its real
+  // gallery immediately, with no click needed and nothing re-extracted.
+  useEffect(() => {
+    if (!isVideo || !selected?.id || !refreshRealFrames) return;
+    refreshRealFrames(selected.id, projectDir);
+  }, [isVideo, selected?.id, projectDir, refreshRealFrames]);
 
   // Debounce the preview timestamp (300ms) so rapid scrubbing doesn't hammer ffmpeg
   useEffect(() => {
@@ -1003,9 +1151,13 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
     ? `/api/jobs/${selected.id}/input/${encodeURIComponent(currentFileName)}?projectDir=${encodeURIComponent(projectDir || '')}`
     : null;
 
-  // Video: URL for the debounced preview frame (avoids ffmpeg spam during scrubbing)
+  // Video: URL for the current preview frame. Once real frames exist, show the
+  // actual extracted frame (exact, cached on disk) instead of a live ffmpeg
+  // decode at an approximated timestamp.
   const videoPreviewUrl = (isVideo && selected?.id && videoInfo)
-    ? `/api/jobs/${selected.id}/preview-frame?timestamp=${debouncedTs.toFixed(3)}`
+    ? (hasRealFrames && realFrameFiles[currentFrame]
+        ? `/api/jobs/${selected.id}/frames/${encodeURIComponent(realFrameFiles[currentFrame])}?projectDir=${encodeURIComponent(projectDir || '')}`
+        : `/api/jobs/${selected.id}/preview-frame?timestamp=${debouncedTs.toFixed(3)}&projectDir=${encodeURIComponent(projectDir || '')}`)
     : null;
   const activePreviewUrl = isVideo ? videoPreviewUrl : currentPreviewUrl;
 
@@ -1167,10 +1319,16 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
   // Navigate to a specific frame index (updates both frame index and scrubber for video)
   const navFrame = (idx) => {
-    const clamped = Math.max(0, Math.min((frames.length||1) - 1, idx));
+    const clamped = Math.max(0, Math.min((galleryCount||1) - 1, idx));
     setCurrentFrame(clamped);
-    if (isVideo && frames.length > 0) {
-      const ts = frames[clamped];
+    if (isVideo && galleryCount > 0) {
+      // Real frames don't carry their own timestamp back from the server --
+      // approximate one from uniform sampling so the time label stays sensible;
+      // the canvas itself uses the exact real frame image (see videoPreviewUrl),
+      // this ts is display-only in that case.
+      const ts = hasRealFrames
+        ? (galleryCount > 1 ? (clamped / (galleryCount - 1)) * (videoInfo?.duration || 0) : 0)
+        : frames[clamped];
       setPreviewTs(ts);
       setDebouncedTs(ts);
     }
@@ -1198,6 +1356,10 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
       setFrames(timestamps);
       setCurrentFrame(0);
       if (timestamps.length > 0) { setPreviewTs(timestamps[0]); setDebouncedTs(timestamps[0]); }
+      // Instant client-side preview above; real extraction into 01_frames/
+      // happens in the background (idempotent -- cheap no-op if this exact
+      // source+settings combo was already extracted).
+      if (onExtractFrames) onExtractFrames(selected.id, projectDir);
       return;
     }
     const count = parseInt(settings.frameCount)||30;
@@ -1269,30 +1431,39 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
       );
     }
     if (isVideo) {
-      if (frames.length === 0) return (
+      if (frames.length === 0 && !hasRealFrames) return (
         <div style={{ color:T.textDim, fontSize:11, textAlign:"center", padding:20 }}>
           {videoInfo ? 'Click "Extract Frames" to populate frame list' : 'Loading video…'}
         </div>
       );
+      // Real thumbnails are cheap (disk + cache), so no throttling needed for them.
       return (
         <div style={{ display:"flex", flexWrap:"wrap", gap:3 }}>
-          {frames.map((ts, i) => {
+          {Array.from({ length: galleryCount }, (_, i) => {
             const isActive = i === currentFrame;
-            const thumbUrl = selected?.id
-              ? `/api/jobs/${selected.id}/preview-frame?timestamp=${ts.toFixed(3)}`
-              : null;
+            const ts = hasRealFrames
+              ? (galleryCount > 1 ? (i / (galleryCount - 1)) * (videoInfo?.duration || 0) : 0)
+              : frames[i];
+            const thumbUrl = !selected?.id ? null
+              : hasRealFrames
+                ? `/api/jobs/${selected.id}/frames/${realFrameFiles[i]}?thumb=true&projectDir=${encodeURIComponent(projectDir || '')}`
+                : `/api/jobs/${selected.id}/preview-frame?timestamp=${ts.toFixed(3)}&projectDir=${encodeURIComponent(projectDir || '')}`;
             return (
               <div key={i} onClick={() => navFrame(i)}
                 style={{ width:72, height:40, borderRadius:2, background:T.surfaceEl,
                   border:`2px solid ${isActive ? T.vidColor : T.border}`,
                   overflow:'hidden', position:'relative', flexShrink:0,
                   cursor:"pointer", boxSizing:'border-box', transition:'border-color .1s' }}>
-                {thumbUrl && (
+                {thumbUrl && (hasRealFrames ? (
                   <img src={thumbUrl} alt={`frame ${i+1}`}
                     style={{ width:'100%', height:'100%', objectFit:'cover', display:'block' }}
                     loading="lazy"
                   />
-                )}
+                ) : (
+                  <ThrottledImg src={thumbUrl} alt={`frame ${i+1}`}
+                    style={{ width:'100%', height:'100%', objectFit:'cover', display:'block' }}
+                  />
+                ))}
                 <div style={{ position:'absolute', bottom:1, left:2, fontSize:8,
                   color: isActive ? T.vidColor : T.textDim, fontFamily:'monospace',
                   textShadow:'0 0 3px #000' }}>
@@ -1537,6 +1708,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
               onChange={e=>setSettings(s=>({...s,inspOutputWidth:e.target.value}))}
               style={{ width:"100%", background:T.void, border:`1px solid ${T.border}`,
                 borderRadius:3, padding:"5px 8px", color:T.textPri, fontSize:12, fontFamily:"inherit" }}>
+              <option value="">Source (no upscale)</option>
               <option value="11968">12K — native (slowest)</option>
               <option value="5984">6K — half res (fast)</option>
               <option value="3840">4K (faster)</option>
@@ -1558,7 +1730,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
 
         <Accordion title="Frame Extraction"
           accent={isFolder ? T.textDim : T.amber}
-          defaultOpen={!isFolder}>
+          defaultOpen={true}>
           {isFolder ? (
             <div style={{ fontSize:11, color:T.textDim, fontStyle:"italic" }}>
               {isFR
@@ -1567,7 +1739,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
             </div>
           ) : <>
             <FieldRow label="Method">
-              <div style={{ display:"flex", gap:12 }}>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:"4px 12px" }}>
                 <Radio value="interval" checked={settings.extractionMethod==="interval"}
                   onChange={v=>setSettings(s=>({...s,extractionMethod:v}))} label="Interval" />
                 <Radio value="count" checked={settings.extractionMethod==="count"}
@@ -1580,7 +1752,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
                   onChange={v=>setSettings(s=>({...s,intervalValue:v}))} />
               </FieldRow>
               <FieldRow label="Unit">
-                <div style={{ display:"flex", gap:12 }}>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:"4px 12px" }}>
                   <Radio value="seconds" checked={settings.intervalUnit==="seconds"}
                     onChange={v=>setSettings(s=>({...s,intervalUnit:v}))} label="Seconds" />
                   <Radio value="frames" checked={settings.intervalUnit==="frames"}
@@ -1594,7 +1766,7 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
               </FieldRow>
             }
             <FieldRow label="Format">
-              <div style={{ display:"flex", gap:12 }}>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:"4px 12px" }}>
                 <Radio value="jpg" checked={settings.frameFormat==="jpg"}
                   onChange={v=>setSettings(s=>({...s,frameFormat:v}))} label="JPEG" />
                 <Radio value="png" checked={settings.frameFormat==="png"}
@@ -1682,25 +1854,25 @@ function ExtractionTab({ selected, settings, setSettings, cameraStatus, imported
                       <span>{fmtTs(previewTs)}</span>
                       <span>{fmtTs(videoInfo.duration)} · {Math.round(videoInfo.fps||30)} fps</span>
                     </div>
-                    {frames.length > 0 && <>
+                    {galleryCount > 0 && <>
                       <div style={{ borderTop:`1px solid ${T.border}`, margin:"8px 0" }} />
                       <div style={{ fontSize:10, color:T.textDim, marginBottom:4,
                         textTransform:"uppercase", letterSpacing:.5 }}>
-                        Extracted frames ({frames.length})
+                        {hasRealFrames ? `Extracted frames (${galleryCount})` : `Preview frames (${galleryCount})`}
                       </div>
                       <div style={{ display:"flex", gap:3, justifyContent:"center", marginBottom:8 }}>
                         {[["⏮",()=>navFrame(0)],["◀",()=>navFrame(currentFrame-1)],
-                          ["▶",()=>navFrame(currentFrame+1)],["⏭",()=>navFrame(frames.length-1)]]
+                          ["▶",()=>navFrame(currentFrame+1)],["⏭",()=>navFrame(galleryCount-1)]]
                           .map(([icon,fn],i)=>(
                           <Btn key={i} small variant="ghost" onClick={fn}>{icon}</Btn>
                         ))}
                       </div>
-                      <input type="range" min={0} max={frames.length-1} value={currentFrame}
+                      <input type="range" min={0} max={galleryCount-1} value={currentFrame}
                         onChange={e => navFrame(+e.target.value)}
                         style={{ width:"100%", accentColor:T.amber }} />
                       <div style={{ textAlign:"center", fontSize:10, color:T.textDim, marginTop:3,
                         fontFamily:"monospace" }}>
-                        {currentFrame+1} / {frames.length} · {fmtTs(frames[currentFrame] ?? 0)}
+                        {currentFrame+1} / {galleryCount} · {fmtTs(previewTs)}
                       </div>
                     </>}
                   </>
@@ -1844,8 +2016,15 @@ function buildRigSensorOptions(pitchAnglesStr, yawSteps, horizonRef) {
 function AlignmentTab({ settings, setSettings, selected, importedFiles, projectDirs }) {
   const { runPostshot, runBrush } = settings;
 
+  // Saved lens calibration profiles — fetched lazily, used by COLMAP Fisheye mode
+  const [calibProfiles, setCalibProfiles] = useState([]);
+  useEffect(() => {
+    calibratorApi.listProfiles().then(r => setCalibProfiles(r.profiles || [])).catch(() => {});
+  }, []);
+
   // Derive a single active mode from the underlying flags
   const mode = settings.runColmap   ? 'colmap'
+             : settings.runColmapFisheye ? 'colmap_fisheye'
              : settings.runGluemap  ? 'gluemap'
              : settings.runRigsfm   ? 'rigsfm'
              : settings.runEquisfm  ? 'equisfm'
@@ -1858,6 +2037,7 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
     skipRS:      m !== 'rs',
     runVggt:     m === 'vggt',
     runColmap:   m === 'colmap',
+    runColmapFisheye: m === 'colmap_fisheye',
     runGluemap:  m === 'gluemap',
     runRigsfm:   m === 'rigsfm',
     runEquisfm:  m === 'equisfm',
@@ -1957,6 +2137,7 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
   const MODES = [
     { id:'rs',      label:'RealityScan', desc:'Epic photogrammetry — high accuracy, requires RS licence' },
     { id:'colmap',  label:'COLMAP',      desc:'Open-source SfM — no licence required, needs COLMAP binary' },
+    { id:'colmap_fisheye', label:'COLMAP Fisheye', desc:'Dual-lens rig using real calibrated fisheye intrinsics (OPENCV_FISHEYE) instead of a virtual pinhole approximation — experimental, compare against COLMAP-rig before adopting' },
     { id:'vggt',    label:'VGGT',        desc:'AI pose estimation — GPU-based, fastest for small captures' },
     { id:'gluemap', label:'GlueMap',     desc:'Global SfM + neural backbone (Pi3/VGGT) via WSL2 — best quality' },
     { id:'rigsfm',  label:'RigGluemap',   desc:'GluMap Pi3 on 1 or 4 horizon anchor sensors per frame → rig expansion to all sensors → SIFT triangulation — fast, rig-consistent from the start' },
@@ -2013,17 +2194,40 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
                 <Radio value="spherical" checked={settings.colmapMode==="spherical"}
                   onChange={v=>setSettings(s=>({...s,colmapMode:v}))} label="Spherical" />
               </div>
+              {settings.colmapMode==="spherical" && (
+                <div style={{ color:T.textDim, fontSize:10, marginTop:4 }}>
+                  Native EQUIRECTANGULAR SfM on raw panoramas — one camera per frame, no
+                  multi-sensor rig structure (nothing to lock). Runs entirely in-process
+                  under Python 3.13, never shells out to a COLMAP binary — none of the
+                  GPU/Caspar work below applies here; always CPU-only. A separate, older
+                  code path from Perspective-Rig, last touched before this session's work.
+                </div>
+              )}
             </FieldRow>
             <FieldRow label="Mapper">
               <div style={{ display:"flex", gap:12 }}>
                 <Radio value="incremental" checked={(settings.colmapMapper||"incremental")==="incremental"}
                   onChange={v=>setSettings(s=>({...s,colmapMapper:v}))} label="Incremental (rig-aware)" />
                 <Radio value="global" checked={settings.colmapMapper==="global"}
-                  onChange={v=>setSettings(s=>({...s,colmapMapper:v}))} label="Global (GLOMAP)" disabled={!settings.colmapBin} />
+                  onChange={v=>setSettings(s=>({...s,colmapMapper:v}))} label="Global (GLOMAP, rig-aware)" />
               </div>
-              {settings.colmapMapper==="global" && (
+              {settings.colmapMapper!=="global" ? (
                 <div style={{ color:T.textDim, fontSize:10, marginTop:4 }}>
-                  GLOMAP: 10–100× faster, better for large sequential captures. No rig constraints — sensors reconstructed independently.
+                  Per-image registration loop. Bundle adjustment tries Caspar GPU first,
+                  then Ceres GPU (CLI), then falls back to in-process CPU — rig geometry
+                  is locked in every tier. GPU tiers require a COLMAP binary (Config →
+                  Paths); falls back to CPU automatically if unset.
+                </div>
+              ) : (
+                <div style={{ color:T.textDim, fontSize:10, marginTop:4 }}>
+                  One global solve instead of a per-image loop — measured ~1.7× faster
+                  wall-clock than Incremental+Ceres on a real 312-image test (though
+                  Incremental+Caspar was still the fastest overall in that same test).
+                  Now fully rig-locked in every stage (rotation averaging, global
+                  positioning, and bundle adjustment) — previously reconstructed each
+                  sensor independently. {settings.colmapBin
+                    ? "Tries Caspar GPU first, then Ceres GPU (CLI), then in-process CPU."
+                    : "No COLMAP binary set (Config → Paths) — runs in-process CPU only, still rig-locked."}
                 </div>
               )}
             </FieldRow>
@@ -2041,9 +2245,10 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
                   Loop closure: vocab tree adds a second matching pass that finds non-adjacent images sharing visual content.
                   Useful for walks that loop back or cross themselves. Requires a vocab tree .bin file (Config → Paths).
                 </div>
-                <Toggle checked={!!settings.colmapVocabTree} label="Enable vocab tree loop closure pass"
-                  disabled
-                  title="Set Vocab Tree path in Config → Paths to enable" />
+                <Toggle checked={!!settings.colmapVocabTree && settings.colmapVocabTreeEnabled !== false} label="Enable vocab tree loop closure pass"
+                  disabled={!settings.colmapVocabTree}
+                  onChange={v=>setSettings(s=>({...s,colmapVocabTreeEnabled:v}))}
+                  title={!settings.colmapVocabTree ? "Set Vocab Tree path in Config → Paths to enable" : undefined} />
                 {settings.colmapVocabTree && (
                   <div style={{ fontSize:10, color:T.live, marginTop:2 }}>
                     Vocab tree configured: {settings.colmapVocabTree.split(/[/\\]/).pop()}
@@ -2067,6 +2272,50 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
             )}
             <Toggle checked={!!settings.colmapVisualize} label="Generate camera visualizer (cameras.html)"
               onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
+          </div>
+        )}
+
+        {/* ── COLMAP Fisheye options ───────────────────────────── */}
+        {mode === 'colmap_fisheye' && (
+          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+            <div style={{ fontSize:10, color:T.textDim, lineHeight:1.5 }}>
+              Uses real calibrated fisheye intrinsics (OPENCV_FISHEYE) for the X4's front/back
+              lenses instead of a derived zero-distortion pinhole. Needs raw, un-stitched
+              per-lens frames — not 01_frames/02_views, which are already-stitched equirect
+              crops. Save calibration profiles from the Lens Calibration tab first.
+            </div>
+            <FieldRow label="Raw frames folder" hint="Folder containing front/ and back/ subfolders of raw fisheye frames.">
+              <Input value={settings.colmapFisheyeRawDir || ''}
+                onChange={v=>setSettings(s=>({...s,colmapFisheyeRawDir:v}))}
+                placeholder="C:\FieldRaven\Calibration\raw\job123" />
+            </FieldRow>
+            <FieldRow label="Front lens profile">
+              <Select value={settings.colmapFisheyeFrontProfile || ''}
+                onChange={v=>setSettings(s=>({...s,colmapFisheyeFrontProfile:v}))}
+                options={[{value:'', label:'Select a profile…'}, ...calibProfiles.map(p=>({value:p.name, label:`${p.name} (RMS ${p.overall_rms_error?.toFixed(3)}px)`}))]} />
+            </FieldRow>
+            <FieldRow label="Back lens profile">
+              <Select value={settings.colmapFisheyeBackProfile || ''}
+                onChange={v=>setSettings(s=>({...s,colmapFisheyeBackProfile:v}))}
+                options={[{value:'', label:'Select a profile…'}, ...calibProfiles.map(p=>({value:p.name, label:`${p.name} (RMS ${p.overall_rms_error?.toFixed(3)}px)`}))]} />
+            </FieldRow>
+            {calibProfiles.length === 0 && (
+              <div style={{ fontSize:10, color:T.amber }}>
+                No saved calibration profiles yet — run a calibration in the Lens Calibration tab and save it.
+              </div>
+            )}
+            <FieldRow label="Matcher">
+              <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                {["sequential","exhaustive","vocabtree"].map(m=>(
+                  <Radio key={m} value={m} checked={(settings.colmapFisheyeMatcher||"sequential")===m}
+                    onChange={v=>setSettings(s=>({...s,colmapFisheyeMatcher:v}))} label={m} />
+                ))}
+              </div>
+            </FieldRow>
+            <div style={{ fontSize:10, color:T.textDim, lineHeight:1.5 }}>
+              Bundle adjustment goes straight to Ceres CLI, then in-process CPU — the GPU
+              Caspar backend has no OPENCV_FISHEYE support (see colmap_fisheye_worker.py).
+            </div>
           </div>
         )}
 
@@ -2235,12 +2484,35 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
               <div style={{ fontSize:10, color:T.textDim, marginTop:6 }}>
                 COLMAP EQUIRECTANGULAR SfM on raw panos — no Pi3, no anchor staging. Sequential matches neighbouring frames; exhaustive matches all pairs (slower, better for short sequences).
               </div>
+              <FieldRow label="Mapper">
+                <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                  <Radio value="incremental" checked={settings.equisfmMapper!=="global"}
+                    onChange={v=>setSettings(s=>({...s,equisfmMapper:v}))} label="Incremental" />
+                  <Radio value="global" checked={settings.equisfmMapper==="global"}
+                    onChange={v=>setSettings(s=>({...s,equisfmMapper:v}))} label="Global (GLOMAP-style)" />
+                </div>
+              </FieldRow>
+              <div style={{ fontSize:10, color:T.textDim, marginTop:6 }}>
+                Incremental grows the reconstruction one image at a time off a single best initial pair. Global solves every pano pose at once from the whole match graph — doesn't depend on incremental's greedy growth order, generally more robust on loop-closure-heavy / revisited-terrain captures.
+              </div>
               <div style={{ marginTop:10 }}>
-                <Toggle checked={!!settings.equisfmTriangulate} label="Real per-sensor triangulation (rig glue)"
+                <Toggle checked={!!settings.equisfmTriangulate} label="Per-Sensor Triangulation"
                   onChange={v=>setSettings(s=>({...s,equisfmTriangulate:v}))} />
               </div>
               <div style={{ fontSize:10, color:T.textDim, marginTop:6 }}>
-                Runs real SIFT matching + triangulation across the 312 per-sensor images using the poses EquiSfM already solved — camera positions are never moved, only used to triangulate a denser, properly-tracked point cloud for Brush. Off by default; adds real SIFT cost across all sensor images (no longer near-instant).
+                {(() => {
+                  const nSensors = buildRigSensorOptions(
+                    settings.pitchAngles, settings.yawSteps, settings.horizonRef !== false
+                  ).length;
+                  return `EquiSfM only solves one pose per raw panorama, then analytically expands it to all ${nSensors} virtual sensors — no real per-sensor matching happens by default. Enabling this runs real SIFT matching + triangulation across every one of those ${nSensors} per-sensor images per frame, using the poses EquiSfM already solved for each capture position (poses are never moved, only used to triangulate a denser, properly-tracked point cloud for Brush). Off by default — real SIFT cost across all sensor images means this is no longer near-instant like the base EquiSfM path.`;
+                })()}
+              </div>
+              <div style={{ marginTop:10 }}>
+                <Toggle checked={!!settings.equisfmMvs} label="Dense Point Cloud (MVS)"
+                  onChange={v=>setSettings(s=>({...s,equisfmMvs:v}))} />
+              </div>
+              <div style={{ fontSize:10, color:T.textDim, marginTop:6 }}>
+                Runs COLMAP's own dense stereo pipeline (undistort → GPU patch-match stereo → depth-map fusion) to add real per-pixel depth points on top of whatever point cloud already exists — works whether or not Per-Sensor Triangulation above is enabled, though pairing the two likely gives tighter depth-range priors and a better result. Requires a GPU and a configured COLMAP binary (Config → Paths) — no CPU fallback exists for this. Note: this densifies near/mid-range surfaces the sparse cloud under-sampled; it does not help with far-away, low-parallax points (sky, distant terrain) — that's a fundamentally different problem this technique can't solve. Off by default — adds real GPU cost (the classic MVS bottleneck).
               </div>
             </Accordion>
           </div>
@@ -2310,10 +2582,11 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
         <div style={{ fontFamily:"monospace", fontSize:11, color:T.textSec, lineHeight:1.8 }}>
           {mode === 'rs'      && `RealityScan alignment${settings.exportXmp?' + XMP rig priors':''}`}
           {mode === 'colmap'  && `COLMAP ${settings.colmapMode} (${settings.colmapMatcher} matcher)`}
+          {mode === 'colmap_fisheye' && `COLMAP Fisheye — front:${settings.colmapFisheyeFrontProfile||'none'} back:${settings.colmapFisheyeBackProfile||'none'} (${settings.colmapFisheyeMatcher||'sequential'} matcher)`}
           {mode === 'vggt'    && `VGGT ${settings.vggtMode} pose estimation`}
           {mode === 'gluemap' && `GlueMap (${settings.glueMapBackbone} backbone, ${settings.glueMapNeighbors} neighbours${settings.glueMapSkipDg?', skip-dg':''})`}
           {mode === 'rigsfm'  && `RigGluemap — Pi3 ${settings.glueMapBackbone||'pi3'} ${settings.rigsfmQuadAnchors ? '4-horizon anchors' : `anchor sensor #${settings.rigsfmAnchorSensor??0}`} → rig expand → SIFT ${settings.rigsfmMatcher||'sequential'}`}
-          {mode === 'equisfm' && `EquiSfM — COLMAP EQUIRECTANGULAR ${settings.equisfmMatcher||'sequential'} matcher → rig expansion${settings.equisfmTriangulate ? ' → per-sensor SIFT triangulation (poses fixed)' : ''}`}
+          {mode === 'equisfm' && `EquiSfM — COLMAP EQUIRECTANGULAR ${settings.equisfmMatcher||'sequential'} matcher → ${settings.equisfmMapper==='global' ? 'global' : 'incremental'} mapping → rig expansion${settings.equisfmTriangulate ? ' → per-sensor SIFT triangulation (poses fixed)' : ''}`}
           {'\n'}
           {[runPostshot&&'→ Postshot training', runBrush&&'→ Brush training'].filter(Boolean).join('\n') || (mode==='vggt'?'':'→ Alignment only (no training selected)')}
         </div>
@@ -2360,8 +2633,26 @@ function PostshotTab({ settings, setSettings }) {
 }
 
 // ─── Brush Tab ────────────────────────────────────────────────────────────────
-function BrushTab({ settings, setSettings }) {
+function BrushTab({ settings, setSettings, selected, projectDirs, api }) {
   const S = k => ({ value:settings[k], onChange:v=>setSettings(s=>({...s,[k]:v})) });
+
+  const [renderRes, setRenderRes] = useState(null); // {width, height, source} | null
+
+  useEffect(() => {
+    let cancelled = false;
+    setRenderRes(null);
+    if (!selected?.id || !api) return;
+    const projectDir = projectDirs?.[selected.id];
+    const q = projectDir ? `?projectDir=${encodeURIComponent(projectDir)}&fov=${settings.fov}` : `?fov=${settings.fov}`;
+    api(`/api/jobs/${selected.id}/render-resolution${q}`)
+      .then(r => { if (!cancelled && r?.width) setRenderRes(r); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [selected?.id, projectDirs, api, settings.fov]);
+
+  const actualLongEdge = renderRes ? Math.max(renderRes.width, renderRes.height) : null;
+  const willDownsample = actualLongEdge != null && Number(settings.brushRes) < actualLongEdge;
+
   return (
     <div style={{ overflowY:"auto", height:"100%" }}>
       <SectionHead>Training</SectionHead>
@@ -2370,6 +2661,28 @@ function BrushTab({ settings, setSettings }) {
         <FieldRow label="Max Splats"><Input type="number" {...S("brushSplats")} /></FieldRow>
         <FieldRow label="Max Resolution"><Input type="number" {...S("brushRes")} /></FieldRow>
         <FieldRow label="Seed"><Input type="number" {...S("brushSeed")} /></FieldRow>
+      </div>
+      <div style={{ marginTop:6, fontSize:10 }}>
+        {renderRes ? (
+          <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+            <span style={{ color: willDownsample ? T.amber : T.textDim }}>
+              {renderRes.source === 'rendered' ? 'Actual' : '~Estimated (views not yet rendered)'} per-sensor
+              image resolution: {renderRes.width}×{renderRes.height}px
+              {willDownsample && ` — Max Resolution (${settings.brushRes}) will downsample these before training`}
+            </span>
+            {willDownsample && (
+              <button onClick={() => setSettings(s => ({ ...s, brushRes: actualLongEdge }))}
+                style={{ background:'none', border:`1px solid ${T.amber}66`, color:T.amber,
+                  borderRadius:3, padding:'2px 8px', cursor:'pointer', fontSize:10 }}>
+                Match ({actualLongEdge}px)
+              </button>
+            )}
+          </div>
+        ) : (
+          <span style={{ color:T.textDim }}>
+            Select a job to see its actual per-sensor image resolution — Brush's Max Resolution only ever downsamples (never upscales), so setting it below the real render size silently trains on lower-resolution images.
+          </span>
+        )}
       </div>
       <div style={{ marginTop:10 }}>
         <SectionHead>Options</SectionHead>
@@ -2451,7 +2764,8 @@ const PIPE_TABS = ["Frame & View Extraction","Alignment","Postshot","Brush","Con
 function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected,
     settings, setSettings, onSaveConfig, onCancelPq, onDeletePq, machineInfo,
     cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder, onAddCameraFiles, onAddVideoFile, onAddVideoFromCamera,
-    importStep, importPct, stitching, stitchStep, stitchPct }) {
+    importStep, importPct, stitching, stitchStep, stitchPct, extractedFrames, setExtractedFrames,
+    realFrames, refreshRealFrames, onExtractFrames }) {
   const [pipeTab, setPipeTab] = useState(0);
   const [canvasH, setCanvasH] = useState(600);
   return (
@@ -2483,11 +2797,14 @@ function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected
             cameraStatus={cameraStatus} importedFiles={importedFiles} projectDirs={projectDirs} onImport={onImport}
             importStep={importStep} importPct={importPct}
             stitching={stitching} stitchStep={stitchStep} stitchPct={stitchPct}
-            canvasH={canvasH} setCanvasH={setCanvasH} />}
+            canvasH={canvasH} setCanvasH={setCanvasH}
+            extractedFrames={extractedFrames} setExtractedFrames={setExtractedFrames}
+            realFrames={realFrames} refreshRealFrames={refreshRealFrames} onExtractFrames={onExtractFrames} />}
           {pipeTab===1 && <AlignmentTab settings={settings} setSettings={setSettings}
             selected={selected} importedFiles={importedFiles} projectDirs={projectDirs} />}
           {pipeTab===2 && <PostshotTab settings={settings} setSettings={setSettings} />}
-          {pipeTab===3 && <BrushTab settings={settings} setSettings={setSettings} />}
+          {pipeTab===3 && <BrushTab settings={settings} setSettings={setSettings}
+            selected={selected} projectDirs={projectDirs} api={api} />}
           {pipeTab===4 && <ConfigTab settings={settings} setSettings={setSettings}
             machineInfo={machineInfo} onSaveConfig={onSaveConfig} />}
         </div>
@@ -2503,6 +2820,8 @@ const _STAGES_RS_BRUSH = { labels:['Frames','Views','RS','Brush'],
   keys:['frame_extraction','view_extraction','realityscan','brush_training'] };
 const _STAGES_COLMAP   = { labels:['Frames','Views','COLMAP','Brush'],
   keys:['frame_extraction','view_extraction','colmap_alignment','brush_training'] };
+const _STAGES_COLMAP_FISHEYE = { labels:['Frames','Fisheye Rig','Brush'],
+  keys:['frame_extraction','colmap_fisheye_alignment','brush_training'] };
 const _STAGES_GLUEMAP  = { labels:['Frames','Views','GlueMap','Brush'],
   keys:['frame_extraction','view_extraction','gluemap_alignment','brush_training'] };
 const _STAGES_RIGSFM   = { labels:['Frames','Views','RigGluemap','Brush'],
@@ -2513,6 +2832,7 @@ const _STAGES_EQUISFM  = { labels:['Frames','Views','EquiSfM','Brush'],
 function ActiveJobTab({ currentJob, progress, statusMsg, logs, currentStage, pipelineMode }) {
   const stageDef = pipelineMode === 'rs_brush' ? _STAGES_RS_BRUSH
                  : pipelineMode === 'colmap'   ? _STAGES_COLMAP
+                 : pipelineMode === 'colmap_fisheye' ? _STAGES_COLMAP_FISHEYE
                  : pipelineMode === 'gluemap'  ? _STAGES_GLUEMAP
                  : pipelineMode === 'rigsfm'   ? _STAGES_RIGSFM
                  : pipelineMode === 'equisfm'  ? _STAGES_EQUISFM
@@ -2689,6 +3009,7 @@ const _STAGE_LABELS = {
   view_extraction:  { label: "View Extraction",    icon: "🖼" },
   realityscan:        { label: "RealityScan",        icon: "📐" },
   colmap_alignment:   { label: "COLMAP Alignment",   icon: "📐" },
+  colmap_fisheye_alignment: { label: "COLMAP Fisheye Alignment", icon: "🔍" },
   vggt_alignment:     { label: "VGGT Alignment",     icon: "🔬" },
   gluemap_alignment:  { label: "GlueMap Alignment",  icon: "🗺️" },
   rigsfm_alignment:   { label: "RigGluemap Alignment", icon: "🗺️" },
@@ -2705,6 +3026,8 @@ function ProjectStateModal({ state, onContinue, onRerunFrom, onStartOver, onCanc
   const _mode = pipelineMode || 'rs_brush';
   const allStages = _mode === 'colmap'
     ? ['import', 'view_extraction', 'colmap_alignment', 'brush_training']
+    : _mode === 'colmap_fisheye'
+    ? ['import', 'colmap_fisheye_alignment', 'brush_training']
     : _mode === 'vggt'
     ? ['import', 'view_extraction', 'vggt_alignment', 'brush_training']
     : _mode === 'gluemap'
@@ -2844,10 +3167,11 @@ const defaultSettings = {
   skipRS:false, runVggt:false, runPostshot:true, runBrush:false,
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
   vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false, gpsTriggersRS:false, gpsPriorsColmap:false,
-  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false, colmapMapper:"incremental", colmapVocabTree:"",
+  runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false, colmapMapper:"incremental", colmapVocabTree:"", colmapVocabTreeEnabled:true,
+  runColmapFisheye:false, colmapFisheyeMatcher:"sequential", colmapFisheyeFrontProfile:"", colmapFisheyeBackProfile:"", colmapFisheyeRawDir:"",
   runGluemap:false, glueMapBackbone:"pi3", glueMapSkipDg:true, glueMapCoarseOnly:false, glueMapSequential:true, glueMapNeighbors:100, glueMapBatchSize:60, glueMapNumTrack:512, glueMapWslHome:"/home/decosson", glueMapWslDistro:"Ubuntu-22.04",
   runRigsfm:false, rigsfmAnchorSensor:0, rigsfmQuadAnchors:false, rigsfmMatcher:'sequential',
-  runEquisfm:false, equisfmMatcher:'sequential', equisfmTriangulate:false,
+  runEquisfm:false, equisfmMatcher:'sequential', equisfmMapper:'incremental', equisfmTriangulate:false, equisfmMvs:false,
   postshotProfile:"Splat MCMC", postshotMaxSize:3840, postshotSteps:30,
   postshotMaxSplats:1000, postshotAA:true, postshotError:false,
   postshotContext:false, postshotPly:false, postshotAlpha:false, postshotSky:false,
@@ -2860,10 +3184,11 @@ const defaultSettings = {
 };
 
 const MAIN_TABS = [
-  { id:"fieldraven", label:"🦅 FieldRaven",  color:T.frColor },
-  { id:"pipeline",   label:"⚙ Pipeline",    color:T.amber },
-  { id:"active",     label:"▶ Active Job",  color:T.live },
-  { id:"history",    label:"◷ History",     color:T.textSec },
+  { id:"fieldraven",   label:"🦅 FieldRaven",  color:T.frColor },
+  { id:"pipeline",     label:"⚙ Pipeline",    color:T.amber },
+  { id:"active",       label:"▶ Active Job",  color:T.live },
+  { id:"history",      label:"◷ History",     color:T.textSec },
+  { id:"calibration",  label:"🎯 Lens Calib", color:T.info },
 ];
 
 // ─── Root ─────────────────────────────────────────────────────────────────────
@@ -2888,6 +3213,8 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [cameraStatus, setCameraStatus]   = useState(null);
   const [importedFiles, setImportedFiles] = useState({}); // { [jobId]: { files, total } }
+  const [extractedFrames, setExtractedFrames] = useState({}); // { [jobId]: number[] timestamps } -- lifted out of ExtractionTab so switching pipeline sub-tabs (which unmounts it) doesn't lose the preview
+  const [realFrames, setRealFrames] = useState({}); // { [jobId]: string[] filenames } -- real files in 01_frames/, takes priority over the client-only timestamp preview once populated
   const [projectDirs, setProjectDirs]       = useState({}); // { [jobId]: string }
   const [lastBrowseDir, setLastBrowseDir]   = useState('C:\\Users');
   const [cameraImportPending, setCameraImportPending] = useState(null); // { filePaths, projectDir, defaultName }
@@ -2895,10 +3222,17 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   const [importingJobId, setImportingJobId] = useState(null);
   const [stitchingJobId, setStitchingJobId] = useState(null);
   const [stitchingProjectDir, setStitchingProjectDir] = useState(null);
+  const [stitchingKind, setStitchingKind]   = useState(null); // 'insp' | 'video'
+  const [stitchModalDismissed, setStitchModalDismissed] = useState(false);
   const [importStep, setImportStep]         = useState('');
   const [importPct, setImportPct]           = useState(0);
   const [stitchStep, setStitchStep]         = useState('');
   const [stitchPct, setStitchPct]           = useState(0);
+  const [extractingJobId, setExtractingJobId] = useState(null);
+  const [extractingProjectDir, setExtractingProjectDir] = useState(null);
+  const [extractModalDismissed, setExtractModalDismissed] = useState(false);
+  const [extractStep, setExtractStep]       = useState('');
+  const [extractPct, setExtractPct]         = useState(0);
 
   const addLog = m => setLogs(l => [...l.slice(-200), m]);
 
@@ -3045,10 +3379,20 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     let jobId = null;
     let jobType = 'folder';
     let savedSettings = null;
+    let isVideoProject = false;
     try {
       const data = await api(`/api/project/config?dir=${encodeURIComponent(dir)}`);
       jobId        = data.config?.jobId   || null;
       savedSettings = data.config?.settings || null;
+      // Detect a video project from the actual files on disk -- needed below because
+      // /api/jobs/{id}/status can come back empty (e.g. this job's Firestore doc was
+      // deleted, then this same project folder reopened), in which case there's no
+      // jobType to read and this was previously hard-defaulting to 'folder'/'local_folder'
+      // regardless of what the project actually is, misplacing reopened video projects
+      // into the Image Folders queue with an empty gallery.
+      const _videoExts = ['.mp4', '.mov', '.avi', '.mkv', '.insv'];
+      isVideoProject = (data.files || []).some(f => _videoExts.includes((f.ext || '').toLowerCase()));
+      jobType = isVideoProject ? 'video' : 'folder';
       // Populate the gallery immediately so it's ready before anything else
       if (data.files && data.files.length > 0) {
         setImportedFiles(prev => ({
@@ -3089,11 +3433,12 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       const jobData = await api(`/api/jobs/${jobId}/status`);
       const name = jobData?.name || dirName;
       const status = jobData?.status || 'queued';
-      const entry = { ...(jobData || {}), docId: jobId, id: jobId, jobType: jobData?.jobType || 'local_folder', name, status };
+      const entry = { ...(jobData || {}), docId: jobId, id: jobId,
+        jobType: jobData?.jobType || (isVideoProject ? 'local_video' : 'local_folder'), name, status };
       setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
       setSelected({ id: jobId, type: jobType, name, status });
     } catch {
-      const entry = { docId: jobId, id: jobId, jobType: 'local_folder', name: dirName, status: 'queued' };
+      const entry = { docId: jobId, id: jobId, jobType: isVideoProject ? 'local_video' : 'local_folder', name: dirName, status: 'queued' };
       setPqItems(prev => prev.some(j => (j.docId||j.id) === jobId) ? prev : [entry, ...prev]);
       setSelected({ id: jobId, type: jobType, name: dirName, status: 'queued' });
     }
@@ -3130,7 +3475,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       setCurrentJobId(r.jobId);
       setProgress(0);
       setCurrentStage('');
-      const _mode = settings.runEquisfm ? 'equisfm' : settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : settings.runRigsfm ? 'rigsfm' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+      const _mode = settings.runEquisfm ? 'equisfm' : settings.runColmap ? 'colmap' : settings.runColmapFisheye ? 'colmap_fisheye' : settings.runGluemap ? 'gluemap' : settings.runRigsfm ? 'rigsfm' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
       setPipelineMode(_mode);
       setStatusMsg(`Resuming from ${startFrom || 'beginning'}`);
       addLog(`Pipeline resumed — jobId: ${r.jobId}`);
@@ -3197,6 +3542,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
           refreshFiles();
           setStitchingJobId(null);
           setStitchingProjectDir(null);
+          setStitchingKind(null);
           addLog('Conversion complete.');
         }
       } catch {}
@@ -3204,7 +3550,51 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     return () => clearInterval(iv);
   }, [stitchingJobId, stitchingProjectDir, api]);
 
+  // ── Real frame extraction progress polling ────────────────
+  const refreshRealFrames = useCallback((jobId, projectDir) => {
+    const q = projectDir ? `?projectDir=${encodeURIComponent(projectDir)}` : '';
+    api(`/api/jobs/${jobId}/frames${q}`)
+      .then(data => setRealFrames(prev => ({ ...prev, [jobId]: data.files || [] })))
+      .catch(() => {});
+  }, [api]);
+
+  useEffect(() => {
+    if (!extractingJobId) { setExtractStep(''); setExtractPct(0); return; }
+    let lastStep = '';
+    const iv = setInterval(async () => {
+      try {
+        const s = await api(`/api/jobs/${extractingJobId}/status`);
+        if (s.currentStep && s.currentStep !== lastStep) {
+          lastStep = s.currentStep;
+          setExtractStep(s.currentStep);
+          addLog(s.currentStep);
+        }
+        if (s.progress != null) setExtractPct(s.progress);
+        if (s.currentStep?.toLowerCase().includes('extracted')) {
+          clearInterval(iv);
+          refreshRealFrames(extractingJobId, extractingProjectDir);
+          setExtractingJobId(null);
+          setExtractingProjectDir(null);
+          addLog('Frame extraction complete.');
+        }
+      } catch {}
+    }, 1200);
+    return () => clearInterval(iv);
+  }, [extractingJobId, extractingProjectDir, api, refreshRealFrames]);
+
   // ── Actions ───────────────────────────────────────────────
+  // Trigger real frame extraction into 01_frames/ (backend is idempotent --
+  // see pipeline.ensure_frames_extracted() -- so calling this repeatedly with
+  // unchanged settings is cheap, it just confirms nothing needs to be redone).
+  const onExtractFrames = useCallback((jobId, projectDir) => {
+    setExtractingJobId(jobId);
+    setExtractingProjectDir(projectDir);
+    setExtractModalDismissed(false);
+    api(`/api/jobs/${jobId}/extract-frames`, 'POST', settingsToApiConfig(settings))
+      .then(r => addLog(r.message))
+      .catch(e => { addLog(`Extraction note: ${e.message}`); setExtractingJobId(null); setExtractingProjectDir(null); });
+  }, [api, settings]);
+
   const onImport = useCallback(async (jobId, sourceDrive) => {
     let projectDir = projectDirs[jobId] || null;
 
@@ -3277,11 +3667,17 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       addLog(`Starting conversion of ${inspFiles.length} .insp files…`);
       setStitchingJobId(jobId);
       setStitchingProjectDir(projectDir);
+      setStitchingKind('insp');
+      setStitchModalDismissed(false);
+      // Stitch settings live in shared React state but the backend reads them from
+      // the persisted splat_config INI -- push current settings there first or the
+      // stitch runs with whatever was last explicitly saved, not what's selected now.
+      await api('/api/config', 'PUT', settingsToApiConfig(settings)).catch(() => {});
       api(`/api/jobs/${jobId}/stitch`, 'POST')
         .then(r => addLog(r.message))
         .catch(e => { addLog(`Conversion note: ${e.message}`); setStitchingJobId(null); setStitchingProjectDir(null); });
     }
-  }, [api, projectDirs, lastBrowseDir, setSettings]);
+  }, [api, projectDirs, lastBrowseDir, setSettings, settings]);
 
   // Entry point for a project whose photos already exist on disk (not a field job,
   // not a camera import) — establish/create a project folder, pick the source photos
@@ -3341,6 +3737,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
       lat:      meta.lat,
       lon:      meta.lon,
     };
+    const importMode = meta.importMode || 'copy';
 
     try {
       if (kind === 'camera') {
@@ -3368,6 +3765,9 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
           addLog(`Starting conversion of ${inspFiles.length} .insp files…`);
           setStitchingJobId(jobId);
           setStitchingProjectDir(projectDir);
+          setStitchingKind('insp');
+          setStitchModalDismissed(false);
+          await api('/api/config', 'PUT', settingsToApiConfig(settings)).catch(() => {});
           api(`/api/jobs/${jobId}/stitch`, 'POST')
             .then(r => addLog(r.message))
             .catch(e => { addLog(`Conversion note: ${e.message}`); setStitchingJobId(null); setStitchingProjectDir(null); });
@@ -3392,13 +3792,17 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
           : [{ docId: jobId, id: jobId, jobType: 'local_folder', name: folderName, status: 'importing' }, ...prev]);
         setSelected({ id: jobId, type: 'folder', name: folderName, status: 'importing' });
 
-        addLog(`Importing photos from ${sourceFolder}…`);
+        addLog(importMode === 'reference'
+          ? `Referencing photos in ${sourceFolder} (not copied)…`
+          : `Importing photos from ${sourceFolder}…`);
         try {
           const result = await api('/api/project/import-folder', 'POST', {
-            jobId, projectDir, sourceFolder,
+            jobId, projectDir, sourceFolder, importMode,
             siteDate: meta.siteDate, siteTime: meta.siteTime, lat: meta.lat, lon: meta.lon,
           });
-          addLog(`Import complete: ${result.imported} copied, ${result.skipped} skipped`);
+          addLog(importMode === 'reference'
+            ? `Referenced ${result.referenced} files in place`
+            : `Import complete: ${result.imported} copied, ${result.skipped} skipped`);
         } catch (e) {
           addLog(`Import failed: ${e.message}`);
           setPqItems(prev => prev.map(j => (j.docId||j.id) === jobId ? { ...j, status: 'error' } : j));
@@ -3423,7 +3827,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         const { videoPath } = cameraImportPending;
         let created;
         try {
-          created = await api('/api/jobs/create-video', 'POST', { projectDir, videoPath, ...metaFields });
+          created = await api('/api/jobs/create-video', 'POST', { projectDir, videoPath, importMode, ...metaFields });
         } catch (e) {
           addLog(`Could not create video project: ${e.message}`);
           setCameraImportBusy(false);
@@ -3445,9 +3849,14 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         // guarantee either way (see backend/pipeline_runner.py _worker).
         if (videoPath.toLowerCase().endsWith('.insv')) {
           addLog('Starting video stitch (raw .insv → equirectangular)…');
+          setStitchingJobId(videoJobId);
+          setStitchingProjectDir(projectDir);
+          setStitchingKind('video');
+          setStitchModalDismissed(false);
+          await api('/api/config', 'PUT', settingsToApiConfig(settings)).catch(() => {});
           api(`/api/jobs/${videoJobId}/stitch`, 'POST')
             .then(r => addLog(r.message))
-            .catch(e => addLog(`Stitch note: ${e.message}`));
+            .catch(e => { addLog(`Stitch note: ${e.message}`); setStitchingJobId(null); setStitchingProjectDir(null); });
         }
         loadQueue();
         return;
@@ -3455,7 +3864,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     } finally {
       setCameraImportBusy(false);
     }
-  }, [api, cameraImportPending, loadQueue, setImportedFiles]);
+  }, [api, cameraImportPending, loadQueue, setImportedFiles, settings]);
 
   const onQueueJob = useCallback(async (job) => {
     try {
@@ -3476,14 +3885,14 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
   const runPipeline = useCallback(async () => {
     if (!selected) return;
     if (!settings.poseSelected) {
-      addLog('No alignment method selected. Go to the Alignment tab and choose RealityScan, COLMAP, VGGT, GlueMap, or RigGluemap before running.');
+      addLog('No alignment method selected. Go to the Alignment tab and choose RealityScan, COLMAP, COLMAP Fisheye, VGGT, GlueMap, or RigGluemap before running.');
       return;
     }
     if (!settings.runBrush && !settings.runPostshot) {
       addLog('No training method selected. Go to the Training tab and enable Brush or Postshot before running.');
       return;
     }
-    if (selected.type === 'fieldraven' || selected.type === 'folder') {
+    if (selected.type === 'fieldraven' || selected.type === 'folder' || selected.type === 'video') {
       try {
         addLog(`Accepting job...`);
         await api('/api/jobs/accept', 'POST', { jobId: selected.id });
@@ -3497,7 +3906,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         setCurrentJobId(selected.id);
         setProgress(0);
         setCurrentStage('');
-        const _mode = settings.runEquisfm ? 'equisfm' : settings.runColmap ? 'colmap' : settings.runGluemap ? 'gluemap' : settings.runRigsfm ? 'rigsfm' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
+        const _mode = settings.runEquisfm ? 'equisfm' : settings.runColmap ? 'colmap' : settings.runColmapFisheye ? 'colmap_fisheye' : settings.runGluemap ? 'gluemap' : settings.runRigsfm ? 'rigsfm' : (!settings.runVggt && settings.runBrush ? 'rs_brush' : 'vggt');
         setPipelineMode(_mode);
         setStatusMsg('Pipeline started');
         addLog('Pipeline running');
@@ -3549,7 +3958,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     setLastBrowseDir(dirRes.path);
 
     const defaultName = fileRes.path.split(/[\\/]/).filter(Boolean).pop()?.replace(/\.[^.]+$/, '') || 'Video Import';
-    setCameraImportPending({ kind: 'video', videoPath: fileRes.path, projectDir: dirRes.path, defaultName });
+    setCameraImportPending({ kind: 'video', videoPath: fileRes.path, projectDir: dirRes.path, defaultName, viaCamera: false });
   }, [api, lastBrowseDir]);
 
   const onAddVideoFromCamera = useCallback(async () => {
@@ -3566,7 +3975,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
     setLastBrowseDir(dirRes.path);
 
     const defaultName = fileRes.path.split(/[\\/]/).filter(Boolean).pop()?.replace(/\.[^.]+$/, '') || 'Video Import';
-    setCameraImportPending({ kind: 'video', videoPath: fileRes.path, projectDir: dirRes.path, defaultName });
+    setCameraImportPending({ kind: 'video', videoPath: fileRes.path, projectDir: dirRes.path, defaultName, viaCamera: true });
   }, [api, lastBrowseDir, cameraStatus]);
 
   const onSaveConfig = useCallback(async () => {
@@ -3616,8 +4025,15 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
           onStartOver={async () => {
             try {
               addLog('Clearing output (views, alignment, training) — import kept…');
-              await api('/api/project/prepare', 'POST', { dir: projectState.projectDir, startFrom: 'view_extraction' });
+              await api('/api/project/prepare', 'POST', {
+                dir: projectState.projectDir, startFrom: 'view_extraction', jobId: projectState.jobId,
+              });
               addLog('Ready — adjust settings then click Run.');
+              // Clear any stale error/cancelled badge left over from the previous attempt
+              if (projectState.jobId) {
+                setPqItems(prev => prev.map(j => (j.docId||j.id) === projectState.jobId ? { ...j, status: 'queued' } : j));
+                setSelected(prev => prev?.id === projectState.jobId ? { ...prev, status: 'queued' } : prev);
+              }
               // Keep the project dir loaded so the user can tweak settings and run manually
               if (selected?.id) loadProjectDir(selected.id, projectState.projectDir);
               setProjectState(null);
@@ -3694,7 +4110,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
 
         {/* Action buttons */}
         <Btn onClick={runPipeline}
-          disabled={!selected || isProcessing || (selected.type !== 'fieldraven' && selected.type !== 'folder')}
+          disabled={!selected || isProcessing || (selected.type !== 'fieldraven' && selected.type !== 'folder' && selected.type !== 'video')}
           variant="live">
           ▶ Run Pipeline
         </Btn>
@@ -3798,6 +4214,8 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
             onAddVideoFromCamera={onAddVideoFromCamera}
             importStep={importStep} importPct={importPct}
             stitching={!!stitchingJobId} stitchStep={stitchStep} stitchPct={stitchPct}
+            extractedFrames={extractedFrames} setExtractedFrames={setExtractedFrames}
+            realFrames={realFrames} refreshRealFrames={refreshRealFrames} onExtractFrames={onExtractFrames}
           />
         )}
         {activeMainTab===2 && (
@@ -3809,6 +4227,9 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         )}
         {activeMainTab===3 && (
           <HistoryTab history={history} loading={historyLoading} />
+        )}
+        {activeMainTab===4 && (
+          <LensCalibrationTab />
         )}
       </div>
 
@@ -3829,6 +4250,24 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
         onCancel={() => { setCameraImportPending(null); addLog('Cancelled.'); }}
         settings={settings}
         setSettings={setSettings}
+      />
+
+      <ProgressToast
+        visible={!!stitchingJobId && stitchingKind === 'video' && !stitchModalDismissed}
+        title="Converting video → equirectangular" doneTitle="Video conversion complete"
+        step={stitchStep} pct={Math.min(100, (stitchPct / 50) * 100)} done={stitchPct >= 50}
+        footerRunning="Runs in the background — safe to keep working."
+        footerDone="Ready for the rest of the pipeline."
+        onDismiss={() => setStitchModalDismissed(true)}
+      />
+
+      <ProgressToast
+        visible={!!extractingJobId && !extractModalDismissed}
+        title="Extracting frames" doneTitle="Frame extraction complete"
+        step={extractStep} pct={extractPct} done={extractStep?.toLowerCase().includes('extracted')}
+        footerRunning="Runs in the background — safe to keep working."
+        footerDone="Ready for the rest of the pipeline."
+        onDismiss={() => setExtractModalDismissed(true)}
       />
       {cameraImportBusy && (
         <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:9999,

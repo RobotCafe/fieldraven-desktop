@@ -13,6 +13,7 @@ class PipelineStage(str, Enum):
     REALITYSCAN = "realityscan"
     VGGT_ALIGNMENT = "vggt_alignment"
     COLMAP_ALIGNMENT = "colmap_alignment"
+    COLMAP_FISHEYE_ALIGNMENT = "colmap_fisheye_alignment"
     COLMAP_EXPORT = "colmap_export"
     GLUEMAP_ALIGNMENT = "gluemap_alignment"
     RIGSFM_ALIGNMENT = "rigsfm_alignment"

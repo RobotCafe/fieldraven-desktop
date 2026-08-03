@@ -47,10 +47,18 @@ class PipelineSettings:
     colmap_orientation_align: bool = False   # after pitch correction, run colmap model_orientation_aligner --method IMAGE_ORIENTATION to refine level using scene geometry (requires colmap_bin)
     colmap_mapper: str = "incremental"       # "incremental" (pycolmap rig-aware) | "global" (GLOMAP, requires colmap_bin, no rig constraints)
     colmap_vocab_tree: str = ""              # path to COLMAP vocab tree .bin; enables a second vocab_tree_matcher pass after sequential matching for loop closure (requires colmap_bin)
+    colmap_vocab_tree_enabled: bool = True    # whether to actually use colmap_vocab_tree when set -- previously "has a path" and "should use it" were the same check, so there was no way to skip the extra retrieval pass per-job without clearing the path setting
     colmap_bin: Optional[str] = None   # path to colmap.exe; enables GPU via CLI for extraction+matching
     sky_sensitivity_threshold: int = 32
     colmap_image_width: int = 1920
     colmap_image_height: int = 1920
+
+    # ── COLMAP Fisheye (dual-lens, calibrated intrinsics) ─────────
+    run_colmap_fisheye: bool = False
+    colmap_fisheye_matcher: str = "sequential"   # "sequential" | "exhaustive" | "vocabtree"
+    colmap_fisheye_front_profile: str = ""       # saved calibration profile name (Lens Calibration tab)
+    colmap_fisheye_back_profile: str = ""
+    colmap_fisheye_raw_dir: str = ""             # folder with front/ and back/ raw fisheye frame subfolders
 
     # ── Training ─────────────────────────────────────────────────
     run_postshot: bool = False
@@ -90,7 +98,14 @@ class PipelineSettings:
     # ── EquiSfM ──────────────────────────────────────────────────
     run_equisfm: bool = False
     equisfm_matcher: str = "sequential"   # "sequential" | "exhaustive"
+    equisfm_mapper: str = "incremental"   # "incremental" (pycolmap, grows one image at a time off a
+                                           # single best initial pair) | "global" (GLOMAP-style
+                                           # pycolmap.global_mapping(), solves all pano poses at once from
+                                           # the whole match graph -- doesn't depend on incremental's greedy
+                                           # growth order, generally more robust on loop-closure-heavy /
+                                           # revisited-terrain captures)
     equisfm_triangulate: bool = False     # real per-sensor SIFT triangulation glue (poses stay fixed); off until validated on real jobs
+    equisfm_mvs: bool = False             # dense point cloud via COLMAP MVS (image_undistorter -> patch_match_stereo -> stereo_fusion); independent of equisfm_triangulate, additive only (never touches poses)
 
     # ── GlueMap ──────────────────────────────────────────────────
     run_gluemap: bool = False

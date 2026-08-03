@@ -74,6 +74,16 @@ _STAGE_RANGE_COLMAP_POST_STITCH = {
     "colmap_alignment":  (72, 88),
     "brush_training":    (88, 97),
 }
+_STAGE_RANGE_COLMAP_FISHEYE = {
+    "frame_extraction":          (5,  20),
+    "colmap_fisheye_alignment":  (20, 80),
+    "brush_training":            (80, 97),
+}
+_STAGE_RANGE_COLMAP_FISHEYE_POST_STITCH = {
+    "frame_extraction":          (47, 57),
+    "colmap_fisheye_alignment":  (57, 88),
+    "brush_training":            (88, 97),
+}
 _STAGE_RANGE_GLUEMAP = {
     "frame_extraction":   (5,  20),
     "view_extraction":    (20, 45),
@@ -170,10 +180,63 @@ def _job_root(job_id: str, job_data: Optional[dict] = None) -> Path:
     return JOBS_DIR / job_id
 
 
+def _import_reference(proj_root: Path) -> Optional[dict]:
+    """Read the 'importReference' block from fieldraven.json, if this project was
+    imported in reference mode (source left in place, not copied in) rather than
+    copy mode. Returns None for every pre-existing project (no such block) and for
+    any project explicitly imported in copy mode -- fully backward compatible."""
+    config_path = proj_root / "fieldraven.json"
+    if not config_path.exists():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    ref = config.get("importReference")
+    return ref if isinstance(ref, dict) and ref.get("mode") == "reference" else None
+
+
+def _write_import_reference(project_dir: Path, kind: str, source_path: Path) -> None:
+    """Record that this project's import was left in place rather than copied in.
+    kind is 'video' or 'folder'; source_path is the original file/folder location.
+    Read back by _import_reference() -- see that function and _input_dir()/
+    _find_primary_input() for how each consumer resolves the reference."""
+    config_path = project_dir / "fieldraven.json"
+    config: dict = {}
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    config["importReference"] = {
+        "mode": "reference", "kind": kind, "sourcePath": str(source_path),
+    }
+    config["savedAt"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️  Could not write importReference to fieldraven.json: {e}")
+
+
 def _input_dir(proj_root: Path) -> Path:
     """Return the project's source-photos directory: 'import from camera' (camera/cloud
     imports) or 'imported photos' (a local folder imported via /api/project/import-folder),
-    whichever exists. Defaults to 'import from camera' when neither exists yet."""
+    whichever exists. Defaults to 'import from camera' when neither exists yet.
+
+    A folder-kind reference import (source left in its original location, never
+    copied in) overrides this entirely -- the referenced folder itself IS the input
+    dir, so every consumer of this function (gallery listing, EXIF/session-time
+    derivation, the stale-output check) transparently reads the real files with no
+    changes needed on their end. Falls through to the normal local-folder logic if
+    the referenced path no longer exists, so a moved/deleted source fails clearly
+    downstream ("no input files found") rather than silently.
+    """
+    ref = _import_reference(proj_root)
+    if ref and ref.get("kind") == "folder":
+        ref_path = Path(ref.get("sourcePath", ""))
+        if ref_path.is_dir():
+            return ref_path
+
     camera_dir = proj_root / "import from camera"
     if camera_dir.exists():
         return camera_dir
@@ -217,7 +280,25 @@ def find_output_glb(job_id: str, job_data: Optional[dict] = None) -> Optional[Pa
 
 def _find_primary_input(job_id: str, job_data: Optional[dict] = None) -> Optional[str]:
     """Return path to a video file or image folder in the job's input dir."""
-    input_dir = _input_dir(_job_root(job_id, job_data))
+    proj_root = _job_root(job_id, job_data)
+    input_dir = _input_dir(proj_root)
+
+    ref = _import_reference(proj_root)
+    if ref and ref.get("kind") == "video":
+        # Referenced video (never copied in) -- a locally-stitched .insv output
+        # still takes priority if it already exists (same priority as the local-
+        # copy case below), otherwise fall back to the external source directly.
+        ref_path = Path(ref.get("sourcePath", ""))
+        if ref_path.suffix.lower() == ".insv" and input_dir.exists():
+            stitched = input_dir / (ref_path.stem + "_equirect.mp4")
+            if stitched.exists():
+                return str(stitched)
+        if ref_path.is_file():
+            return str(ref_path)
+        # Referenced source no longer exists -- fall through to the scan below,
+        # which will correctly find nothing local either and report a clear
+        # failure rather than silently proceeding on stale state.
+
     if not input_dir.exists():
         return None
     files = sorted(input_dir.iterdir())
@@ -301,6 +382,7 @@ def _build_settings(job_data: dict):
     s.colmap_orientation_align    = _to_bool(cfg.get("colmap_orientation_align", s.colmap_orientation_align))
     s.colmap_mapper               = cfg.get("colmap_mapper", s.colmap_mapper)
     s.colmap_vocab_tree           = cfg.get("colmap_vocab_tree", s.colmap_vocab_tree)
+    s.colmap_vocab_tree_enabled   = _to_bool(cfg.get("colmap_vocab_tree_enabled", s.colmap_vocab_tree_enabled))
     s.sky_sensitivity_threshold   = int(float(cfg.get("sky_sensitivity_threshold", s.sky_sensitivity_threshold)))
 
     # ── Postshot ──────────────────────────────────────────────────
@@ -335,6 +417,7 @@ def _build_settings(job_data: dict):
     s.colmap_bin            = cfg.get("colmap_bin") or s.colmap_bin
     s.rigsfm_quad_anchors   = _to_bool(cfg.get("rigsfm_quad_anchors", s.rigsfm_quad_anchors))
     s.colmap_vocab_tree     = cfg.get("colmap_vocab_tree", s.colmap_vocab_tree) or s.colmap_vocab_tree
+    s.colmap_vocab_tree_enabled = _to_bool(cfg.get("colmap_vocab_tree_enabled", s.colmap_vocab_tree_enabled))
     if cfg.get("colmap_image_width"):
         try:
             s.colmap_image_width = int(float(cfg["colmap_image_width"]))
@@ -377,6 +460,7 @@ def _build_settings(job_data: dict):
         if "colmap_orientation_align" in ui:   s.colmap_orientation_align   = _to_bool(ui["colmap_orientation_align"])
         if "colmap_mapper" in ui:              s.colmap_mapper              = ui["colmap_mapper"]
         if "colmap_vocab_tree" in ui:          s.colmap_vocab_tree          = ui["colmap_vocab_tree"]
+        if "colmap_vocab_tree_enabled" in ui:   s.colmap_vocab_tree_enabled  = _to_bool(ui["colmap_vocab_tree_enabled"])
         if "run_gluemap" in ui:                s.run_gluemap                = _to_bool(ui["run_gluemap"])
         if "gluemap_backbone" in ui:           s.gluemap_backbone           = ui["gluemap_backbone"]
         if "gluemap_skip_doppelgangers" in ui: s.gluemap_skip_doppelgangers = _to_bool(ui["gluemap_skip_doppelgangers"])
@@ -391,8 +475,14 @@ def _build_settings(job_data: dict):
         if "rigsfm_anchor_sensor" in ui:       s.rigsfm_anchor_sensor       = int(float(ui["rigsfm_anchor_sensor"]))
         if "rigsfm_matcher" in ui:             s.rigsfm_matcher             = ui["rigsfm_matcher"]
         if "rigsfm_quad_anchors" in ui:        s.rigsfm_quad_anchors        = _to_bool(ui["rigsfm_quad_anchors"])
+        if "run_colmap_fisheye" in ui:          s.run_colmap_fisheye          = _to_bool(ui["run_colmap_fisheye"])
+        if "colmap_fisheye_matcher" in ui:       s.colmap_fisheye_matcher       = ui["colmap_fisheye_matcher"]
+        if "colmap_fisheye_front_profile" in ui: s.colmap_fisheye_front_profile = ui["colmap_fisheye_front_profile"]
+        if "colmap_fisheye_back_profile" in ui:  s.colmap_fisheye_back_profile  = ui["colmap_fisheye_back_profile"]
+        if "colmap_fisheye_raw_dir" in ui:        s.colmap_fisheye_raw_dir       = ui["colmap_fisheye_raw_dir"]
         if "run_equisfm" in ui:                s.run_equisfm                = _to_bool(ui["run_equisfm"])
         if "equisfm_matcher" in ui:            s.equisfm_matcher            = ui["equisfm_matcher"]
+        if "equisfm_mapper" in ui:             s.equisfm_mapper             = ui["equisfm_mapper"]
         if "equisfm_triangulate" in ui:        s.equisfm_triangulate        = _to_bool(ui["equisfm_triangulate"])
         if "colmap_image_width" in ui:         s.colmap_image_width         = int(float(ui["colmap_image_width"]))
         if "yaw_steps" in ui:         s.yaw_steps         = int(ui["yaw_steps"])
@@ -548,8 +638,28 @@ def _stitch_insv_files(job_id: str, cancel_event: threading.Event, job_data: Opt
     .insv is left in place (matching the .insp -> .jpg convention) and
     _find_primary_input() prefers the stitched output once it exists.
     Returns number of files successfully stitched."""
-    input_dir = _input_dir(_job_root(job_id, job_data))
-    insv_files = sorted(input_dir.glob("*.insv"))
+    proj_root = _job_root(job_id, job_data)
+    input_dir = _input_dir(proj_root)
+    # Only stitch the one video this job actually owns (job_data['videoFile'],
+    # set once at job creation) -- NOT every .insv sitting in the input dir.
+    # A project folder can hold other raw clips (e.g. multiple imports from the
+    # same card) that were never part of this job; globbing *.insv would stitch
+    # them too on every Run Pipeline click, which is exactly the "stitch should
+    # only happen at import" bug this guards against.
+    video_file = (job_data or {}).get("videoFile", "")
+    if not video_file.lower().endswith(".insv"):
+        return 0
+    candidate = input_dir / video_file
+    if not candidate.exists():
+        # Referenced (never-copied) source -- read the raw .insv from its
+        # original location; the stitched output below still always writes
+        # into input_dir (project-owned), never back into the source folder.
+        ref = _import_reference(proj_root)
+        if ref and ref.get("kind") == "video":
+            ref_path = Path(ref.get("sourcePath", ""))
+            if ref_path.name == video_file and ref_path.exists():
+                candidate = ref_path
+    insv_files = [candidate] if candidate.exists() else []
     if not insv_files:
         return 0
 
@@ -633,6 +743,46 @@ def _stitch_insv_files(job_id: str, cancel_event: threading.Event, job_data: Opt
     return ok
 
 
+def _extract_frames_files(job_id: str, cancel_event: threading.Event,
+                           job_data: Optional[dict] = None, ui_settings: Optional[dict] = None) -> dict:
+    """Extract frames for a video job into 01_frames/, skipping the work entirely
+    if a matching extraction (same source content + same settings) already exists.
+    Shared with the real pipeline run via pipeline.ensure_frames_extracted() -- built
+    through _build_settings() exactly like /start does, so the button and a later
+    Run Pipeline always agree on what counts as "already extracted"."""
+    from splatpipe_core import pipeline as core_pipeline  # type: ignore
+
+    settings = _build_settings({**(job_data or {}), "_ui_settings": ui_settings or {}})
+    core_pipeline._load_splatpipe(settings.vggt_app_path)
+
+    input_path = _find_primary_input(job_id, job_data)
+    if not input_path or not Path(input_path).is_file():
+        return {"success": False, "error": "No video file found for this job"}
+
+    proj_root = _job_root(job_id, job_data)
+    frames_dir = proj_root / "01_frames"
+
+    last_pct = [-1]
+
+    def _progress_cb(current, total, ts=None):
+        pct = int(current / total * 100) if total else 0
+        if pct != last_pct[0]:
+            last_pct[0] = pct
+            msg = f"Extracting frame {current}/{total}" + (f" at {ts:.1f}s" if ts else "")
+            queue_manager.update_job_progress(job_id, pct, msg)
+
+    ok, n_frames, already_done = core_pipeline.ensure_frames_extracted(
+        video_path=input_path,
+        frames_dir=frames_dir,
+        settings=settings,
+        progress_callback=_progress_cb,
+        cancel_event=cancel_event,
+    )
+    if not ok:
+        return {"success": False, "error": "Frame extraction failed or produced no frames"}
+    return {"success": True, "n_frames": n_frames, "already_done": already_done}
+
+
 # ── Worker thread ─────────────────────────────────────────────
 
 def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
@@ -696,15 +846,33 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             proj_root = _job_root(job_id, job_data)
             _write_stage_progress(proj_root, "import", {"stitched": stitched, "total": insp_count})
 
-        # Stitch any raw .insv videos to equirectangular .mp4 before the
-        # pipeline runs -- frame extraction assumes its input is already
+        # Stitch this job's own raw .insv video to equirectangular .mp4 before
+        # the pipeline runs -- frame extraction assumes its input is already
         # equirectangular (it only crops panorama -> perspective views, it
         # never un-fisheyes anything), so this must happen before
         # _find_primary_input() / run_pipeline() regardless of whether the
         # frontend's own immediate-post-import stitch trigger already ran.
-        insv_count = len(list(input_dir.glob("*.insv"))) if input_dir.exists() else 0
-        if insv_count:
-            queue_manager.update_job_progress(job_id, 3, f"Found {insv_count} Insta360 video(s) — stitching…", milestone=True)
+        # Scoped to job_data['videoFile'] specifically (not a directory-wide
+        # *.insv glob) -- a project folder can hold other raw clips that were
+        # never part of this job, and stitching should only ever happen at
+        # import time, not get re-triggered against unrelated files every time
+        # Run Pipeline is clicked.
+        _video_file = (job_data or {}).get("videoFile", "")
+        _should_stitch = False
+        if _video_file.lower().endswith(".insv"):
+            if (input_dir / _video_file).exists():
+                _should_stitch = True
+            else:
+                # Referenced (never-copied) source -- the raw .insv lives at
+                # the external reference path, not in input_dir.
+                # _stitch_insv_files() already checks the reference itself;
+                # this gate just needs to not skip the whole block on that
+                # account.
+                _ref = _import_reference(_job_root(job_id, job_data))
+                if _ref and _ref.get("kind") == "video" and Path(_ref.get("sourcePath", "")).exists():
+                    _should_stitch = True
+        if _should_stitch:
+            queue_manager.update_job_progress(job_id, 3, "Found Insta360 video — stitching…", milestone=True)
             stitched_v = _stitch_insv_files(job_id, cancel_event, job_data)
             if cancel_event.is_set():
                 queue_manager.fail_job(job_id, "Cancelled by user")
@@ -712,9 +880,9 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
             if stitched_v == 0:
                 queue_manager.fail_job(job_id, "Video stitch step produced no output — check MediaSDK setup")
                 return
-            queue_manager.update_job_progress(job_id, 45, f"Stitched {stitched_v}/{insv_count} video(s)", milestone=True)
+            queue_manager.update_job_progress(job_id, 45, "Stitched video", milestone=True)
             proj_root = _job_root(job_id, job_data)
-            _write_stage_progress(proj_root, "import", {"stitched": stitched_v, "total": insv_count})
+            _write_stage_progress(proj_root, "import", {"stitched": stitched_v, "total": 1})
 
         # ── Storage download (web-queued jobs only) ──────────────
         storage_prefix = job_data.get('storageInputPath')
@@ -783,10 +951,11 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                         shutil.rmtree(str(d))
 
         use_colmap      = getattr(settings, "run_colmap",   False)
+        use_colmap_fisheye = getattr(settings, "run_colmap_fisheye", False)
         use_gluemap     = getattr(settings, "run_gluemap",  False)
         use_rigsfm      = getattr(settings, "run_rigsfm",   False)
         use_equisfm     = getattr(settings, "run_equisfm",  False)
-        _no_sfm         = not settings.run_vggt and not use_colmap and not use_gluemap and not use_rigsfm and not use_equisfm
+        _no_sfm         = not settings.run_vggt and not use_colmap and not use_colmap_fisheye and not use_gluemap and not use_rigsfm and not use_equisfm
         use_rs_brush    = _no_sfm and settings.run_brush and not settings.run_postshot
         use_rs_postshot = _no_sfm and settings.run_postshot and not settings.run_brush
         if use_equisfm:
@@ -804,6 +973,9 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         elif use_colmap:
             stage_map = _STAGE_RANGE_COLMAP_POST_STITCH if insp_count else _STAGE_RANGE_COLMAP
             print(f"  → Stage map: COLMAP {'(post-stitch)' if insp_count else '(direct)'}")
+        elif use_colmap_fisheye:
+            stage_map = _STAGE_RANGE_COLMAP_FISHEYE_POST_STITCH if insp_count else _STAGE_RANGE_COLMAP_FISHEYE
+            print(f"  → Stage map: COLMAP Fisheye {'(post-stitch)' if insp_count else '(direct)'}")
         elif use_gluemap:
             stage_map = _STAGE_RANGE_GLUEMAP_POST_STITCH if insp_count else _STAGE_RANGE_GLUEMAP
             print(f"  → Stage map: GlueMap {'(post-stitch)' if insp_count else '(direct)'}")
@@ -826,6 +998,7 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                      else "rs_brush" if use_rs_brush
                      else "rs_brush" if use_rs_postshot
                      else "colmap"   if use_colmap
+                     else "colmap_fisheye" if use_colmap_fisheye
                      else "gluemap"  if use_gluemap
                      else "vggt")
             extra = {
@@ -914,6 +1087,7 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
                     # Publish to the public gallery Firestore collection
                     _pipeline_mode = ("rs_brush" if use_rs_brush
                               else "colmap"   if use_colmap
+                              else "colmap_fisheye" if use_colmap_fisheye
                               else "gluemap"  if use_gluemap
                               else "vggt")
                     _publish_to_gallery(job_id, job_data, r2_url, gaussian_count, thumbnail_url,
@@ -1055,7 +1229,14 @@ def _upload_thumbnail(job_id: str, proj_root: "Path") -> "str | None":
         input_dir = _input_dir(proj_root)
         jpegs = sorted(input_dir.glob("*.jpg"))
         if not jpegs:
-            print("  [thumbnail] No stitched JPEGs found, skipping thumbnail")
+            # Video jobs have no loose stitched JPEGs in the input dir (just the
+            # video file) -- fall back to an extracted frame instead.
+            frames_dir = proj_root / "01_frames"
+            jpegs = sorted(
+                f for f in frames_dir.glob("*") if f.suffix.lower() in (".jpg", ".jpeg", ".png")
+            )
+        if not jpegs:
+            print("  [thumbnail] No stitched JPEGs or extracted frames found, skipping thumbnail")
             return None
 
         src = jpegs[len(jpegs) // 2]

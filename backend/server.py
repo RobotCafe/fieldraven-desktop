@@ -80,6 +80,7 @@ from . import machine as machine_module
 from . import queue_manager
 from . import pipeline_runner
 from . import splat_config
+from .lens_calibrator import router as calibrator_router
 
 # ── Server state ─────────────────────────────────────────────
 JOBS_DIR = Path("C:/FieldRaven/Jobs")
@@ -132,6 +133,11 @@ app.add_middleware(
 )
 
 # ── API Routes ───────────────────────────────────────────────
+
+# Lens calibration — no auth (local-network-only tool, same trust model
+# as the rest of this local desktop backend; mobile app also hits these
+# routes directly by IP during a live calibration capture session).
+app.include_router(calibrator_router)
 
 # ── Firebase web config ──────────────────────────────────────
 
@@ -577,6 +583,7 @@ class CreateVideoJobRequest(BaseModel):
     name: Optional[str] = None
     location: Optional[str] = None
     notes: Optional[str] = None
+    importMode: str = "copy"  # "copy" | "reference" -- reference leaves the source in place
     siteDate: Optional[str] = None
     siteTime: Optional[str] = None
     lat: Optional[float] = None
@@ -588,8 +595,12 @@ async def create_video_job(
     user: CurrentUser = Depends(require_auth),
 ):
     """Create a processing-queue job for a local video file.
-    The video is copied into <projectDir>/import from camera/ so the pipeline
-    can find it via _find_primary_input and trigger frame extraction as stage 1."""
+    In copy mode (default), the video is copied into <projectDir>/import from camera/
+    so the pipeline can find it via _find_primary_input and trigger frame extraction
+    as stage 1. In reference mode, the source is left in place -- an importReference
+    block in fieldraven.json points _find_primary_input()/_stitch_insv_files() at it
+    directly instead; import from camera/ still gets created since that's where any
+    .insv stitching output lands (see pipeline_runner._stitch_insv_files)."""
     import datetime, shutil as _shutil
 
     video_path = Path(request.videoPath)
@@ -598,12 +609,15 @@ async def create_video_job(
     input_dir = project_dir / "import from camera"
     input_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = input_dir / video_path.name
-    if not dest.exists():
-        import asyncio as _asyncio
-        await _asyncio.get_event_loop().run_in_executor(
-            None, lambda: _shutil.copy2(str(video_path), str(dest))
-        )
+    if request.importMode == "reference":
+        pipeline_runner._write_import_reference(project_dir, kind="video", source_path=video_path)
+    else:
+        dest = input_dir / video_path.name
+        if not dest.exists():
+            import asyncio as _asyncio
+            await _asyncio.get_event_loop().run_in_executor(
+                None, lambda: _shutil.copy2(str(video_path), str(dest))
+            )
 
     display_name = request.name or video_path.stem
 
@@ -1202,6 +1216,7 @@ class ImportFolderRequest(BaseModel):
     jobId: Optional[str] = None
     projectDir: str
     sourceFolder: str
+    importMode: str = "copy"  # "copy" | "reference" -- reference leaves the source in place
     siteDate: Optional[str] = None
     siteTime: Optional[str] = None
     lat: Optional[float] = None
@@ -1230,9 +1245,6 @@ async def import_folder(
     if not source_dir.is_dir():
         raise HTTPException(status_code=400, detail=f"Source folder not found: {source_dir}")
 
-    dest_dir = project_dir / "imported photos"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
     if request.jobId:
         try:
             firebase_client.get_processing_queue().document(request.jobId).update(
@@ -1246,6 +1258,26 @@ async def import_folder(
         if f.is_file() and f.suffix.lower() in _IMPORT_FOLDER_EXTS
     )
     total = len(files)
+
+    if request.importMode == "reference":
+        # Source stays in place -- pipeline_runner._input_dir() resolves straight
+        # to source_dir via the importReference block below (no copy, no
+        # "imported photos" folder needed at all). Source must not be moved,
+        # renamed, or deleted before this project finishes.
+        pipeline_runner._write_import_reference(project_dir, kind="folder", source_path=source_dir)
+        if request.jobId:
+            queue_manager.update_job_progress(
+                request.jobId, 30, f"Referencing {total} files in {source_dir} (not copied)"
+            )
+            await _write_session_meta(project_dir, source_dir, request.jobId,
+                                       request.siteDate or "", request.siteTime or "",
+                                       request.lat, request.lon)
+        return {"imported": 0, "skipped": 0, "errors": 0, "referenced": total,
+                "destination": str(source_dir)}
+
+    dest_dir = project_dir / "imported photos"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
     if total == 0:
         return {"imported": 0, "skipped": 0, "errors": 0, "destination": str(dest_dir)}
 
@@ -1383,8 +1415,38 @@ async def write_project_config(
                 "assignedMachine": machine_module.get_machine_id(),
                 "name":            request.dir.split("\\")[-1].split("/")[-1] or "Project",
             }
+            # Backfill videoFile if the doc doesn't have one -- happens whenever a video
+            # job's doc was deleted (e.g. "delete job" then reopen the same project folder)
+            # and merge-recreated here with no videoFile field, since this endpoint's
+            # update_data never included it. /video-info and /preview-frame resolve job
+            # data via Firestore only (no projectDir fallback like /frames has), so a
+            # missing videoFile 404s them permanently even though the video is still on
+            # disk. Scan the input dir the same way _find_primary_input() does. Done
+            # BEFORE the jobType default below so that default can tell a video project
+            # apart from a folder project instead of guessing.
+            video_file_found = existing_data.get("videoFile")
+            if not video_file_found:
+                input_dir = pipeline_runner._input_dir(project_dir)
+                if input_dir.exists():
+                    for f in sorted(input_dir.iterdir()):
+                        if f.is_file() and f.suffix.lower() in pipeline_runner.VIDEO_EXTS:
+                            video_file_found = f.name
+                            update_data["videoFile"] = f.name
+                            break
+            if not video_file_found:
+                # Referenced (never-copied) video -- nothing to find locally above.
+                ref = pipeline_runner._import_reference(project_dir)
+                if ref and ref.get("kind") == "video":
+                    ref_name = Path(ref.get("sourcePath", "")).name
+                    if ref_name:
+                        video_file_found = ref_name
+                        update_data["videoFile"] = ref_name
             if not existing_data.get("jobType"):
-                update_data["jobType"] = "local_folder"
+                # A whole-doc delete (not just a missing jobType) loses this distinction
+                # entirely -- infer it from whether a video file is actually on disk
+                # rather than assuming local_folder, which previously misclassified
+                # reopened video projects into the Image Folders list.
+                update_data["jobType"] = "local_video" if video_file_found else "local_folder"
             doc_ref.set(update_data, merge=True)
         except Exception as e:
             print(f"⚠️ Could not save projectDir to Firestore: {e}")
@@ -1475,6 +1537,7 @@ async def get_project_state(
 
     saved_settings = saved.get("settings", {})
     run_colmap  = _b(saved_settings.get("run_colmap"),  False)
+    run_colmap_fisheye = _b(saved_settings.get("run_colmap_fisheye"), False)
     run_vggt    = _b(saved_settings.get("run_vggt"),    False)
     run_gluemap = _b(saved_settings.get("run_gluemap"), False)
     run_rigsfm  = _b(saved_settings.get("run_rigsfm"),  False)
@@ -1482,6 +1545,8 @@ async def get_project_state(
 
     if run_colmap:
         pipeline_mode = "colmap"
+    elif run_colmap_fisheye:
+        pipeline_mode = "colmap_fisheye"
     elif run_vggt:
         pipeline_mode = "vggt"
     elif run_gluemap:
@@ -1528,10 +1593,20 @@ async def get_project_state(
         (equisfm_sparse / f).exists() for f in ("cameras.txt", "images.txt")
     )
 
+    # COLMAP Fisheye alignment: worker writes sparse_txt to 03_alignment/colmap_fisheye/sparse_txt
+    colmap_fisheye_sparse = project_dir / "03_alignment" / "colmap_fisheye" / "sparse_txt"
+    colmap_fisheye_done   = colmap_fisheye_sparse.exists() and any(
+        (colmap_fisheye_sparse / f).exists() for f in ("cameras.txt", "images.txt")
+    )
+
     stages["colmap_alignment"] = {
         "done":        colmap_done,
         "cameras":     colmap_cameras,
         "completedAt": saved_stages.get("colmap_alignment", {}).get("completedAt"),
+    }
+    stages["colmap_fisheye_alignment"] = {
+        "done":        colmap_fisheye_done,
+        "completedAt": saved_stages.get("colmap_fisheye_alignment", {}).get("completedAt"),
     }
     stages["vggt_alignment"] = {
         "done":        vggt_done,
@@ -1552,6 +1627,8 @@ async def get_project_state(
 
     if pipeline_mode == "colmap":
         stage_order = ["import", "view_extraction", "colmap_alignment", "brush_training"]
+    elif pipeline_mode == "colmap_fisheye":
+        stage_order = ["import", "colmap_fisheye_alignment", "brush_training"]
     elif pipeline_mode == "vggt":
         stage_order = ["import", "view_extraction", "vggt_alignment", "brush_training"]
     elif pipeline_mode == "gluemap":
@@ -1587,12 +1664,14 @@ async def get_project_state(
 class ProjectPrepareRequest(BaseModel):
     dir: str
     startFrom: str  # "view_extraction" | "realityscan" | "brush_training"
+    jobId: Optional[str] = None
 
 
 _STAGE_DIRS_TO_DELETE: dict[str, list[str]] = {
     "view_extraction":   ["02_views", "03_alignment", "04_training"],
     "realityscan":       ["03_alignment", "04_training"],
     "colmap_alignment":  ["03_alignment", "04_training"],
+    "colmap_fisheye_alignment": ["03_alignment", "04_training"],
     "vggt_alignment":    ["03_alignment", "04_training"],
     "gluemap_alignment": ["03_alignment", "04_training"],
     "rigsfm_alignment":  ["03_alignment", "04_training"],
@@ -1630,6 +1709,8 @@ async def prepare_project_rerun(
                 print(f"⚠️ [prepare] {msg}")
     if errors and not deleted:
         raise HTTPException(status_code=500, detail="; ".join(errors))
+    if request.jobId:
+        queue_manager.requeue_job(request.jobId)
     return {"deleted": deleted, "startFrom": request.startFrom, "errors": errors}
 
 
@@ -1718,6 +1799,11 @@ async def resume_project(
             "colmap_mode":       saved_settings.get("colmap_mode", "rig"),
             "colmap_matcher":    saved_settings.get("colmap_matcher", "sequential"),
             "colmap_visualize":  saved_settings.get("colmap_visualize", False),
+            "run_colmap_fisheye":          saved_settings.get("run_colmap_fisheye", False),
+            "colmap_fisheye_matcher":      saved_settings.get("colmap_fisheye_matcher", "sequential"),
+            "colmap_fisheye_front_profile": saved_settings.get("colmap_fisheye_front_profile", ""),
+            "colmap_fisheye_back_profile":  saved_settings.get("colmap_fisheye_back_profile", ""),
+            "colmap_fisheye_raw_dir":       saved_settings.get("colmap_fisheye_raw_dir", ""),
             "run_gluemap":                saved_settings.get("run_gluemap", False),
             "gluemap_backbone":           saved_settings.get("gluemap_backbone", "pi3"),
             "gluemap_skip_doppelgangers": saved_settings.get("gluemap_skip_doppelgangers", True),
@@ -1733,6 +1819,7 @@ async def resume_project(
             "rigsfm_matcher":             saved_settings.get("rigsfm_matcher", "sequential"),
             "run_equisfm":                saved_settings.get("run_equisfm", False),
             "equisfm_matcher":            saved_settings.get("equisfm_matcher", "sequential"),
+            "equisfm_mapper":             saved_settings.get("equisfm_mapper", "incremental"),
             "equisfm_triangulate":        saved_settings.get("equisfm_triangulate", False),
             "export_xmp":          saved_settings.get("export_xmp", False),
             "brush_rerun_logging": saved_settings.get("brush_rerun_logging", False),
@@ -1820,7 +1907,16 @@ async def stitch_job(
     insp_files = list(input_dir.glob("*.insp")) if input_dir.exists() else []
     insv_files = list(input_dir.glob("*.insv")) if input_dir.exists() else []
     if not insp_files and not insv_files:
-        return {"total": 0, "message": "No .insp/.insv files to convert"}
+        # A referenced (never-copied) .insv won't show up in input_dir's own
+        # glob above -- check the reference directly so this endpoint still
+        # kicks off stitching for it, same as the copy-mode case.
+        ref = pipeline_runner._import_reference(pipeline_runner._job_root(job_id, job_data))
+        if ref and ref.get("kind") == "video":
+            ref_path = Path(ref.get("sourcePath", ""))
+            if ref_path.suffix.lower() == ".insv" and ref_path.exists():
+                insv_files = [ref_path]
+        if not insp_files and not insv_files:
+            return {"total": 0, "message": "No .insp/.insv files to convert"}
 
     is_video = not insp_files and bool(insv_files)
     total = len(insv_files) if is_video else len(insp_files)
@@ -1847,46 +1943,30 @@ async def stitch_job(
     return {"total": total, "message": f"Converting {total} {kind} in background"}
 
 
-@app.get("/api/jobs/{job_id}/input/{filename}")
-async def serve_input_file(
-    job_id: str,
-    filename: str,
-    projectDir: Optional[str] = None,
-    thumb: bool = False,
-):
-    """Serve a file from the job input directory for in-app preview. No auth — localhost only."""
-    if projectDir:
-        # projectDir in the URL is authoritative — skip the Firestore read entirely
-        # (saves a round-trip per image, critical when 25+ thumbnails load in parallel)
-        job_data: dict = {"projectDir": projectDir}
-    else:
-        try:
-            doc = firebase_client.get_processing_queue().document(job_id).get()
-            job_data = doc.to_dict() if doc.exists else {}
-        except Exception:
-            job_data = {}
+def _serve_image_file(base_dir: Path, filename: str, thumb: bool):
+    """Serve one image file from base_dir for in-app preview -- shared by the
+    input-dir gallery (/input/{filename}) and the extracted-frames gallery
+    (/frames/{filename}), which differ only in which directory they're rooted at."""
+    file_path = (base_dir / filename).resolve()
 
-    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
-    file_path = (input_dir / filename).resolve()
-
-    if not str(file_path).startswith(str(input_dir.resolve())):
+    if not str(file_path).startswith(str(base_dir.resolve())):
         raise HTTPException(status_code=403, detail="Access denied")
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    # The Insta360 stitcher writes equirectangular JPEGs in a background thread
-    # while the gallery may already be polling/loading them. Reading mid-write
-    # doesn't raise -- PIL and browser JPEG decoders both tolerantly render
-    # whatever complete scanlines exist so far (valid top rows, black below)
-    # rather than erroring, so this previously slipped through as a normal
-    # 200 response and got permanently cached (server .thumbs/ cache AND the
-    # browser's own image cache) as a corrupt-but-valid-looking thumbnail/
-    # preview. A real JPEG always ends with the EOI marker (0xFFD9); checking
-    # for it lets us reject a mid-write read with an error instead, which
-    # triggers the frontend's existing onerror retry-with-cache-bust logic
-    # (already implemented for both the canvas preview and the thumbnail
-    # row) rather than silently serving/caching bad data.
+    # The Insta360 stitcher (or frame extractor) writes JPEGs in a background
+    # thread while the gallery may already be polling/loading them. Reading
+    # mid-write doesn't raise -- PIL and browser JPEG decoders both tolerantly
+    # render whatever complete scanlines exist so far (valid top rows, black
+    # below) rather than erroring, so this previously slipped through as a
+    # normal 200 response and got permanently cached (server .thumbs/ cache
+    # AND the browser's own image cache) as a corrupt-but-valid-looking
+    # thumbnail/preview. A real JPEG always ends with the EOI marker
+    # (0xFFD9); checking for it lets us reject a mid-write read with an error
+    # instead, which triggers the frontend's existing onerror
+    # retry-with-cache-bust logic (already implemented for both the canvas
+    # preview and the thumbnail row) rather than silently serving/caching bad data.
     def _is_complete_jpeg(p: Path) -> bool:
         try:
             with open(p, "rb") as fh:
@@ -1901,7 +1981,7 @@ async def serve_input_file(
 
     # Serve a small disk-cached thumbnail so the gallery doesn't load full 6-12K images
     if thumb and file_path.suffix.lower() in ('.jpg', '.jpeg', '.png'):
-        thumb_dir = input_dir / ".thumbs"
+        thumb_dir = base_dir / ".thumbs"
         thumb_path = (thumb_dir / filename).resolve()
         if thumb_path.exists() and thumb_path.stat().st_size < 500:
             # Cached thumbnail is suspiciously small (corrupt/black) — regenerate it
@@ -1934,19 +2014,205 @@ async def serve_input_file(
     return FileResponse(str(file_path))
 
 
+@app.get("/api/jobs/{job_id}/input/{filename}")
+async def serve_input_file(
+    job_id: str,
+    filename: str,
+    projectDir: Optional[str] = None,
+    thumb: bool = False,
+):
+    """Serve a file from the job input directory for in-app preview. No auth — localhost only."""
+    if projectDir:
+        # projectDir in the URL is authoritative — skip the Firestore read entirely
+        # (saves a round-trip per image, critical when 25+ thumbnails load in parallel)
+        job_data: dict = {"projectDir": projectDir}
+    else:
+        try:
+            doc = firebase_client.get_processing_queue().document(job_id).get()
+            job_data = doc.to_dict() if doc.exists else {}
+        except Exception:
+            job_data = {}
+
+    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
+    return _serve_image_file(input_dir, filename, thumb)
+
+
+@app.get("/api/jobs/{job_id}/frames")
+async def list_extracted_frames(
+    job_id: str,
+    projectDir: Optional[str] = None,
+    user: CurrentUser = Depends(require_auth),
+):
+    """List real, already-extracted frames in 01_frames/ (written by
+    /extract-frames or by a real pipeline run) -- distinct from /files, which
+    lists the *input* directory (raw imported photos/video), not extracted frames."""
+    job_data: dict = {"projectDir": projectDir} if projectDir else {}
+    if not projectDir:
+        try:
+            doc = firebase_client.get_processing_queue().document(job_id).get()
+            job_data = doc.to_dict() if doc.exists else {}
+        except Exception:
+            job_data = {}
+
+    frames_dir = pipeline_runner._job_root(job_id, job_data) / "01_frames"
+    if not frames_dir.exists():
+        return {"files": [], "total": 0, "alreadyExtracted": False}
+
+    img_exts = {".jpg", ".jpeg", ".png"}
+    files = sorted(f.name for f in frames_dir.iterdir() if f.is_file() and f.suffix.lower() in img_exts)
+
+    already_extracted = False
+    meta_path = frames_dir / ".extraction_meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            already_extracted = meta.get("n_frames") == len(files)
+        except Exception:
+            pass
+
+    return {"files": files, "total": len(files), "alreadyExtracted": already_extracted}
+
+
+@app.get("/api/jobs/{job_id}/frames/{filename}")
+async def serve_extracted_frame(
+    job_id: str,
+    filename: str,
+    projectDir: Optional[str] = None,
+    thumb: bool = False,
+):
+    """Serve one real extracted frame from 01_frames/ for in-app preview. No auth — localhost only."""
+    job_data: dict = {"projectDir": projectDir} if projectDir else {}
+    if not projectDir:
+        try:
+            doc = firebase_client.get_processing_queue().document(job_id).get()
+            job_data = doc.to_dict() if doc.exists else {}
+        except Exception:
+            job_data = {}
+
+    frames_dir = pipeline_runner._job_root(job_id, job_data) / "01_frames"
+    return _serve_image_file(frames_dir, filename, thumb)
+
+
+@app.post("/api/jobs/{job_id}/extract-frames")
+async def extract_frames_endpoint(
+    job_id: str,
+    raw_request: Request,
+    user: CurrentUser = Depends(require_auth),
+):
+    """Extract real frames into 01_frames/ in the background (mirrors /stitch's
+    shape). Skips the work entirely if a matching extraction already exists --
+    see pipeline.ensure_frames_extracted(). Accepts the same UI-settings body
+    shape as /start so the button and a later real pipeline run always agree
+    on what "matching settings" means."""
+    import threading
+
+    try:
+        ui_settings = await raw_request.json()
+    except Exception:
+        ui_settings = {}
+
+    try:
+        doc = firebase_client.get_processing_queue().document(job_id).get()
+        job_data = doc.to_dict() if doc.exists else {}
+    except Exception:
+        job_data = {}
+
+    input_path = pipeline_runner._find_primary_input(job_id, job_data)
+    if not input_path or not Path(input_path).is_file():
+        return {"success": False, "message": "No video file found for this job"}
+
+    cancel = threading.Event()
+
+    def _run():
+        try:
+            result = pipeline_runner._extract_frames_files(job_id, cancel, job_data, ui_settings)
+            if result.get("success"):
+                msg = (f"Already extracted ({result['n_frames']} frames)" if result.get("already_done")
+                       else f"Extracted {result['n_frames']} frames")
+                queue_manager.update_job_progress(job_id, 20, msg)
+            else:
+                queue_manager.update_job_progress(job_id, 0, result.get("error", "Frame extraction failed"))
+        except Exception as e:
+            queue_manager.update_job_progress(job_id, 0, f"Frame extraction failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    queue_manager.update_job_progress(job_id, 1, "Extracting frames…")
+    return {"success": True, "message": "Extracting frames in background"}
+
+
 # ── Video preview endpoints ───────────────────────────────────
 # Uses OpenCV VideoCapture (same approach as GPU_video_extraction.py in V13):
 #   - video-info: instant cap props, no subprocess
 #   - preview-frame: seek + single decode + in-memory imencode, no temp file,
 #     optional CUDA decode, orders of magnitude faster than spawning ffmpeg per frame
 
-def _resolve_video_path(job_id: str) -> dict:
-    """Shared helper: look up job data from Firestore for video preview endpoints."""
-    try:
-        doc = firebase_client.get_processing_queue().document(job_id).get()
-        return doc.to_dict() if doc.exists else {}
-    except Exception:
-        return {}
+def _resolve_video_path(job_id: str, project_dir: Optional[str] = None) -> dict:
+    """Shared helper: look up job data for video preview endpoints.
+
+    projectDir in the URL is authoritative when given -- skips the Firestore read
+    entirely, same reasoning as serve_input_file(). Without this, these endpoints
+    would 404 whenever the job's Firestore doc has no videoFile yet (e.g. right after
+    reopening a project whose job was previously deleted -- the doc gets merge-recreated
+    by the project-config autosave, but only if/after that request lands first).
+
+    Also self-heals a missing videoFile by scanning the project's input dir directly
+    (mirrors pipeline_runner._find_primary_input()'s own video-file preference), so this
+    doesn't strictly depend on that autosave having already backfilled it either. For a
+    reference-mode import (source never copied in), the local scan finds nothing, so
+    this also falls back to the registered import reference's file name.
+    """
+    job_data: dict = {"projectDir": project_dir} if project_dir else {}
+    if not project_dir:
+        try:
+            doc = firebase_client.get_processing_queue().document(job_id).get()
+            job_data = doc.to_dict() if doc.exists else {}
+        except Exception:
+            job_data = {}
+
+    if not job_data.get("videoFile"):
+        input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
+        if input_dir.exists():
+            for f in sorted(input_dir.iterdir()):
+                if f.is_file() and f.suffix.lower() in pipeline_runner.VIDEO_EXTS:
+                    job_data["videoFile"] = f.name
+                    break
+    if not job_data.get("videoFile"):
+        ref = pipeline_runner._import_reference(pipeline_runner._job_root(job_id, job_data))
+        if ref and ref.get("kind") == "video":
+            ref_name = Path(ref.get("sourcePath", "")).name
+            if ref_name:
+                job_data["videoFile"] = ref_name
+    return job_data
+
+
+def _resolve_preview_video_file(job_id: str, job_data: dict, video_file: str) -> Path:
+    """Return the actual on-disk path to preview/probe for a video job:
+    the project-owned stitched output if one exists (mirrors
+    pipeline_runner._find_primary_input()'s same priority for a raw .insv),
+    else the project-owned copy, else the registered external reference
+    (reference-mode import, source never copied in). Raises 404 if none of
+    these resolve, or 403 if a local match somehow escapes the project's own
+    input dir (defense in depth against a tampered videoFile)."""
+    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
+
+    if video_file.lower().endswith(".insv"):
+        stitched = input_dir / (video_file[:-len(".insv")] + "_equirect.mp4")
+        if stitched.exists():
+            return stitched.resolve()
+
+    local_path = (input_dir / video_file).resolve()
+    if local_path.exists():
+        if not str(local_path).startswith(str(input_dir.resolve())):
+            raise HTTPException(status_code=403, detail="Access denied")
+        return local_path
+
+    ref = pipeline_runner._import_reference(pipeline_runner._job_root(job_id, job_data))
+    if ref and ref.get("kind") == "video":
+        ref_path = Path(ref.get("sourcePath", "")).resolve()
+        if ref_path.name == video_file and ref_path.exists():
+            return ref_path
+
+    raise HTTPException(status_code=404, detail="Video file not found")
 
 
 def _get_cv2_backend():
@@ -1963,22 +2229,16 @@ def _get_cv2_backend():
 
 
 @app.get("/api/jobs/{job_id}/video-info")
-async def get_video_info_for_job(job_id: str):
+async def get_video_info_for_job(job_id: str, projectDir: Optional[str] = None):
     """Return duration/fps/dimensions for a local_video job (no auth — localhost only).
     Uses OpenCV VideoCapture to read container headers instantly — no subprocess."""
-    job_data = _resolve_video_path(job_id)
+    job_data = _resolve_video_path(job_id, projectDir)
 
     video_file = job_data.get('videoFile')
     if not video_file:
         raise HTTPException(status_code=404, detail="No video file for this job")
 
-    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
-    video_path = (input_dir / video_file).resolve()
-
-    if not str(video_path).startswith(str(input_dir.resolve())):
-        raise HTTPException(status_code=403, detail="Access denied")
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Video file not found")
+    video_path = _resolve_preview_video_file(job_id, job_data, video_file)
 
     cv2, _cuda = _get_cv2_backend()
     if cv2 is None:
@@ -2027,27 +2287,79 @@ async def get_video_info_for_job(job_id: str):
     return info
 
 
+@app.get("/api/jobs/{job_id}/render-resolution")
+async def get_render_resolution(job_id: str, projectDir: Optional[str] = None, fov: float = 94.6):
+    """Return the actual per-sensor image resolution Brush will train against for
+    this job -- the number `brush_max_resolution` needs to be compared to, since
+    Brush's own --max-resolution only ever downsamples (never upscales, confirmed
+    in brush-dataset/src/load_image.rs's output_scale()) -- setting it below this
+    value silently trains on downsampled images with no warning anywhere.
+
+    Prefers a real rendered view from 02_views/ (ground truth). Falls back to
+    computing the *would-be* resolution from 01_frames/ + fov using the exact same
+    formula the pipeline itself uses for view rendering (see
+    RIG_PIPELINE_PROCESS.md: image_size = pano_height * fov_deg / 180), for a job
+    that hasn't reached view extraction yet."""
+    proj_root = pipeline_runner._job_root(job_id, {"projectDir": projectDir} if projectDir else None)
+
+    def _read() -> dict:
+        from PIL import Image as _PIL
+
+        views_dir = proj_root / "02_views"
+        if views_dir.exists():
+            for img_path in sorted(views_dir.rglob("*.jpg")):
+                try:
+                    with _PIL.open(img_path) as im:
+                        w, h = im.size
+                    return {"width": w, "height": h, "source": "rendered"}
+                except Exception:
+                    continue
+
+        frames_dir = proj_root / "01_frames"
+        if frames_dir.exists():
+            for img_path in sorted(frames_dir.glob("*.jpg")):
+                try:
+                    with _PIL.open(img_path) as im:
+                        _, pano_h = im.size
+                    size = int(pano_h * fov / 180)
+                    return {"width": size, "height": size, "source": "estimated"}
+                except Exception:
+                    continue
+
+        return {"width": None, "height": None, "source": "none"}
+
+    return await asyncio.get_event_loop().run_in_executor(None, _read)
+
+
 @app.get("/api/jobs/{job_id}/preview-frame")
-async def preview_frame(job_id: str, timestamp: float = 0.0):
+async def preview_frame(job_id: str, timestamp: float = 0.0, projectDir: Optional[str] = None):
     """Extract a single JPEG from the job video at the given timestamp (no auth — localhost only).
     Uses OpenCV seek + decode + in-memory imencode — no subprocess spawn, no temp file.
     Falls back to ffmpeg subprocess if OpenCV cannot open the file (e.g. unsupported codec)."""
-    job_data = _resolve_video_path(job_id)
+    job_data = _resolve_video_path(job_id, projectDir)
 
     video_file = job_data.get('videoFile')
     if not video_file:
         raise HTTPException(status_code=404, detail="No video file for this job")
 
-    input_dir = pipeline_runner._input_dir(pipeline_runner._job_root(job_id, job_data))
-    video_path = (input_dir / video_file).resolve()
-
-    if not str(video_path).startswith(str(input_dir.resolve())):
-        raise HTTPException(status_code=403, detail="Access denied")
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Video file not found")
+    video_path = _resolve_preview_video_file(job_id, job_data, video_file)
 
     timestamp = max(0.0, timestamp)
     cv2, cuda_ok = _get_cv2_backend()
+
+    # A timestamp at or past the true end has no frame to seek to -- neither
+    # OpenCV nor ffmpeg can produce one, and both just fail. video_extraction.py
+    # (the SplatPipe App's own extractor) hits the same issue and fixes it with
+    # a 200ms buffer off the end; apply the same buffer here.
+    if cv2 is not None:
+        _cap = cv2.VideoCapture(str(video_path))
+        if _cap.isOpened():
+            _fps = _cap.get(cv2.CAP_PROP_FPS) or 0
+            _n = _cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            _cap.release()
+            if _fps > 0 and _n > 0:
+                duration = _n / _fps
+                timestamp = min(timestamp, max(0.0, duration - 0.2))
 
     def _extract_opencv() -> bytes | None:
         if cv2 is None:

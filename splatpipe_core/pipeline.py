@@ -9,6 +9,7 @@ Stages:
 """
 import os
 import re
+import json
 import subprocess
 import sys
 import shutil
@@ -63,6 +64,206 @@ def _make_reporter(on_progress: Optional[Callable[[StageProgress], None]]):
                 _last_fb[0] = fb_key
                 on_progress(StageProgress(stage=stage, progress=pct, message=message, detail=detail))
     return report
+
+
+_FRAME_META_NAME = ".extraction_meta.json"
+_FRAME_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+def _frame_extraction_signature(video_path: Path, settings: PipelineSettings) -> dict:
+    """Everything that determines what extraction *should* produce. Source stat
+    fields catch a re-stitch producing new content under the same filename;
+    the rest catches a settings change. Comparing this dict is how we know
+    whether an existing 01_frames/ already matches what would be re-extracted."""
+    st = video_path.stat()
+    return {
+        "source_name":       video_path.name,
+        "source_size":       st.st_size,
+        "source_mtime":      st.st_mtime,
+        "extraction_method": settings.extraction_method,
+        "interval_value":    settings.interval_value,
+        "interval_unit":     settings.interval_unit,
+        "frame_count":       settings.frame_count,
+        "frame_format":      settings.frame_format,
+    }
+
+
+def ensure_frames_extracted(
+    video_path: str,
+    frames_dir: Path,
+    settings: PipelineSettings,
+    progress_callback: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[bool, int, bool]:
+    """Extract frames from video_path into frames_dir, but only if a matching
+    extraction (same source file content + same extraction settings) doesn't
+    already exist there. Returns (success, n_frames, already_done).
+
+    This is the single source of truth both the "Extract Frames" button and
+    the real pipeline run call into, so neither can redo the other's work and
+    both agree on what "matching settings" means."""
+    import video_extraction  # type: ignore -- loaded onto sys.path by _load_splatpipe
+
+    video_p = Path(video_path)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    sig = _frame_extraction_signature(video_p, settings)
+
+    meta_path = frames_dir / _FRAME_META_NAME
+    if meta_path.exists():
+        try:
+            prev = json.loads(meta_path.read_text(encoding="utf-8"))
+            on_disk = sum(1 for f in frames_dir.iterdir() if f.suffix.lower() in _FRAME_EXTS)
+            if prev.get("signature") == sig and prev.get("n_frames") == on_disk:
+                return True, on_disk, True
+        except Exception:
+            pass  # corrupt/unreadable marker -- fall through and re-extract
+
+    # Settings (or source content) changed, or no marker yet -- clear stale
+    # frames before re-extracting so a lower frame count never leaves extras.
+    for f in frames_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in _FRAME_EXTS:
+            f.unlink()
+
+    ok = video_extraction.extract_frames_for_video(
+        video_path=str(video_p),
+        output_folder=str(frames_dir),
+        extraction_method=settings.extraction_method,
+        interval_value=settings.interval_value,
+        interval_unit=settings.interval_unit,
+        frame_count=settings.frame_count,
+        frame_format=settings.frame_format,
+        ffmpeg_path=settings.ffmpeg_path,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    )
+    if not ok:
+        return False, 0, False
+
+    n_frames = sum(1 for f in frames_dir.iterdir() if f.suffix.lower() in _FRAME_EXTS)
+    try:
+        meta_path.write_text(json.dumps({"signature": sig, "n_frames": n_frames}), encoding="utf-8")
+    except Exception:
+        pass  # marker write failure shouldn't fail an otherwise-successful extraction
+    return True, n_frames, False
+
+
+_VIEW_META_NAME = ".view_extraction_meta.json"
+
+
+def _view_extraction_signature(source_dir: Path, frame_paths: List[Path], settings: PipelineSettings) -> dict:
+    """Everything that determines what view extraction *should* produce. Reuses
+    frame extraction's own signature (source video content + extraction settings)
+    when available, so a real re-extraction of 01_frames/ (different content under
+    the same filenames) invalidates the views cache too, not just a settings change
+    here; falls back to a frame-count + total-size proxy for the image-folder input
+    case, which has no frame-extraction marker of its own. Comparing this dict is
+    how we know whether an existing 02_views/ already matches what would be
+    re-rendered."""
+    frame_meta_path = source_dir / _FRAME_META_NAME
+    frame_sig = None
+    if frame_meta_path.exists():
+        try:
+            frame_sig = json.loads(frame_meta_path.read_text(encoding="utf-8")).get("signature")
+        except Exception:
+            pass
+    if frame_sig is None:
+        frame_sig = {
+            "n_frames":    len(frame_paths),
+            "total_size":  sum(p.stat().st_size for p in frame_paths),
+        }
+    return {
+        "frame_source_signature": frame_sig,
+        "fov":          settings.fov,
+        "yaw_steps":    settings.yaw_steps,
+        "pitch_angles": list(settings.pitch_angles),
+        "horizon_ref":  getattr(settings, "horizon_ref", False),
+    }
+
+
+def ensure_views_extracted(
+    frame_paths: List[Path],
+    source_dir: Path,
+    views_dir: Path,
+    settings: PipelineSettings,
+    progress_callback: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[bool, int, bool]:
+    """Render perspective views from frame_paths into views_dir, but only if a
+    matching render (same source frames + same view settings) doesn't already
+    exist there. Returns (success, total_views, already_done).
+
+    Mirrors ensure_frames_extracted()'s caching pattern -- without this, every
+    plain "Run Pipeline" re-render all views from scratch even when 02_views/
+    already has a complete, matching set on disk (e.g. after only changing an
+    unrelated setting like colmap_bin), which is exactly the redundant-work bug
+    that fix already solved one stage earlier."""
+    import panorama_processing  # type: ignore -- loaded onto sys.path by _load_splatpipe
+
+    views_dir.mkdir(parents=True, exist_ok=True)
+    sig = _view_extraction_signature(source_dir, frame_paths, settings)
+
+    n_frames = len(frame_paths)
+    views_per_frame = len(settings.pitch_angles) * settings.yaw_steps + (1 if getattr(settings, "horizon_ref", False) else 0)
+    total_views = n_frames * views_per_frame
+
+    meta_path = views_dir / _VIEW_META_NAME
+    if meta_path.exists():
+        try:
+            prev = json.loads(meta_path.read_text(encoding="utf-8"))
+            on_disk = sum(1 for f in views_dir.rglob("*") if f.is_file() and f.suffix.lower() in _FRAME_EXTS)
+            if prev.get("signature") == sig and prev.get("total_views") == on_disk:
+                return True, on_disk, True
+        except Exception:
+            pass  # corrupt/unreadable marker -- fall through and re-render
+
+    # Settings (or source frames) changed, or no marker yet -- clear stale
+    # per-frame view subdirectories before re-rendering so a lower view count
+    # never leaves extras behind.
+    if views_dir.exists():
+        for sub in views_dir.iterdir():
+            if sub.is_dir():
+                shutil.rmtree(sub, ignore_errors=True)
+
+    view_counter = [0]
+    last_pct = [-1]
+
+    for fi, frame_path in enumerate(frame_paths):
+        if cancel_event and cancel_event.is_set():
+            return False, view_counter[0], False
+
+        def _view_cb(current_view, total_per_frame, _fi=fi):
+            if current_view >= total_per_frame:  # skip the per-frame completion ping
+                return
+            view_counter[0] += 1
+            pct = min(int(view_counter[0] / total_views * 100), 100)
+            if pct == last_pct[0]:
+                return
+            last_pct[0] = pct
+            if progress_callback:
+                display = min(current_view + 1, total_per_frame)
+                progress_callback(_fi, n_frames, pct, display, total_per_frame)
+
+        panorama_processing.render_views(
+            pano_path=str(frame_path),
+            out_root=str(views_dir),
+            fov_deg=settings.fov,
+            yaw_steps=settings.yaw_steps,
+            pitch_angles=settings.pitch_angles,
+            export_xmp=False,
+            save_images=True,
+            cancel_event=cancel_event,
+            progress_callback=_view_cb,
+            horizon_ref=getattr(settings, "horizon_ref", False),
+        )
+
+    if cancel_event and cancel_event.is_set():
+        return False, view_counter[0], False
+
+    try:
+        meta_path.write_text(json.dumps({"signature": sig, "total_views": total_views}), encoding="utf-8")
+    except Exception:
+        pass  # marker write failure shouldn't fail an otherwise-successful render
+    return True, total_views, False
 
 
 def _estimate_vggt_progress(message: str, total_seen: int) -> int:
@@ -516,11 +717,12 @@ def run_pipeline(
 
     # Determine which stages to skip when resuming from a saved state.
     # Each key implies all earlier stages are also skipped.
-    _SKIP_STAGE1 = {'view_extraction', 'realityscan', 'brush_training', 'vggt_alignment', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment', 'colmap_export', 'colmap_alignment'}
-    _SKIP_STAGE2 = {'realityscan', 'brush_training', 'vggt_alignment', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment', 'colmap_export', 'colmap_alignment'}
+    _SKIP_STAGE1 = {'view_extraction', 'realityscan', 'brush_training', 'vggt_alignment', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment', 'colmap_export', 'colmap_alignment', 'colmap_fisheye_alignment'}
+    _SKIP_STAGE2 = {'realityscan', 'brush_training', 'vggt_alignment', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment', 'colmap_export', 'colmap_alignment', 'colmap_fisheye_alignment'}
     skip_stage1  = start_from in _SKIP_STAGE1
     skip_stage2  = start_from in _SKIP_STAGE2
     skip_colmap  = start_from in ('brush_training', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment')
+    skip_colmap_fisheye = start_from in ('brush_training',)
     skip_rs      = start_from in ('brush_training', 'gluemap_alignment', 'rigsfm_alignment', 'equisfm_alignment')
 
     # ═══════════════════════════════════════════════════════════
@@ -545,15 +747,10 @@ def run_pipeline(
             msg = f"Frame {current}/{total}" + (f" at {ts:.1f}s" if ts else "")
             report(PipelineStage.FRAME_EXTRACTION, pct, msg)
 
-        ok = video_extraction.extract_frames_for_video(
+        ok, n_frames, already_done = ensure_frames_extracted(
             video_path=str(input_p),
-            output_folder=str(frames_dir),
-            extraction_method=settings.extraction_method,
-            interval_value=settings.interval_value,
-            interval_unit=settings.interval_unit,
-            frame_count=settings.frame_count,
-            frame_format=settings.frame_format,
-            ffmpeg_path=settings.ffmpeg_path,
+            frames_dir=frames_dir,
+            settings=settings,
             progress_callback=_frame_cb,
             cancel_event=cancel_event,
         )
@@ -562,7 +759,8 @@ def run_pipeline(
                 success=False, job_id=job_id, output_dir=str(job_dir),
                 error="Frame extraction failed or produced no frames",
             )
-        report(PipelineStage.FRAME_EXTRACTION, 100, "Frame extraction complete")
+        report(PipelineStage.FRAME_EXTRACTION, 100,
+               f"Already extracted ({n_frames} frames)" if already_done else "Frame extraction complete")
         source_dir = str(frames_dir)
     else:
         # Input is already an image folder
@@ -593,46 +791,36 @@ def run_pipeline(
 
         n_frames = len(frame_paths)
         views_per_frame = len(settings.pitch_angles) * settings.yaw_steps + (1 if getattr(settings, "horizon_ref", False) else 0)
-        total_views = n_frames * views_per_frame
-        view_counter = [0]   # mutable counter shared across loop closures
 
         report(PipelineStage.VIEW_EXTRACTION, 0,
                f"Rendering views for {n_frames} frames "
                f"({views_per_frame} views each)…")
 
-        for fi, frame_path in enumerate(frame_paths):
-            if cancel_event.is_set():
-                return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
-
-            def _view_cb(current_view, total_per_frame, _fi=fi):
-                if current_view >= total_per_frame:  # skip the per-frame completion ping
-                    return
-                view_counter[0] += 1
-                pct = min(int(view_counter[0] / total_views * 100), 100)
-                display = min(current_view + 1, total_per_frame)
-                report(
-                    PipelineStage.VIEW_EXTRACTION, pct,
-                    f"Frame {_fi + 1}/{n_frames} — view {display}/{total_per_frame}",
-                )
-
-            panorama_processing.render_views(
-                pano_path=str(frame_path),
-                out_root=str(views_dir),
-                fov_deg=settings.fov,
-                yaw_steps=settings.yaw_steps,
-                pitch_angles=settings.pitch_angles,
-                export_xmp=False,
-                save_images=True,
-                cancel_event=cancel_event,
-                progress_callback=_view_cb,
-                horizon_ref=getattr(settings, "horizon_ref", False),
+        def _view_progress(_fi, _n_frames, pct, display, total_per_frame):
+            report(
+                PipelineStage.VIEW_EXTRACTION, pct,
+                f"Frame {_fi + 1}/{_n_frames} — view {display}/{total_per_frame}",
             )
 
-        if cancel_event.is_set():
-            return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+        ok, total_views, already_done = ensure_views_extracted(
+            frame_paths=frame_paths,
+            source_dir=Path(source_dir),
+            views_dir=views_dir,
+            settings=settings,
+            progress_callback=_view_progress,
+            cancel_event=cancel_event,
+        )
+        if not ok:
+            if cancel_event.is_set():
+                return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+            return PipelineResult(
+                success=False, job_id=job_id, output_dir=str(job_dir),
+                error="View extraction failed or produced no views",
+            )
 
         report(PipelineStage.VIEW_EXTRACTION, 100,
-               f"View extraction complete — {total_views} views rendered")
+               f"Already rendered ({total_views} views)" if already_done
+               else f"View extraction complete — {total_views} views rendered")
 
     # ═══════════════════════════════════════════════════════════
     # STAGE 3 — COLMAP alignment  (when run_colmap=True)
@@ -682,6 +870,68 @@ def run_pipeline(
             )
 
         # COLMAP/GlueMap+PostShot: PostShot reads brush_input/ directly (COLMAP files + images)
+        if settings.run_postshot:
+            _run_postshot_training(brush_input_dir, training_dir, settings, report, cancel_event)
+        if settings.run_brush:
+            _run_brush_training(training_dir, settings, report, cancel_event)
+        return PipelineResult(
+            success=True, job_id=job_id, output_dir=str(job_dir),
+            stats={"frames_extracted": n_frames, "views_rendered": total_views},
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # STAGE 3 — COLMAP Fisheye alignment  (when run_colmap_fisheye=True)
+    # Operates on settings.colmap_fisheye_raw_dir (raw, un-stitched per-lens
+    # frames) instead of views_dir — see colmap_fisheye_runner.py docstring
+    # for why 02_views/ synthetic pinhole crops don't work for this mode.
+    # ═══════════════════════════════════════════════════════════
+    if getattr(settings, "run_colmap_fisheye", False):
+        if cancel_event.is_set():
+            return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        from .colmap_fisheye_runner import run_colmap_fisheye_pipeline
+
+        colmap_fisheye_dir = job_dir / "03_alignment" / "colmap_fisheye"
+        brush_input_dir     = training_dir / "brush_input"
+        raw_dir              = Path(getattr(settings, "colmap_fisheye_raw_dir", "") or "")
+
+        if skip_colmap_fisheye and brush_input_dir.exists():
+            report(PipelineStage.COLMAP_FISHEYE_ALIGNMENT, 100,
+                   "COLMAP Fisheye alignment skipped — resuming from saved brush_input/")
+        else:
+            if not raw_dir.exists():
+                return PipelineResult(
+                    success=False, job_id=job_id, output_dir=str(job_dir),
+                    error=f"colmap_fisheye_raw_dir does not exist: {raw_dir}",
+                )
+            run_colmap_fisheye_pipeline(
+                raw_dir=raw_dir,
+                colmap_dir=colmap_fisheye_dir,
+                brush_input_dir=brush_input_dir,
+                settings=settings,
+                report=report,
+                cancel_event=cancel_event,
+            )
+
+            if cancel_event.is_set():
+                return PipelineResult(success=False, job_id=job_id, output_dir=str(job_dir), error="Cancelled")
+
+        colmap_fisheye_files = list(brush_input_dir.glob("*.txt")) if brush_input_dir.exists() else []
+        if not colmap_fisheye_files:
+            return PipelineResult(
+                success=False, job_id=job_id, output_dir=str(job_dir),
+                error="COLMAP Fisheye produced no text files in brush_input/.",
+            )
+
+        report(PipelineStage.COLMAP_FISHEYE_ALIGNMENT, 100,
+               f"COLMAP Fisheye complete — {len(colmap_fisheye_files)} file(s) in brush_input/")
+
+        if not settings.run_brush and not settings.run_postshot and not skip_colmap_fisheye:
+            return PipelineResult(
+                success=True, job_id=job_id, output_dir=str(job_dir),
+                stats={"frames_extracted": n_frames, "views_rendered": total_views},
+            )
+
         if settings.run_postshot:
             _run_postshot_training(brush_input_dir, training_dir, settings, report, cancel_event)
         if settings.run_brush:
