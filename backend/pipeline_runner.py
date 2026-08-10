@@ -317,6 +317,35 @@ def _find_primary_input(job_id: str, job_data: Optional[dict] = None) -> Optiona
     return None
 
 
+def _find_raw_fisheye_sources(job_id: str, job_data: Optional[dict] = None) -> Optional[dict]:
+    """Resolve the job's own raw, un-stitched Insta360 source for auto-deriving
+    colmap_fisheye_raw_dir (see splatpipe_core/fisheye_frame_extractor.py). Mirrors
+    _stitch_insv_files'/_stitch_insp_files' own resolution logic (lines above) rather
+    than inventing new logic. Returns None if this job has no raw .insv/.insp at all
+    (non-Insta360 source, or a job relying solely on a manually-pointed / mobile
+    live-capture raw_dir) -- the caller no-ops in that case."""
+    proj_root = _job_root(job_id, job_data)
+    input_dir = _input_dir(proj_root)
+
+    video_file = (job_data or {}).get("videoFile", "")
+    if video_file.lower().endswith(".insv"):
+        candidate = input_dir / video_file
+        if candidate.exists():
+            return {"kind": "insv", "paths": [candidate]}
+        ref = _import_reference(proj_root)
+        if ref and ref.get("kind") == "video":
+            ref_path = Path(ref.get("sourcePath", ""))
+            if ref_path.name == video_file and ref_path.exists():
+                return {"kind": "insv", "paths": [ref_path]}
+
+    if input_dir.exists():
+        insp_files = sorted(input_dir.glob("*.insp"))
+        if insp_files:
+            return {"kind": "insp", "paths": insp_files}
+
+    return None
+
+
 def _to_bool(v) -> bool:
     if isinstance(v, bool):
         return v
@@ -476,10 +505,14 @@ def _build_settings(job_data: dict):
         if "rigsfm_matcher" in ui:             s.rigsfm_matcher             = ui["rigsfm_matcher"]
         if "rigsfm_quad_anchors" in ui:        s.rigsfm_quad_anchors        = _to_bool(ui["rigsfm_quad_anchors"])
         if "run_colmap_fisheye" in ui:          s.run_colmap_fisheye          = _to_bool(ui["run_colmap_fisheye"])
+        if "colmap_fisheye_use_calibration" in ui: s.colmap_fisheye_use_calibration = _to_bool(ui["colmap_fisheye_use_calibration"])
         if "colmap_fisheye_matcher" in ui:       s.colmap_fisheye_matcher       = ui["colmap_fisheye_matcher"]
         if "colmap_fisheye_front_profile" in ui: s.colmap_fisheye_front_profile = ui["colmap_fisheye_front_profile"]
         if "colmap_fisheye_back_profile" in ui:  s.colmap_fisheye_back_profile  = ui["colmap_fisheye_back_profile"]
         if "colmap_fisheye_raw_dir" in ui:        s.colmap_fisheye_raw_dir       = ui["colmap_fisheye_raw_dir"]
+        if "colmap_fisheye_fov_deg" in ui:          s.colmap_fisheye_fov_deg          = float(ui["colmap_fisheye_fov_deg"])
+        if "colmap_fisheye_raw_fov_deg" in ui:      s.colmap_fisheye_raw_fov_deg      = float(ui["colmap_fisheye_raw_fov_deg"])
+        if "colmap_fisheye_raw_swap_lenses" in ui:  s.colmap_fisheye_raw_swap_lenses  = _to_bool(ui["colmap_fisheye_raw_swap_lenses"])
         if "run_equisfm" in ui:                s.run_equisfm                = _to_bool(ui["run_equisfm"])
         if "equisfm_matcher" in ui:            s.equisfm_matcher            = ui["equisfm_matcher"]
         if "equisfm_mapper" in ui:             s.equisfm_mapper             = ui["equisfm_mapper"]
@@ -917,6 +950,54 @@ def _worker(job_id: str, job_data: dict, cancel_event: threading.Event):
         settings = _build_settings(job_data)
         proj_root = Path(str(_job_root(job_id, job_data)))
         settings.project_dir = str(proj_root)
+
+        # ── COLMAP Fisheye: auto-derive raw_dir from the job's own raw .insv/.insp
+        # if the user hasn't manually pointed at some other folder. Silent no-op for
+        # non-Insta360 jobs or when a manual/mobile-live-capture folder is already set.
+        if getattr(settings, "run_colmap_fisheye", False) and not (settings.colmap_fisheye_raw_dir or "").strip():
+            _raw_sources = _find_raw_fisheye_sources(job_id, job_data)
+            if _raw_sources:
+                from splatpipe_core import fisheye_frame_extractor
+                from splatpipe_core.calibration_profiles import load_profile as _load_calib_profile
+
+                _front_profile = _back_profile = None
+                if getattr(settings, "colmap_fisheye_use_calibration", True):
+                    _front_profile = _load_calib_profile(settings.colmap_fisheye_front_profile)
+                    _back_profile = _load_calib_profile(settings.colmap_fisheye_back_profile)
+
+                _extraction_settings = {
+                    "extraction_method": settings.extraction_method,
+                    "interval_value": settings.interval_value,
+                    "interval_unit": settings.interval_unit,
+                    "frame_count": settings.frame_count,
+                    "ffmpeg_path": settings.ffmpeg_path,
+                }
+                queue_manager.update_job_progress(job_id, 3, "Deriving raw fisheye frames from source…", milestone=True)
+
+                def _fisheye_progress(pct: int, msg: str) -> None:
+                    queue_manager.update_job_progress(job_id, int(3 + pct * 0.42), msg)
+
+                try:
+                    _fisheye_raw_dir = fisheye_frame_extractor.ensure_fisheye_raw_frames(
+                        raw_sources=_raw_sources["paths"],
+                        source_kind=_raw_sources["kind"],
+                        out_dir=proj_root / "01_frames_fisheye",
+                        fov_deg=getattr(settings, "colmap_fisheye_fov_deg", 130.0),
+                        raw_fov_deg=getattr(settings, "colmap_fisheye_raw_fov_deg", 190.0),
+                        swap_lenses=getattr(settings, "colmap_fisheye_raw_swap_lenses", False),
+                        front_profile=_front_profile,
+                        back_profile=_back_profile,
+                        extraction_settings=_extraction_settings,
+                        cancel_event=cancel_event,
+                        progress_cb=_fisheye_progress,
+                    )
+                except Exception as exc:
+                    queue_manager.fail_job(job_id, f"Raw fisheye frame extraction failed: {exc}")
+                    return
+                if cancel_event.is_set():
+                    queue_manager.fail_job(job_id, "Cancelled by user")
+                    return
+                settings.colmap_fisheye_raw_dir = str(_fisheye_raw_dir)
 
         print(f"⚙️  Pipeline settings: run_vggt={settings.run_vggt} run_brush={settings.run_brush} "
               f"run_postshot={settings.run_postshot} "

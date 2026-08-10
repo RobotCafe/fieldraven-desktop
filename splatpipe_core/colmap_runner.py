@@ -275,6 +275,7 @@ def _apply_global_level_correction(
     sparse_txt_dir: Path,
     cam_from_rig: list,
     anchor_diag_pitch: float = 0.0,
+    sensor_name_to_idx: Optional[dict] = None,
 ) -> tuple:
     """
     Level the whole reconstruction with ONE rotation applied identically to
@@ -313,6 +314,11 @@ def _apply_global_level_correction(
     Also patches frames.txt's RIG_FROM_WORLD (the pose pycolmap actually
     uses) and points3D.txt.
 
+    sensor_name_to_idx: optional folder-name -> rig-sensor-index map, for
+        non-pano_camera naming schemes (e.g. colmap_fisheye's {"front":0,
+        "back":1}). When None (default), falls back to the original
+        "pano_cameraN" parsing.
+
     Returns (n_cameras_corrected, n_points_corrected).
     """
     images_txt = sparse_txt_dir / "images.txt"
@@ -335,11 +341,17 @@ def _apply_global_level_correction(
             parts = line.split()
             if len(parts) >= 10:
                 sensor_name = Path(parts[9]).parent.name
-                try:
-                    sensor_idx = int(sensor_name.replace("pano_camera", ""))
-                except ValueError:
-                    data_line = True
-                    continue
+                if sensor_name_to_idx is not None:
+                    sensor_idx = sensor_name_to_idx.get(sensor_name)
+                    if sensor_idx is None:
+                        data_line = True
+                        continue
+                else:
+                    try:
+                        sensor_idx = int(sensor_name.replace("pano_camera", ""))
+                    except ValueError:
+                        data_line = True
+                        continue
                 frame_stem = Path(parts[9]).stem
                 rec_idx = len(records)
                 records.append({"line_idx": idx, "parts": parts})
@@ -518,11 +530,13 @@ def _patch_frames_rig_from_world(sparse_txt_dir: Path, frame_rig_poses: dict) ->
     return n_patched
 
 
-def _measure_anchor_pitch(sparse_txt_dir: Path) -> float:
-    """Measure the mean DIAG pitch of all sensor-0 (pano_camera0) images in images.txt.
+def _measure_anchor_pitch(sparse_txt_dir: Path, anchor_prefix: str = "pano_camera0/") -> float:
+    """Measure the mean DIAG pitch of all sensor-0 (anchor_prefix) images in images.txt.
 
     Works whether or not horizon_ref is set — always reads the sensor whose
     index in the rig is 0 (whatever pitch that sensor was extracted at).
+    anchor_prefix lets non-pano_camera naming schemes (e.g. colmap_fisheye's
+    "front/") reuse this same measurement — the math is naming-agnostic.
 
     DIAG pitch = arcsin(Y_world) where Y_world is the Y component of the camera
     forward axis in COLMAP world coordinates (Y-down convention).
@@ -540,7 +554,7 @@ def _measure_anchor_pitch(sparse_txt_dir: Path) -> float:
             continue
         if not data_line:
             parts = line.split()
-            if len(parts) >= 10 and parts[9].startswith("pano_camera0/"):
+            if len(parts) >= 10 and parts[9].startswith(anchor_prefix):
                 qw, qx, qy, qz = (float(parts[i]) for i in (1, 2, 3, 4))
                 R   = _quat_to_mat(qw, qx, qy, qz)   # cam_from_world
                 fwd = R.T[:, 2]                        # forward axis in COLMAP world
@@ -698,7 +712,8 @@ def _run_perspective_rig(
         "colmap_matcher":  settings.colmap_matcher,
         "colmap_bin":      settings.colmap_bin or "",
         "colmap_mapper":   getattr(settings, "colmap_mapper", "incremental"),
-        "vocab_tree_path": getattr(settings, "colmap_vocab_tree", "") or "",
+        "vocab_tree_path":    getattr(settings, "colmap_vocab_tree", "") or "",
+        "vocab_tree_enabled": getattr(settings, "colmap_vocab_tree_enabled", True),
         "rig":             rig_params,
     }
 

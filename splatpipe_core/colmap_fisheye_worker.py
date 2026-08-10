@@ -4,27 +4,37 @@ Isolated PyCOLMAP worker for the "COLMAP Fisheye" alignment mode — cloned
 from colmap_worker.py (the verified SIMPLE_PINHOLE rig path) with two
 substantive differences:
 
-  1. Camera model is OPENCV_FISHEYE (fx,fy,cx,cy,k1,k2,k3,k4) with REAL
-     calibrated intrinsics per lens (front/back), sourced from a saved
-     lens_calibrator.py profile — not a derived single-focal guess. Front
-     and back lenses get their own distinct pycolmap.Camera object/id
-     instead of one shared object reused across every rig sensor.
+  1. Camera model depends on whether a real calibration is available
+     (the "calibrated" flag in the payload, from
+     settings.colmap_fisheye_use_calibration):
+       - calibrated=True:  OPENCV_FISHEYE (fx,fy,cx,cy,k1,k2,k3,k4) with REAL
+         calibrated intrinsics per lens (front/back), sourced from a saved
+         lens_calibrator.py profile, intrinsics locked (never refined by BA).
+       - calibrated=False: RADIAL_FISHEYE (f,cx,cy,k1,k2) with a guessed seed
+         per lens, refined by BA. A lower-DOF model was chosen deliberately
+         for self-calibration: asking BA to freely fit all 4 OPENCV_FISHEYE
+         distortion coefficients from ordinary scene photos (not a dedicated
+         calibration target) is poorly constrained and prone to degenerate
+         solutions; RADIAL_FISHEYE's 2 distortion terms self-calibrate more
+         robustly.
+     Either way, front and back lenses get their own distinct pycolmap.Camera
+     object/id instead of one shared object reused across every rig sensor.
   2. The Caspar GPU BA tier is removed entirely. Caspar's adapter only
      understands SIMPLE_RADIAL/PINHOLE (see colmap_worker.py's
      _convert_db_cameras_to_pinhole docstring) and has no conversion path
-     for OPENCV_FISHEYE — reaching it unconverted silently produces
-     "No residuals to optimize" (a wrong answer, not a crash). This worker
-     goes straight to Ceres CLI, then in-process CPU as fallback — a
+     for OPENCV_FISHEYE/RADIAL_FISHEYE — reaching it unconverted silently
+     produces "No residuals to optimize" (a wrong answer, not a crash). This
+     worker goes straight to Ceres CLI, then in-process CPU as fallback — a
      2-tier chain instead of the 3-tier Caspar/Ceres/CPU chain.
 
 Receives a JSON payload via sys.argv[1] and runs:
-  1. Feature extraction  (OPENCV_FISHEYE, PER_FOLDER)
+  1. Feature extraction  (OPENCV_FISHEYE or RADIAL_FISHEYE, PER_FOLDER)
        → CLI (colmap.exe) if colmap_bin is set, else pycolmap (CPU only)
   2. Rig config build + apply_rig_config  (always pycolmap) — front/back
-     each get their own calibrated intrinsics, never refined by BA.
+     each get their own intrinsics; locked if calibrated, refined by BA if not.
   3. Feature matching
        → CLI (colmap.exe) if colmap_bin is set, else pycolmap (CPU only)
-  4. Incremental/global mapping, intrinsics locked, Caspar tier removed
+  4. Incremental/global mapping, Caspar tier removed
   5. Write sparse_txt output
 
 Progress lines are printed as  WORKER_PROGRESS:<pct>:<message>
@@ -104,11 +114,26 @@ def main():
         colmap_mapper   = payload.get("colmap_mapper", "incremental")  # "incremental" | "global"
         vocab_tree_path    = payload.get("vocab_tree_path", "")
         vocab_tree_enabled = payload.get("vocab_tree_enabled", True)
+        # calibrated=False means no real lens profile was available (see
+        # colmap_fisheye_runner.py) — front/back params below are a guessed
+        # seed, not a real prior, so BA must refine focal/principal
+        # point/distortion per lens instead of locking them. Rig geometry
+        # (the fixed ~180° yaw between lenses) stays locked either way —
+        # that's a physical constant of the hardware, independent of
+        # per-lens calibration status.
+        calibrated = bool(payload.get("calibrated", True))
+        # OPENCV_FISHEYE (8 params: fx,fy,cx,cy,k1,k2,k3,k4) when calibrated -- matches
+        # the Lens Calibration tab's cv2.fisheye.calibrate output exactly. RADIAL_FISHEYE
+        # (5 params: f,cx,cy,k1,k2) when self-calibrating -- a lower-DOF model fits more
+        # robustly from ordinary scene photos than freely refining all 4 OPENCV_FISHEYE
+        # distortion terms would (see module docstring).
+        camera_model_name = "OPENCV_FISHEYE" if calibrated else "RADIAL_FISHEYE"
 
         rig          = payload["rig"]
         image_width  = int(rig["image_width"])
         image_height = int(rig["image_height"])
-        # 8-value OPENCV_FISHEYE params per lens: fx,fy,cx,cy,k1,k2,k3,k4
+        # 8-value OPENCV_FISHEYE params per lens (calibrated) or 5-value RADIAL_FISHEYE
+        # params (self-calibrate): fx,fy,cx,cy,k1,k2,k3,k4  or  f,cx,cy,k1,k2
         front_params = [float(v) for v in rig["front_params"]]
         back_params  = [float(v) for v in rig["back_params"]]
         # cam_from_rig rotation matrices (sensor 0 = front = identity = reference)
@@ -122,7 +147,8 @@ def main():
             return pitch, yaw
 
         rig_config_dump = {
-            "camera_model": "OPENCV_FISHEYE",
+            "camera_model": camera_model_name,
+            "calibrated": calibrated,
             "image_width": image_width,
             "image_height": image_height,
             "front_params": front_params,
@@ -146,6 +172,9 @@ def main():
 
         import pycolmap
 
+        camera_model_id = (pycolmap.CameraModelId.OPENCV_FISHEYE if calibrated
+                            else pycolmap.CameraModelId.RADIAL_FISHEYE)
+
         # Placeholder used for the initial extraction pass only -- ImageReaderOptions
         # is global for the whole extract_features()/project.ini call and can't vary
         # per folder, so every folder is seeded with the front lens's params here.
@@ -155,7 +184,7 @@ def main():
         # object, just parameterized per-lens instead of shared.
         placeholder_params_str = ",".join(str(v) for v in front_params)
         reader_opts = pycolmap.ImageReaderOptions(
-            camera_model="OPENCV_FISHEYE",
+            camera_model=camera_model_name,
             camera_params=placeholder_params_str,
         )
 
@@ -177,7 +206,7 @@ def main():
                 )
 
         # ── 1. Feature extraction ──────────────────────────────────────────────
-        _prog(20, f"Extracting SIFT features ({len(prefixes)} sensors, OPENCV_FISHEYE)…")
+        _prog(20, f"Extracting SIFT features ({len(prefixes)} sensors, {camera_model_name})…")
         if colmap_bin:
             if db_path.exists():
                 db_path.unlink()
@@ -185,7 +214,7 @@ def main():
             proj_ini.write_text(
                 f"database_path={db_path}\n"
                 f"image_path={image_path}\n"
-                f"ImageReader.camera_model=OPENCV_FISHEYE\n"
+                f"ImageReader.camera_model={camera_model_name}\n"
                 f"ImageReader.camera_params={placeholder_params_str}\n"
                 f"ImageReader.single_camera_per_folder=1\n"
                 f"SiftExtraction.max_num_features=16384\n",
@@ -202,29 +231,32 @@ def main():
             )
         _prog(28, "Feature extraction complete.")
 
-        # ── 2. Build rig config — one real camera per lens ─────────────────────
-        def _make_camera(camera_id: int, params: list):
+        # ── 2. Build rig config — one camera per lens (real or guessed) ────────
+        def _make_camera(camera_id: int, params: list, locked: bool):
             try:
                 cam = pycolmap.Camera.create_from_model_id(
-                    camera_id=camera_id, model=pycolmap.CameraModelId.OPENCV_FISHEYE,
+                    camera_id=camera_id, model=camera_model_id,
                     focal_length=params[0], width=image_width, height=image_height,
                 )
             except TypeError:
                 cam = pycolmap.Camera.create_from_model_id(
-                    camera_id=camera_id, model_id=pycolmap.CameraModelId.OPENCV_FISHEYE,
+                    camera_id=camera_id, model_id=camera_model_id,
                     focal_length=params[0], width=image_width, height=image_height,
                 )
             except AttributeError:
                 cam = pycolmap.Camera.create(
-                    camera_id=camera_id, model=pycolmap.CameraModelId.OPENCV_FISHEYE,
+                    camera_id=camera_id, model=camera_model_id,
                     focal_length=params[0], width=image_width, height=image_height,
                 )
             cam.params = np.array(params, dtype=np.float64)
-            cam.has_prior_focal_length = True
+            # Only a real calibration profile counts as a prior; a guessed
+            # seed (uncalibrated mode) is not one, and BA below is told to
+            # refine it rather than trust it.
+            cam.has_prior_focal_length = locked
             return cam
 
-        front_camera = _make_camera(0, front_params)
-        back_camera  = _make_camera(1, back_params)
+        front_camera = _make_camera(0, front_params, locked=calibrated)
+        back_camera  = _make_camera(1, back_params, locked=calibrated)
 
         zero_t = np.zeros((3, 1), dtype=np.float64)
         rig_cameras = []
@@ -244,7 +276,9 @@ def main():
         rig_config = pycolmap.RigConfig(cameras=rig_cameras)
 
         # ── 3. Apply rig config ────────────────────────────────────────────────
-        _prog(30, "Applying rig configuration (calibrated fisheye intrinsics, locked)…")
+        _prog(30, "Applying rig configuration (calibrated fisheye intrinsics, locked)…"
+              if calibrated else
+              "Applying rig configuration (no lens profile — intrinsics will self-calibrate)…")
         with pycolmap.Database.open(str(db_path)) as db:
             pycolmap.apply_rig_config([rig_config], db)
 
@@ -323,6 +357,7 @@ def main():
                         shutil.rmtree(str(cli_out))
                     cli_out.mkdir(parents=True, exist_ok=True)
 
+                    _refine = "0" if calibrated else "1"
                     _run_cli([
                         "global_mapper",
                         "--database_path", str(db_path),
@@ -330,9 +365,9 @@ def main():
                         "--output_path", str(cli_out),
                         "--GlobalMapper.ba_backend", "CERES",
                         "--GlobalMapper.refine_sensor_from_rig", "0",
-                        "--GlobalMapper.ba_refine_focal_length", "0",
-                        "--GlobalMapper.ba_refine_principal_point", "0",
-                        "--GlobalMapper.ba_refine_extra_params", "0",
+                        "--GlobalMapper.ba_refine_focal_length", _refine,
+                        "--GlobalMapper.ba_refine_principal_point", _refine,
+                        "--GlobalMapper.ba_refine_extra_params", _refine,
                         "--GlobalMapper.ba_gpu_index", "-1",
                     ], pct=60)
 
@@ -358,9 +393,9 @@ def main():
                     _prog(60, f"Running GLOMAP global SfM in-process, rig-locked, BA CPU ({label})…")
                     gm_opts = pycolmap.GlobalPipelineOptions()
                     gm_opts.mapper.refine_sensor_from_rig = False
-                    gm_opts.mapper.bundle_adjustment.refine_focal_length = False
-                    gm_opts.mapper.bundle_adjustment.refine_principal_point = False
-                    gm_opts.mapper.bundle_adjustment.refine_extra_params = False
+                    gm_opts.mapper.bundle_adjustment.refine_focal_length = not calibrated
+                    gm_opts.mapper.bundle_adjustment.refine_principal_point = not calibrated
+                    gm_opts.mapper.bundle_adjustment.refine_extra_params = not calibrated
                     recs = pycolmap.global_mapping(
                         str(db_path), str(image_path), str(sparse_path), gm_opts
                     )
@@ -373,6 +408,7 @@ def main():
                         shutil.rmtree(str(cli_out))
                     cli_out.mkdir(parents=True, exist_ok=True)
 
+                    _refine = "0" if calibrated else "1"
                     _run_cli([
                         "mapper",
                         "--database_path", str(db_path),
@@ -381,9 +417,9 @@ def main():
                         "--Mapper.ba_local_backend", "CERES",
                         "--Mapper.ba_global_backend", "CERES",
                         "--Mapper.ba_refine_sensor_from_rig", "0",
-                        "--Mapper.ba_refine_focal_length", "0",
-                        "--Mapper.ba_refine_principal_point", "0",
-                        "--Mapper.ba_refine_extra_params", "0",
+                        "--Mapper.ba_refine_focal_length", _refine,
+                        "--Mapper.ba_refine_principal_point", _refine,
+                        "--Mapper.ba_refine_extra_params", _refine,
                         "--Mapper.ba_use_gpu", "1",
                         "--Mapper.ba_gpu_index", "-1",
                     ], pct=60)
@@ -410,9 +446,9 @@ def main():
                     _prog(60, f"Running incremental mapping, fixed rig, BA CPU in-process ({label})…")
                     map_opts = pycolmap.IncrementalPipelineOptions(
                         ba_refine_sensor_from_rig=False,
-                        ba_refine_focal_length=False,
-                        ba_refine_principal_point=False,
-                        ba_refine_extra_params=False,
+                        ba_refine_focal_length=not calibrated,
+                        ba_refine_principal_point=not calibrated,
+                        ba_refine_extra_params=not calibrated,
                         ba_use_gpu=True,
                         ba_gpu_index="-1",
                     )

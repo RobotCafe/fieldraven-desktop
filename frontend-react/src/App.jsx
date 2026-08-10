@@ -543,7 +543,7 @@ const API_TO_UI = {
   vggt_prediction_mode:'vggtMode', vggt_use_anchor_rig:'vggtAnchorRig',
   export_xmp:'exportXmp', gps_priors_rs:'gpsTriggersRS', gps_priors_colmap:'gpsPriorsColmap',
   run_colmap:'runColmap', colmap_mode:'colmapMode', colmap_matcher:'colmapMatcher', horizon_ref:'horizonRef', colmap_visualize:'colmapVisualize', colmap_correct_pitch:'colmapCorrectPitch', colmap_orientation_align:'colmapOrientationAlign', colmap_mapper:'colmapMapper', colmap_vocab_tree:'colmapVocabTree', colmap_vocab_tree_enabled:'colmapVocabTreeEnabled',
-  run_colmap_fisheye:'runColmapFisheye', colmap_fisheye_matcher:'colmapFisheyeMatcher', colmap_fisheye_front_profile:'colmapFisheyeFrontProfile', colmap_fisheye_back_profile:'colmapFisheyeBackProfile', colmap_fisheye_raw_dir:'colmapFisheyeRawDir',
+  run_colmap_fisheye:'runColmapFisheye', colmap_fisheye_use_calibration:'colmapFisheyeUseCalibration', colmap_fisheye_matcher:'colmapFisheyeMatcher', colmap_fisheye_front_profile:'colmapFisheyeFrontProfile', colmap_fisheye_back_profile:'colmapFisheyeBackProfile', colmap_fisheye_raw_dir:'colmapFisheyeRawDir', colmap_fisheye_fov_deg:'colmapFisheyeFovDeg', colmap_fisheye_raw_fov_deg:'colmapFisheyeRawFovDeg', colmap_fisheye_raw_swap_lenses:'colmapFisheyeRawSwapLenses',
   run_gluemap:'runGluemap', gluemap_backbone:'glueMapBackbone', gluemap_skip_doppelgangers:'glueMapSkipDg', gluemap_coarse_only:'glueMapCoarseOnly', gluemap_is_sequential:'glueMapSequential', gluemap_num_neighbors:'glueMapNeighbors', gluemap_batch_size:'glueMapBatchSize', gluemap_num_track_per_img:'glueMapNumTrack', gluemap_wsl_home:'glueMapWslHome', gluemap_wsl_distro:'glueMapWslDistro',
   run_rigsfm:'runRigsfm', rigsfm_anchor_sensor:'rigsfmAnchorSensor', rigsfm_quad_anchors:'rigsfmQuadAnchors', rigsfm_matcher:'rigsfmMatcher',
   run_equisfm:'runEquisfm', equisfm_matcher:'equisfmMatcher', equisfm_mapper:'equisfmMapper', equisfm_triangulate:'equisfmTriangulate', equisfm_mvs:'equisfmMvs',
@@ -2282,28 +2282,73 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
               Uses real calibrated fisheye intrinsics (OPENCV_FISHEYE) for the X4's front/back
               lenses instead of a derived zero-distortion pinhole. Needs raw, un-stitched
               per-lens frames — not 01_frames/02_views, which are already-stitched equirect
-              crops. Save calibration profiles from the Lens Calibration tab first.
+              crops.
             </div>
-            <FieldRow label="Raw frames folder" hint="Folder containing front/ and back/ subfolders of raw fisheye frames.">
+            <FieldRow label="Raw frames folder" hint="Folder containing front/ and back/ subfolders of raw fisheye frames. Leave blank to auto-derive from this job's own raw .insv/.insp file (front/back split + FOV crop applied automatically).">
               <Input value={settings.colmapFisheyeRawDir || ''}
                 onChange={v=>setSettings(s=>({...s,colmapFisheyeRawDir:v}))}
-                placeholder="C:\FieldRaven\Calibration\raw\job123" />
+                placeholder="Auto-derived from job's raw .insv/.insp if left blank" />
             </FieldRow>
-            <FieldRow label="Front lens profile">
-              <Select value={settings.colmapFisheyeFrontProfile || ''}
-                onChange={v=>setSettings(s=>({...s,colmapFisheyeFrontProfile:v}))}
-                options={[{value:'', label:'Select a profile…'}, ...calibProfiles.map(p=>({value:p.name, label:`${p.name} (RMS ${p.overall_rms_error?.toFixed(3)}px)`}))]} />
+            <FieldRow label="Target crop FOV (°)" hint="Each lens is cropped to this field of view before reconstruction — extreme fisheye edges are badly distorted/vignetted and destabilize the distortion fit. Only applies when the raw frames folder above is auto-derived (left blank); has no effect on a manually-pointed folder.">
+              <Input type="number" value={settings.colmapFisheyeFovDeg ?? 130}
+                onChange={v=>setSettings(s=>({...s,colmapFisheyeFovDeg:v}))} />
             </FieldRow>
-            <FieldRow label="Back lens profile">
-              <Select value={settings.colmapFisheyeBackProfile || ''}
-                onChange={v=>setSettings(s=>({...s,colmapFisheyeBackProfile:v}))}
-                options={[{value:'', label:'Select a profile…'}, ...calibProfiles.map(p=>({value:p.name, label:`${p.name} (RMS ${p.overall_rms_error?.toFixed(3)}px)`}))]} />
-            </FieldRow>
-            {calibProfiles.length === 0 && (
-              <div style={{ fontSize:10, color:T.amber }}>
-                No saved calibration profiles yet — run a calibration in the Lens Calibration tab and save it.
+            <Toggle checked={!!settings.colmapFisheyeRawSwapLenses} label="Swap front/back lens mapping"
+              onChange={v=>setSettings(s=>({...s,colmapFisheyeRawSwapLenses:v}))} />
+            <div style={{ color:T.textDim, fontSize:10, marginTop:-4 }}>
+              The raw source has no metadata identifying which physical lens is front vs back — flip this
+              if a calibrated run looks wrong (e.g. front/back profiles seem swapped).
+            </div>
+            {settings.colmapFisheyeUseCalibration === false && (
+              <FieldRow label="Raw lens FOV (°)" hint="Approximate native FOV of the raw, uncropped fisheye lens — only used to scale the detected lens circle when self-calibrating (no saved profile). Low-stakes if slightly off since bundle adjustment refines the rest.">
+                <Input type="number" value={settings.colmapFisheyeRawFovDeg ?? 190}
+                  onChange={v=>setSettings(s=>({...s,colmapFisheyeRawFovDeg:v}))} />
+              </FieldRow>
+            )}
+
+            <Toggle checked={settings.colmapFisheyeUseCalibration !== false} label="Use calibrated lens profiles"
+              onChange={v=>setSettings(s=>({...s,colmapFisheyeUseCalibration:v}))} />
+            {settings.colmapFisheyeUseCalibration !== false ? (
+              <div style={{ paddingLeft:12, borderLeft:`2px solid ${T.border}`, display:"flex", flexDirection:"column", gap:10 }}>
+                <FieldRow label="Front lens profile">
+                  <Select value={settings.colmapFisheyeFrontProfile || ''}
+                    onChange={v=>setSettings(s=>({...s,colmapFisheyeFrontProfile:v}))}
+                    options={[{value:'', label:'Select a profile…'}, ...calibProfiles.map(p=>({value:p.name, label:`${p.name} (RMS ${p.overall_rms_error?.toFixed(3)}px)`}))]} />
+                </FieldRow>
+                <FieldRow label="Back lens profile">
+                  <Select value={settings.colmapFisheyeBackProfile || ''}
+                    onChange={v=>setSettings(s=>({...s,colmapFisheyeBackProfile:v}))}
+                    options={[{value:'', label:'Select a profile…'}, ...calibProfiles.map(p=>({value:p.name, label:`${p.name} (RMS ${p.overall_rms_error?.toFixed(3)}px)`}))]} />
+                </FieldRow>
+                {calibProfiles.length === 0 && (
+                  <div style={{ fontSize:10, color:T.amber }}>
+                    No saved calibration profiles yet — run a calibration in the Lens Calibration tab and save it,
+                    or turn this off to test the pipeline without one.
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ paddingLeft:12, borderLeft:`2px solid ${T.border}`, fontSize:10, color:T.textDim, lineHeight:1.5 }}>
+                No lens profile needed — both lenses are seeded with a rough guessed intrinsic
+                and bundle adjustment self-calibrates focal length, principal point, and
+                distortion during reconstruction. Useful for trying the pipeline out before
+                doing a real calibration; expect lower accuracy than a calibrated profile.
               </div>
             )}
+
+            <FieldRow label="Mapper">
+              <div style={{ display:"flex", gap:12 }}>
+                <Radio value="incremental" checked={(settings.colmapMapper||"incremental")==="incremental"}
+                  onChange={v=>setSettings(s=>({...s,colmapMapper:v}))} label="Incremental (rig-aware)" />
+                <Radio value="global" checked={settings.colmapMapper==="global"}
+                  onChange={v=>setSettings(s=>({...s,colmapMapper:v}))} label="Global (GLOMAP, rig-aware)" />
+              </div>
+              <div style={{ color:T.textDim, fontSize:10, marginTop:4 }}>
+                Shared with the COLMAP tab's Mapper setting. Bundle adjustment goes straight to
+                Ceres CLI, then in-process CPU — the GPU Caspar backend has no OPENCV_FISHEYE
+                support (see colmap_fisheye_worker.py), so unlike plain COLMAP there's no Caspar tier.
+              </div>
+            </FieldRow>
             <FieldRow label="Matcher">
               <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
                 {["sequential","exhaustive","vocabtree"].map(m=>(
@@ -2312,9 +2357,43 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
                 ))}
               </div>
             </FieldRow>
+            {settings.colmapFisheyeMatcher==="sequential" && settings.colmapBin && (
+              <div style={{ paddingLeft:12, borderLeft:`2px solid ${T.border}` }}>
+                <div style={{ fontSize:10, color:T.textDim, marginBottom:4 }}>
+                  Loop closure: vocab tree adds a second matching pass that finds non-adjacent images sharing visual content.
+                  Requires a vocab tree .bin file (Config → Paths). Shared with the COLMAP tab's vocab tree setting.
+                </div>
+                <Toggle checked={!!settings.colmapVocabTree && settings.colmapVocabTreeEnabled !== false} label="Enable vocab tree loop closure pass"
+                  disabled={!settings.colmapVocabTree}
+                  onChange={v=>setSettings(s=>({...s,colmapVocabTreeEnabled:v}))}
+                  title={!settings.colmapVocabTree ? "Set Vocab Tree path in Config → Paths to enable" : undefined} />
+                {settings.colmapVocabTree && (
+                  <div style={{ fontSize:10, color:T.live, marginTop:2 }}>
+                    Vocab tree configured: {settings.colmapVocabTree.split(/[/\\]/).pop()}
+                  </div>
+                )}
+              </div>
+            )}
+            <Toggle checked={settings.colmapCorrectPitch !== false} label="Align reconstruction to rig 0° pitch reference"
+              onChange={v=>setSettings(s=>({...s,colmapCorrectPitch:v}))} />
+            <Toggle checked={!!settings.colmapOrientationAlign} label="Refine level using scene geometry (IMAGE_ORIENTATION)"
+              disabled={!settings.colmapBin}
+              onChange={v=>setSettings(s=>({...s,colmapOrientationAlign:v}))}
+              title={!settings.colmapBin ? "Requires COLMAP binary path to be set" : undefined} />
+            <Toggle checked={!!settings.gpsPriorsColmap} label="Geo-register reconstruction using GPS"
+              onChange={v=>setSettings(s=>({...s,gpsPriorsColmap:v}))} />
+            {settings.gpsPriorsColmap && (
+              <div style={{ color:T.textDim, fontSize:10 }}>
+                Requires .gps.json sidecars next to the raw front/back frames + COLMAP binary path set.
+                Aligns the reconstruction to real-world GPS coordinates (ECEF).
+              </div>
+            )}
+            <Toggle checked={!!settings.colmapVisualize} label="Generate camera visualizer (cameras.html)"
+              onChange={v=>setSettings(s=>({...s,colmapVisualize:v}))} />
             <div style={{ fontSize:10, color:T.textDim, lineHeight:1.5 }}>
-              Bundle adjustment goes straight to Ceres CLI, then in-process CPU — the GPU
-              Caspar backend has no OPENCV_FISHEYE support (see colmap_fisheye_worker.py).
+              Mapper, vocab tree, pitch alignment, orientation refinement, GPS geo-registration and the
+              camera visualizer are shared settings with the plain COLMAP tab — changing them here also
+              changes them there.
             </div>
           </div>
         )}
@@ -2582,7 +2661,9 @@ function AlignmentTab({ settings, setSettings, selected, importedFiles, projectD
         <div style={{ fontFamily:"monospace", fontSize:11, color:T.textSec, lineHeight:1.8 }}>
           {mode === 'rs'      && `RealityScan alignment${settings.exportXmp?' + XMP rig priors':''}`}
           {mode === 'colmap'  && `COLMAP ${settings.colmapMode} (${settings.colmapMatcher} matcher)`}
-          {mode === 'colmap_fisheye' && `COLMAP Fisheye — front:${settings.colmapFisheyeFrontProfile||'none'} back:${settings.colmapFisheyeBackProfile||'none'} (${settings.colmapFisheyeMatcher||'sequential'} matcher)`}
+          {mode === 'colmap_fisheye' && (settings.colmapFisheyeUseCalibration !== false
+            ? `COLMAP Fisheye — front:${settings.colmapFisheyeFrontProfile||'none'} back:${settings.colmapFisheyeBackProfile||'none'} (${settings.colmapFisheyeMatcher||'sequential'} matcher)`
+            : `COLMAP Fisheye — self-calibrating (no lens profile), ${settings.colmapFisheyeMatcher||'sequential'} matcher`)}
           {mode === 'vggt'    && `VGGT ${settings.vggtMode} pose estimation`}
           {mode === 'gluemap' && `GlueMap (${settings.glueMapBackbone} backbone, ${settings.glueMapNeighbors} neighbours${settings.glueMapSkipDg?', skip-dg':''})`}
           {mode === 'rigsfm'  && `RigGluemap — Pi3 ${settings.glueMapBackbone||'pi3'} ${settings.rigsfmQuadAnchors ? '4-horizon anchors' : `anchor sensor #${settings.rigsfmAnchorSensor??0}`} → rig expand → SIFT ${settings.rigsfmMatcher||'sequential'}`}
@@ -2765,7 +2846,7 @@ function PipelineTab({ pqItems, localQueue, setLocalQueue, selected, setSelected
     settings, setSettings, onSaveConfig, onCancelPq, onDeletePq, machineInfo,
     cameraStatus, importedFiles, projectDirs, onImport, onAddImageFolder, onAddCameraFiles, onAddVideoFile, onAddVideoFromCamera,
     importStep, importPct, stitching, stitchStep, stitchPct, extractedFrames, setExtractedFrames,
-    realFrames, refreshRealFrames, onExtractFrames }) {
+    realFrames, refreshRealFrames, onExtractFrames, api }) {
   const [pipeTab, setPipeTab] = useState(0);
   const [canvasH, setCanvasH] = useState(600);
   return (
@@ -3168,7 +3249,8 @@ const defaultSettings = {
   vggtConf:50, vggtSky:32, vggtMaskSky:true, vggtShowCam:true, vggtTemporal:true,
   vggtMode:"depthmap", vggtAnchorRig:false, exportXmp:false, gpsTriggersRS:false, gpsPriorsColmap:false,
   runColmap:false, colmapMode:"rig", colmapMatcher:"sequential", horizonRef:true, colmapVisualize:false, colmapCorrectPitch:true, colmapOrientationAlign:false, colmapMapper:"incremental", colmapVocabTree:"", colmapVocabTreeEnabled:true,
-  runColmapFisheye:false, colmapFisheyeMatcher:"sequential", colmapFisheyeFrontProfile:"", colmapFisheyeBackProfile:"", colmapFisheyeRawDir:"",
+  runColmapFisheye:false, colmapFisheyeUseCalibration:true, colmapFisheyeMatcher:"sequential", colmapFisheyeFrontProfile:"", colmapFisheyeBackProfile:"", colmapFisheyeRawDir:"",
+  colmapFisheyeFovDeg:130, colmapFisheyeRawFovDeg:190, colmapFisheyeRawSwapLenses:false,
   runGluemap:false, glueMapBackbone:"pi3", glueMapSkipDg:true, glueMapCoarseOnly:false, glueMapSequential:true, glueMapNeighbors:100, glueMapBatchSize:60, glueMapNumTrack:512, glueMapWslHome:"/home/decosson", glueMapWslDistro:"Ubuntu-22.04",
   runRigsfm:false, rigsfmAnchorSensor:0, rigsfmQuadAnchors:false, rigsfmMatcher:'sequential',
   runEquisfm:false, equisfmMatcher:'sequential', equisfmMapper:'incremental', equisfmTriangulate:false, equisfmMvs:false,
@@ -4216,6 +4298,7 @@ export default function FieldRavenDesktop({ user, onSignOut }) {
             stitching={!!stitchingJobId} stitchStep={stitchStep} stitchPct={stitchPct}
             extractedFrames={extractedFrames} setExtractedFrames={setExtractedFrames}
             realFrames={realFrames} refreshRealFrames={refreshRealFrames} onExtractFrames={onExtractFrames}
+            api={api}
           />
         )}
         {activeMainTab===2 && (

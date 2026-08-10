@@ -56,9 +56,33 @@ class PipelineSettings:
     # ── COLMAP Fisheye (dual-lens, calibrated intrinsics) ─────────
     run_colmap_fisheye: bool = False
     colmap_fisheye_matcher: str = "sequential"   # "sequential" | "exhaustive" | "vocabtree"
+    colmap_fisheye_use_calibration: bool = True  # off = skip requiring saved profiles; seed both lenses
+                                                  # with a guessed OPENCV_FISHEYE intrinsic and let bundle
+                                                  # adjustment self-calibrate focal/principal-point/distortion
+                                                  # instead of locking them — lets you test the pipeline
+                                                  # without running a real lens calibration first
     colmap_fisheye_front_profile: str = ""       # saved calibration profile name (Lens Calibration tab)
     colmap_fisheye_back_profile: str = ""
-    colmap_fisheye_raw_dir: str = ""             # folder with front/ and back/ raw fisheye frame subfolders
+    colmap_fisheye_raw_dir: str = ""             # folder with front/ and back/ raw fisheye frame subfolders;
+                                                  # if left blank and the job has its own raw .insv/.insp, it is
+                                                  # auto-derived by fisheye_frame_extractor.py (see pipeline_runner.py)
+    colmap_fisheye_fov_deg: float = 130.0        # target crop FOV (full angle) per lens, cropped from the raw
+                                                  # dual-fisheye source before reconstruction -- only applies to
+                                                  # auto-derived raw_dir, not a manually-pointed folder
+    colmap_fisheye_raw_fov_deg: float = 190.0    # approximate X4 raw single-lens FOV spec (unverified against an
+                                                  # official source) -- only scales the self-calibrate path's
+                                                  # detected-circle crop; the calibrated path derives crop radius
+                                                  # from the real calibration polynomial instead and ignores this
+    colmap_fisheye_raw_swap_lenses: bool = False # raw .insv encodes the two lenses as two independent HEVC
+                                                  # streams and raw .insp as one JPEG split down the middle --
+                                                  # neither carries metadata saying which physical lens (front/
+                                                  # back) is which, so this is camera-firmware-defined and
+                                                  # unconfirmed; flip if calibrated-path results suggest profiles
+                                                  # are applied to the wrong lens
+    # Mapper/vocab-tree/GPU-binary/leveling/orientation-align/GPS-geo-register/visualizer options are
+    # shared with the plain COLMAP mode's settings (colmap_mapper, colmap_vocab_tree*, colmap_bin,
+    # colmap_correct_pitch, colmap_orientation_align, gps_priors_colmap, colmap_visualize above) — same
+    # generic COLMAP-family knobs, not alignment-mode-specific, so both tabs read/write the same fields.
 
     # ── Training ─────────────────────────────────────────────────
     run_postshot: bool = False
